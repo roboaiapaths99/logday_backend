@@ -307,6 +307,7 @@ class SystemSettings(BaseModel):
     office_lat: float = 0.0
     office_long: float = 0.0
     office_wifi_ssid: Optional[str] = None
+    office_wifi_bssid: Optional[str] = None
     geofence_radius: float = 40.0
 
 

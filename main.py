@@ -722,24 +722,33 @@ async def verify_presence(req: VerifyPresenceRequest):
         )
     # 3. Geofencing & WiFi Validation (Split Field/Desk)
     org_id = user.get("organization_id")
-    org_settings = await settings_collection.find_one({"organization_id": org_id})
+    org_settings = await settings_collection.find_one({"organization_id": org_id}) if org_id else None
     settings = org_settings or {}
     emp_type = user.get("employee_type", "desk")
     
-    if emp_type == "field":
-        # Dynamic from Database
-        office_lat = float(settings.get("office_lat", 0))
-        office_long = float(settings.get("office_long", 0))
-        radius = float(settings.get("geofence_radius", 150))
-        target_ssid = settings.get("office_wifi_ssid", "")
-        tz_offset = settings.get("timezone_offset", 330)
+    # Coordinates fallback (Dynamic Database with Env Fallback)
+    db_lat = settings.get("office_lat")
+    db_long = settings.get("office_long")
+    office_lat = float(db_lat) if (db_lat is not None and abs(float(db_lat)) > 0.0001) else float(os.getenv("OFFICE_LAT", 0))
+    office_long = float(db_long) if (db_long is not None and abs(float(db_long)) > 0.0001) else float(os.getenv("OFFICE_LONG", 0))
+    
+    # Radius fallback
+    db_radius = settings.get("geofence_radius")
+    if db_radius is not None and float(db_radius) > 0.0001:
+        radius = float(db_radius)
     else:
-        # Desk: Always use .env values
-        office_lat = float(os.getenv("OFFICE_LAT", 0))
-        office_long = float(os.getenv("OFFICE_LONG", 0))
-        radius = float(os.getenv("GEOFENCE_RADIUS_METERS", 40))
-        target_ssid = os.getenv("OFFICE_WIFI_SSID", "")
-        tz_offset = 330 # Fixed for Desk
+        radius = float(os.getenv("GEOFENCE_RADIUS_METERS", 40 if emp_type == "desk" else 150))
+        
+    # WiFi SSID fallback
+    db_wifi_ssid = settings.get("office_wifi_ssid")
+    target_ssid = str(db_wifi_ssid).strip() if (db_wifi_ssid and str(db_wifi_ssid).strip() != "") else os.getenv("OFFICE_WIFI_SSID", "")
+    
+    # WiFi BSSID fallback
+    db_wifi_bssid = settings.get("office_wifi_bssid")
+    target_bssid = str(db_wifi_bssid).strip() if (db_wifi_bssid and str(db_wifi_bssid).strip() != "") else os.getenv("OFFICE_WIFI_BSSID", "")
+    
+    # Timezone offset fallback
+    tz_offset = int(settings.get("timezone_offset", 330))
 
     # Haversine distance
     import math
@@ -755,8 +764,11 @@ async def verify_presence(req: VerifyPresenceRequest):
             detail=f"You are {dist_meters:.1f}m away from office. Must be within {radius:.1f}m."
         )
 
-    if emp_type != "field" and target_ssid and req.wifi_ssid and req.wifi_ssid != target_ssid:
-         raise HTTPException(status_code=403, detail=f"Must be connected to Office WiFi: {target_ssid}")
+    if emp_type != "field":
+        if target_ssid and req.wifi_ssid and req.wifi_ssid.strip().lower() != target_ssid.strip().lower():
+             raise HTTPException(status_code=403, detail=f"Must be connected to Office WiFi: {target_ssid}")
+        if target_bssid and req.wifi_bssid and req.wifi_bssid.strip().lower() != target_bssid.strip().lower():
+             raise HTTPException(status_code=403, detail="Must be connected to Office WiFi Access Point (BSSID mismatch).")
 
     # 5. Determine check-in or check-out (Localized)
     today_start_utc = get_today_start(tz_offset)
@@ -839,21 +851,30 @@ async def smart_attendance(req: VerifyPresenceRequest, background_tasks: Backgro
         # Fetch settings.
         org_id = user.get("organization_id")
         org_settings = await settings_collection.find_one({"organization_id": org_id}) if org_id else None
+        settings = org_settings or {}
         
         emp_type = user.get("employee_type", "desk")
         
-        if emp_type == "field" and org_settings:
-            # Field users: Dynamic from DB
-            office_lat = float(org_settings.get("office_lat", 0))
-            office_long = float(org_settings.get("office_long", 0))
-            radius = float(org_settings.get("geofence_radius", 150))
-            office_wifi_ssid = org_settings.get("office_wifi_ssid", "")
+        # Coordinates fallback (Dynamic Database with Env Fallback)
+        db_lat = settings.get("office_lat")
+        db_long = settings.get("office_long")
+        office_lat = float(db_lat) if (db_lat is not None and abs(float(db_lat)) > 0.0001) else float(os.getenv("OFFICE_LAT", 0))
+        office_long = float(db_long) if (db_long is not None and abs(float(db_long)) > 0.0001) else float(os.getenv("OFFICE_LONG", 0))
+        
+        # Radius fallback
+        db_radius = settings.get("geofence_radius")
+        if db_radius is not None and float(db_radius) > 0.0001:
+            radius = float(db_radius)
         else:
-            # Desk/Default: Hardcoded from ENV
-            office_lat = float(os.getenv("OFFICE_LAT", 0))
-            office_long = float(os.getenv("OFFICE_LONG", 0))
-            radius = float(os.getenv("GEOFENCE_RADIUS_METERS", 150))
-            office_wifi_ssid = os.getenv("OFFICE_WIFI_SSID", "")
+            radius = float(os.getenv("GEOFENCE_RADIUS_METERS", 40 if emp_type == "desk" else 150))
+            
+        # WiFi SSID fallback
+        db_wifi_ssid = settings.get("office_wifi_ssid")
+        office_wifi_ssid = str(db_wifi_ssid).strip() if (db_wifi_ssid and str(db_wifi_ssid).strip() != "") else os.getenv("OFFICE_WIFI_SSID", "")
+        
+        # WiFi BSSID fallback
+        db_wifi_bssid = settings.get("office_wifi_bssid")
+        office_wifi_bssid = str(db_wifi_bssid).strip() if (db_wifi_bssid and str(db_wifi_bssid).strip() != "") else os.getenv("OFFICE_WIFI_BSSID", "")
 
         role = user.get("employee_type", "desk")
         attendance_type = req.intended_type or "check-in"
@@ -953,7 +974,14 @@ async def smart_attendance(req: VerifyPresenceRequest, background_tasks: Backgro
                          status_code=403, 
                          detail=f"Location error. You are {office_dist:.1f}m away from office (Limit: {radius}m)."
                      )
-                wifi_pct = 100 if not office_wifi_ssid or (req.wifi_ssid and req.wifi_ssid.strip().lower() == office_wifi_ssid.strip().lower()) else 0
+                
+                is_wifi_ok = True
+                if office_wifi_ssid and (not req.wifi_ssid or req.wifi_ssid.strip().lower() != office_wifi_ssid.strip().lower()):
+                    is_wifi_ok = False
+                if office_wifi_bssid and (not req.wifi_bssid or req.wifi_bssid.strip().lower() != office_wifi_bssid.strip().lower()):
+                    is_wifi_ok = False
+                
+                wifi_pct = 100 if is_wifi_ok else 0
                 check_in_method = CheckInMethod.WIFI_GEOFENCE
             else:
                 # Field Logic
@@ -999,10 +1027,10 @@ async def smart_attendance(req: VerifyPresenceRequest, background_tasks: Backgro
                 threshold_mins = settings.get("field_late_threshold_mins", 30)
                 tz_offset = settings.get("timezone_offset", 330)
             else:
-                # Desk: Hardcoded 10 AM to 6 PM logic
-                start_time_str = "10:00"
-                threshold_mins = 15
-                tz_offset = 330
+                # Desk: Dynamic from Database with defaults
+                start_time_str = settings.get("office_start_time", "10:00")
+                threshold_mins = settings.get("late_threshold_mins", 15)
+                tz_offset = settings.get("timezone_offset", 330)
             
             try:
                 log_time_utc = datetime.now(timezone.utc)
@@ -1026,8 +1054,9 @@ async def smart_attendance(req: VerifyPresenceRequest, background_tasks: Backgro
                 end_time_str = settings.get("field_office_end_time", "18:00")
                 tz_offset = settings.get("timezone_offset", 330)
             else:
-                end_time_str = "18:00"
-                tz_offset = 330
+                # Desk: Dynamic from Database with defaults
+                end_time_str = settings.get("office_end_time", "18:00")
+                tz_offset = settings.get("timezone_offset", 330)
                 
             try:
                 log_time_utc = datetime.now(timezone.utc)
