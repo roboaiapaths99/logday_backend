@@ -300,6 +300,7 @@ class SystemSettings(BaseModel):
     field_required_hours: float = 9.0
     field_visits_goal: int = 10
     field_km_goal: float = 20.0
+    field_rate_per_km: float = 10.0
     
     timezone_offset: int = 330
     primary_color: Optional[str] = "#6366f1"

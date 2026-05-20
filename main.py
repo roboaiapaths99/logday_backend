@@ -944,6 +944,7 @@ async def smart_attendance(req: VerifyPresenceRequest, background_tasks: Backgro
             raise HTTPException(status_code=400, detail="Face biometric not enrolled for this user.")
         
         # Face Verification (Bypass for Superadmin or if no embedding)
+        distance = 0.0
         if user.get("face_embedding"):
             is_match, distance = verify_face(req.image, user["face_embedding"])
             if not is_match and not is_superadmin:
@@ -2950,8 +2951,11 @@ async def submit_km_reimbursement(req: dict, employee=Depends(get_current_employ
         if existing:
             raise HTTPException(status_code=400, detail=f"KM reimbursement already claimed for {date_str}")
         
-        # Default rate (could be dynamic later)
-        rate_per_km = 10.0 # Example: 10 INR per KM
+        # Fetch dynamic rate from organization settings
+        org_settings = await settings_collection.find_one({"organization_id": employee["organization_id"]})
+        rate_per_km = 10.0 # Default
+        if org_settings and "field_rate_per_km" in org_settings:
+            rate_per_km = float(org_settings["field_rate_per_km"])
         
         claim = {
             "employee_id": employee["email"],
@@ -3793,6 +3797,63 @@ async def get_field_live_status(admin=Depends(get_current_admin)):
 
 
 
+
+# -----------------------------------------------------------------------------
+# FIELD LEADERBOARD
+# -----------------------------------------------------------------------------
+
+@app.get("/api/field/leaderboard")
+async def get_field_leaderboard(employee=Depends(get_current_employee)):
+    """Get the live leaderboard for field agents for the current week."""
+    try:
+        now = datetime.now(timezone.utc)
+        start_of_week = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+        end_of_week = start_of_week + timedelta(days=6, hours=23, minutes=59, seconds=59)
+
+        employees_cursor = employees_collection.find({
+            "organization_id": employee["organization_id"],
+            "employee_type": EmployeeType.FIELD
+        })
+        
+        leaderboard = []
+        async for emp in employees_cursor:
+            visits_count = await visit_logs_collection.count_documents({
+                "employee_id": emp["email"],
+                "timestamp": {"$gte": start_of_week, "$lte": end_of_week},
+                "action": "check_in"
+            })
+            
+            claims_cursor = km_reimbursements_collection.find({
+                "employee_id": emp["email"],
+                "date": {"$gte": start_of_week.strftime("%Y-%m-%d"), "$lte": end_of_week.strftime("%Y-%m-%d")}
+            })
+            total_km = 0
+            async for claim in claims_cursor:
+                total_km += float(claim.get("total_km", 0))
+                
+            leaderboard.append({
+                "employee_id": emp["email"],
+                "name": emp.get("full_name", "Unknown"),
+                "designation": emp.get("designation", "Field Agent"),
+                "visits_completed": visits_count,
+                "leads_captured": 0,
+                "distance_km": round(total_km, 1),
+                "is_me": emp["email"] == employee["email"]
+            })
+            
+        leaderboard.sort(key=lambda x: x["visits_completed"], reverse=True)
+        
+        for i, entry in enumerate(leaderboard):
+            entry["rank"] = i + 1
+            
+        return {
+            "week_start": start_of_week.strftime("%b %d"),
+            "week_end": end_of_week.strftime("%b %d"),
+            "leaderboard": leaderboard
+        }
+    except Exception as e:
+        logger.error(f"Failed to fetch leaderboard: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to load leaderboard data")
 
 # -----------------------------------------------------------------------------
 # EXPENSE CLAIM MANAGEMENT
