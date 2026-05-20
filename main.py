@@ -3087,12 +3087,18 @@ async def get_field_day_summary(employee_id: str, date: Optional[str] = None, cu
                 total_km += d
         total_km = total_km / 1000.0 # Convert to KM
     
-    # 3. Current Attendance Status (ABSOLUTE LATEST)
-    last_log = await attendance_logs_collection.find_one(
-        {"email": employee_id},
+    # 3. Current Attendance Status (TODAY ONLY)
+    # Only check today's logs to determine status. If the last log is from
+    # a previous day, treat it as a fresh day (check-out / "Start of Day").
+    today_log = await attendance_logs_collection.find_one(
+        {"email": employee_id, "timestamp": {"$gte": today_start}},
         sort=[("timestamp", -1)]
     )
-    current_status = last_log.get("type", "check-out") if last_log else "check-out"
+    if today_log:
+        current_status = today_log.get("type", "check-out")
+    else:
+        # No log today → fresh day → user needs to check in
+        current_status = "check-out"
             
     return {
         "date": query_date,
