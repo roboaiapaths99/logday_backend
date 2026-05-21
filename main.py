@@ -1001,11 +1001,14 @@ async def smart_attendance(req: VerifyPresenceRequest, background_tasks: Backgro
                     check_in_method = CheckInMethod.OTP_FALLBACK
                 else:
                     # Territory verification
-                    t_lat = user.get("territory_center_lat", 0)
-                    t_lng = user.get("territory_center_lng", 0)
+                    t_lat_val = user.get("territory_center_lat")
+                    t_lng_val = user.get("territory_center_lng")
+                    t_lat = float(t_lat_val) if t_lat_val is not None else 0.0
+                    t_lng = float(t_lng_val) if t_lng_val is not None else 0.0
                     if abs(t_lat) < 0.01 and abs(office_lat) > 0.01:
                         t_lat, t_lng = office_lat, office_long
-                    t_radius = user.get("territory_radius_meters", 500)
+                    t_radius_val = user.get("territory_radius_meters")
+                    t_radius = float(t_radius_val) if t_radius_val is not None else 500.0
                     dist = calculate_haversine(req.lat, req.long, t_lat, t_lng)
                     if dist > t_radius:
                         raise HTTPException(status_code=403, detail=f"Territory Breach. You are {dist:.0f}m away from your assigned zone.")
