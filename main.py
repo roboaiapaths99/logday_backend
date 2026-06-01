@@ -6182,6 +6182,7 @@ async def scan_screenshot_ocr_threats(screenshot_id: str, image_path: str, emplo
 
 @app.get("/api/wfh/screenshots")
 async def get_my_screenshots(
+    request: Request,
     date: Optional[str] = None,
     limit: int = 100,
     employee=Depends(get_current_employee)
@@ -6199,6 +6200,12 @@ async def get_my_screenshots(
     
     for item in screenshots:
         item["_id"] = str(item["_id"])
+        image_url = item.get("image_url", "")
+        if image_url and image_url.startswith("/uploads/"):
+            item["image_url"] = build_static_upload_url(request, image_url)
+        thumbnail_url = item.get("thumbnail_url", "")
+        if thumbnail_url and thumbnail_url.startswith("/uploads/"):
+            item["thumbnail_url"] = build_static_upload_url(request, thumbnail_url)
         
     return {"screenshots": screenshots}
 
@@ -7071,6 +7078,7 @@ async def complete_command(command_id: str, employee=Depends(get_current_employe
 
 @app.get("/admin/wfh/employee/{email}/screenshots")
 async def admin_wfh_employee_screenshots(
+    request: Request,
     email: str,
     date: Optional[str] = None,
     limit: int = 100,
@@ -7091,6 +7099,12 @@ async def admin_wfh_employee_screenshots(
 
     for item in screenshots:
         item["_id"] = str(item["_id"])
+        image_url = item.get("image_url", "")
+        if image_url and image_url.startswith("/uploads/"):
+            item["image_url"] = build_static_upload_url(request, image_url)
+        thumbnail_url = item.get("thumbnail_url", "")
+        if thumbnail_url and thumbnail_url.startswith("/uploads/"):
+            item["thumbnail_url"] = build_static_upload_url(request, thumbnail_url)
 
     return screenshots
 
