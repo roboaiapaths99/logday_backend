@@ -20,3 +20,5 @@ gspread==5.12.0
 google-auth==2.27.0
 pandas==2.2.1
 argon2-cffi==23.1.0
+boto3==1.34.69
+certifi==2024.2.2
