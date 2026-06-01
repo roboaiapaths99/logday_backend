@@ -72,7 +72,7 @@ from auth import (
     get_current_admin, get_current_employee, admin_oauth2_scheme, employee_oauth2_scheme,
     SECRET_KEY, ALGORITHM
 )
-from attendance_service import toggle_check_in
+import uuid
 from face_utils import get_face_embedding, verify_face, compare_faces
 from sheets_sync import sync_to_google_sheets, sync_visit_to_google_sheets
 from fastapi import BackgroundTasks
@@ -804,11 +804,22 @@ async def login(req: LoginRequest, request: Request):
 @app.post("/auth/check")
 async def auth_check(employee=Depends(get_current_employee)):
     """Toggle check‑in status and return updated info."""
-    updated = await toggle_check_in(employee["email"])
+    # Inlined from deleted attendance_service.py
+    emp = await employees_collection.find_one({"email": employee["email"]})
+    if not emp:
+        raise HTTPException(status_code=404, detail="Employee not found")
+    new_status = not emp.get("checked_in", False)
+    update_fields = {"checked_in": new_status, "last_checkin": datetime.now(timezone.utc)}
+    if new_status:
+        update_fields["session_id"] = str(uuid.uuid4())
+    else:
+        update_fields["session_id"] = None
+    await employees_collection.update_one({"email": employee["email"]}, {"$set": update_fields})
+    emp.update(update_fields)
     return {
         "status": "success",
-        "checked_in": updated.get("checked_in", False),
-        "session_id": updated.get("session_id")
+        "checked_in": emp.get("checked_in", False),
+        "session_id": emp.get("session_id")
     }
 
 
