@@ -267,7 +267,7 @@ async def trigger_alert(alert_type: str, employee_id: str, organization_id: str,
 UPLOAD_DIR = "uploads"
 if not os.path.exists(UPLOAD_DIR):
     os.makedirs(UPLOAD_DIR)
-os.makedirs("uploads/wfh_screenshots", exist_ok=True)
+os.makedirs("uploads/wfh_view", exist_ok=True)
 
 # Serve static files
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
@@ -282,7 +282,7 @@ S3_SECRET_ACCESS_KEY = os.getenv("S3_SECRET_ACCESS_KEY") or os.getenv("AWS_SECRE
 S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME") or os.getenv("AWS_STORAGE_BUCKET_NAME", "logday-wfh-screenshots")
 S3_REGION_NAME = os.getenv("S3_REGION_NAME", "us-east-1")
 
-async def upload_file_to_storage(image_bytes: bytes, filename: str, folder: str = "wfh_screenshots") -> str:
+async def upload_file_to_storage(image_bytes: bytes, filename: str, folder: str = "wfh_view") -> str:
     """
     Enterprise hybrid storage: Uploads to S3/MinIO if configured, otherwise falls back to local disk.
     """
@@ -6249,8 +6249,8 @@ async def wfh_submit_screenshot(req: dict, background_tasks: BackgroundTasks, re
                 ext = ".png"
             elif "gif" in header:
                 ext = ".gif"
-            filename = f"screenshot_{int(time.time())}_{uuid.uuid4().hex[:8]}{ext}"
-            image_url = await upload_file_to_storage(image_bytes, filename, "wfh_screenshots")
+            filename = f"view_{int(time.time())}_{uuid.uuid4().hex[:8]}{ext}"
+            image_url = await upload_file_to_storage(image_bytes, filename, "wfh_view")
         except Exception as err:
             logger.error(f"Failed to decode base64 screenshot: {err}")
             raise HTTPException(status_code=400, detail=f"Invalid base64 image data: {err}")
