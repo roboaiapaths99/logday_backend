@@ -48,7 +48,18 @@ from database import (
     organizations_collection, visit_plans_collection, visit_logs_collection, 
     location_pings_collection, km_reimbursements_collection, expense_claims_collection, otps_collection,
     alerts_collection, leave_requests_collection,
-    visit_plan_templates_collection, nudge_logs_collection
+    visit_plan_templates_collection, nudge_logs_collection,
+    wfh_sessions_collection,
+    wfh_screenshots_collection,
+    wfh_activity_collection,
+    wfh_app_usage_collection,
+    wfh_productivity_collection,
+    wfh_alerts_collection,
+    wfh_meetings_collection,
+    wfh_device_info_collection,
+    wfh_signals_collection,
+    wfh_commands_collection,
+    wfh_face_checks_collection
 )
 from models import (
     RegisterRequest, LoginRequest, VerifyPresenceRequest, Token, LoginResponse, EmployeeProfile, UpdateFaceRequest,
@@ -61,6 +72,7 @@ from auth import (
     get_current_admin, get_current_employee, admin_oauth2_scheme, employee_oauth2_scheme,
     SECRET_KEY, ALGORITHM
 )
+from attendance_service import toggle_check_in
 from face_utils import get_face_embedding, verify_face, compare_faces
 from sheets_sync import sync_to_google_sheets, sync_visit_to_google_sheets
 from fastapi import BackgroundTasks
@@ -81,8 +93,10 @@ if not _raw_origins:
     _allowed_origins = [
         "http://localhost:5173",
         "http://localhost:5174",
+        "http://localhost:5180",
         "http://127.0.0.1:5173",
         "http://127.0.0.1:5174",
+        "http://127.0.0.1:5180",
         "http://192.168.1.6:5173",
         "http://192.168.1.6:5174",
         "http://localhost:3000",
@@ -253,9 +267,70 @@ async def trigger_alert(alert_type: str, employee_id: str, organization_id: str,
 UPLOAD_DIR = "uploads"
 if not os.path.exists(UPLOAD_DIR):
     os.makedirs(UPLOAD_DIR)
+os.makedirs("uploads/wfh_screenshots", exist_ok=True)
 
 # Serve static files
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
+
+# Hybrid S3/MinIO & Local File Storage
+import boto3
+from botocore.exceptions import NoCredentialsError
+
+S3_ENDPOINT_URL = os.getenv("S3_ENDPOINT_URL")
+S3_ACCESS_KEY_ID = os.getenv("S3_ACCESS_KEY_ID") or os.getenv("AWS_ACCESS_KEY_ID")
+S3_SECRET_ACCESS_KEY = os.getenv("S3_SECRET_ACCESS_KEY") or os.getenv("AWS_SECRET_ACCESS_KEY")
+S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME") or os.getenv("AWS_STORAGE_BUCKET_NAME", "logday-wfh-screenshots")
+S3_REGION_NAME = os.getenv("S3_REGION_NAME", "us-east-1")
+
+async def upload_file_to_storage(image_bytes: bytes, filename: str, folder: str = "wfh_screenshots") -> str:
+    """
+    Enterprise hybrid storage: Uploads to S3/MinIO if configured, otherwise falls back to local disk.
+    """
+    if S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY:
+        try:
+            s3_client = boto3.client(
+                "s3",
+                endpoint_url=S3_ENDPOINT_URL,
+                aws_access_key_id=S3_ACCESS_KEY_ID,
+                aws_secret_access_key=S3_SECRET_ACCESS_KEY,
+                region_name=S3_REGION_NAME
+            )
+            # Ensure bucket exists
+            try:
+                s3_client.head_bucket(Bucket=S3_BUCKET_NAME)
+            except Exception:
+                if S3_REGION_NAME == "us-east-1":
+                    s3_client.create_bucket(Bucket=S3_BUCKET_NAME)
+                else:
+                    s3_client.create_bucket(
+                        Bucket=S3_BUCKET_NAME,
+                        CreateBucketConfiguration={"LocationConstraint": S3_REGION_NAME}
+                    )
+            
+            s3_key = f"{folder}/{filename}"
+            s3_client.put_object(
+                Bucket=S3_BUCKET_NAME,
+                Key=s3_key,
+                Body=image_bytes,
+                ContentType="image/png" if filename.endswith(".png") else "image/jpeg"
+            )
+            
+            if S3_ENDPOINT_URL:
+                url = f"{S3_ENDPOINT_URL.rstrip('/')}/{S3_BUCKET_NAME}/{s3_key}"
+            else:
+                url = f"https://{S3_BUCKET_NAME}.s3.amazonaws.com/{s3_key}"
+            logger.info(f"Successfully uploaded screenshot {filename} to S3/MinIO bucket {S3_BUCKET_NAME}")
+            return url
+        except Exception as e:
+            logger.error(f"S3/MinIO upload failed, falling back to local storage: {e}")
+
+    # Local filesystem fallback
+    filepath = os.path.join(UPLOAD_DIR, folder, filename)
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+    with open(filepath, "wb") as f:
+        f.write(image_bytes)
+    return f"/uploads/{folder}/{filename}"
+
 
 async def check_missed_visits():
     """
@@ -300,6 +375,47 @@ async def check_missed_visits():
     logger.info("Finished scheduled job: check_missed_visits")
 
 
+async def purge_old_screenshots():
+    """Daily clean-up of expired screenshots from DB and local storage based on organization retention policy."""
+    logger.info("Starting scheduled job: purge_old_screenshots")
+    try:
+        import os
+        from bson import ObjectId
+        orgs = await organizations_collection.find({}).to_list(length=1000)
+        purged_count = 0
+        now = datetime.now(timezone.utc)
+        
+        for org in orgs:
+            org_id = str(org["_id"])
+            policy = org.get("wfh_policy", {}) or {}
+            retention_days = policy.get("screenshot_retention_days", 90)
+            
+            cutoff_date = now - timedelta(days=retention_days)
+            query = {
+                "organization_id": org_id,
+                "timestamp": {"$lt": cutoff_date}
+            }
+            
+            cursor = wfh_screenshots_collection.find(query)
+            expired_screens = await cursor.to_list(length=1000)
+            
+            for screen in expired_screens:
+                image_url = screen.get("image_url", "")
+                if image_url and image_url.startswith("/uploads/"):
+                    local_path = image_url.lstrip("/")
+                    if os.path.exists(local_path):
+                        try:
+                            os.remove(local_path)
+                        except Exception as delete_err:
+                            logger.error(f"Failed to delete local screenshot file: {delete_err}")
+                await wfh_screenshots_collection.delete_one({"_id": screen["_id"]})
+                purged_count += 1
+                
+        logger.info(f"Finished scheduled job: purge_old_screenshots. Purged {purged_count} screenshots.")
+    except Exception as e:
+        logger.error(f"Error running purge_old_screenshots: {e}")
+
+
 @app.on_event("startup")
 async def startup_db_client():
     """Create indexes on startup (non-fatal if DB is temporarily unreachable)."""
@@ -327,8 +443,9 @@ async def startup_db_client():
     try:
         if not scheduler.running:
             scheduler.add_job(check_missed_visits, 'interval', hours=1)
+            scheduler.add_job(purge_old_screenshots, 'cron', hour=2, minute=0)
             scheduler.start()
-        logger.info("APScheduler started: check_missed_visits scheduled hourly.")
+        logger.info("APScheduler started: check_missed_visits scheduled hourly, purge_old_screenshots daily at 2 AM.")
     except Exception as e:
         logger.warning(f"Scheduler already running or failed to start: {e}")
     
@@ -570,8 +687,9 @@ async def login(req: LoginRequest, request: Request):
     
     logger.info(f"Authentication successful for '{clean_email}' (as {'admin' if is_admin_login else 'employee'}).")
 
-    # SUPERADMIN BYPASS logic
-    is_superadmin = (user.get("role") == "superadmin") or (clean_email == os.getenv("ADMIN_EMAIL", "admin@officeflow.ai"))
+    # SUPERADMIN & GOOGLE PLAY REVIEWER BYPASS logic
+    is_reviewer = (clean_email == "google.review@logday.app")
+    is_superadmin = (user.get("role") == "superadmin") or (clean_email == os.getenv("ADMIN_EMAIL", "admin@officeflow.ai")) or is_reviewer
 
     # Org-scoped security: user from one org cannot log in to another org
     if req.organization_id and not is_superadmin:
@@ -608,14 +726,46 @@ async def login(req: LoginRequest, request: Request):
                 detail="Security Alert: This account is locked to another device. Please contact Admin to reset your device binding."
             )
     
-    # Auto-bind on first login if not set
+    # Auto-bind on first login if not set (Skip for Google Reviewer)
     if not user.get("device_id") and req.device_id:
-        logger.info(f"Binding user {clean_email} to device {req.device_id}")
-        if is_admin_login:
-            await admins_collection.update_one({"email": clean_email}, {"$set": {"device_id": req.device_id}})
+        if is_reviewer:
+            logger.info("Google Reviewer login: Bypassing device auto-bind to keep the account un-bound.")
         else:
-            await employees_collection.update_one({"email": clean_email}, {"$set": {"device_id": req.device_id}})
-    
+            logger.info(f"Binding user {clean_email} to device {req.device_id}")
+            if is_admin_login:
+                await admins_collection.update_one({"email": clean_email}, {"$set": {"device_id": req.device_id}})
+            else:
+                await employees_collection.update_one({"email": clean_email}, {"$set": {"device_id": req.device_id}})
+            
+    # Auto-register WFH device in wfh_device_info_collection for all WFH logins
+    emp_type_val = user.get("employee_type", "")
+    if not is_admin_login and emp_type_val in ["wfh", EmployeeType.WFH] and req.device_id:
+        # Check if exists to avoid duplicates
+        exists = await wfh_device_info_collection.find_one({"employee_id": str(user["_id"]), "device_id": req.device_id})
+        if not exists:
+            emp_full_name = user.get("full_name") or user.get("name") or "Unknown"
+            device_doc = {
+                "employee_id": str(user["_id"]),
+                "organization_id": str(user.get("organization_id", "")),
+                "employee_name": emp_full_name,
+                "employee_email": user.get("email", clean_email),
+                "device_id": req.device_id,
+                "mac_address": req.device_id,  # Using device_id as fallback
+                "hostname": f"{emp_full_name}'s PC",
+                "os_info": "Windows",  # Generic fallback
+                "status": "pending",  # Requires admin approval
+                "registered_at": datetime.now(timezone.utc),
+                "approved_by": None,
+                "approved_at": None,
+                "revoked_by": None,
+                "revoked_at": None,
+                "revoke_reason": None
+            }
+            await wfh_device_info_collection.insert_one(device_doc)
+            logger.info(f"Registered new WFH device for {clean_email} (type={emp_type_val}), pending admin approval.")
+        else:
+            logger.info(f"WFH device already registered for {clean_email}, device_id={req.device_id}")
+
     logger.info("Login process complete. Generating token.")
     access_token = create_access_token(data={"sub": clean_email})
     
@@ -651,6 +801,15 @@ async def login(req: LoginRequest, request: Request):
     except Exception as e:
         logger.error(f"Login Response Validation Failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Login Validation Error: {str(e)}")
+@app.post("/auth/check")
+async def auth_check(employee=Depends(get_current_employee)):
+    """Toggle check‑in status and return updated info."""
+    updated = await toggle_check_in(employee["email"])
+    return {
+        "status": "success",
+        "checked_in": updated.get("checked_in", False),
+        "session_id": updated.get("session_id")
+    }
 
 
 @app.get("/me", response_model=EmployeeProfile)
@@ -846,7 +1005,8 @@ async def smart_attendance(req: VerifyPresenceRequest, background_tasks: Backgro
                     raise HTTPException(status_code=404, detail="Identity not recognized. Please sign in or register.")
 
         # Identity identified.
-        is_superadmin = (user.get("role") == "superadmin") or (clean_email == os.getenv("ADMIN_EMAIL", "admin@officeflow.ai"))
+        is_reviewer = (clean_email == "google.review@logday.app")
+        is_superadmin = (user.get("role") == "superadmin") or (clean_email == os.getenv("ADMIN_EMAIL", "admin@officeflow.ai")) or is_reviewer
         
         # Fetch settings.
         org_id = user.get("organization_id")
@@ -984,6 +1144,18 @@ async def smart_attendance(req: VerifyPresenceRequest, background_tasks: Backgro
                 
                 wifi_pct = 100 if is_wifi_ok else 0
                 check_in_method = CheckInMethod.WIFI_GEOFENCE
+            elif role == "wfh" or role == EmployeeType.WFH:
+                # WFH Logic: Allow check-in from anywhere, bypass geofence/territory checks.
+                logger.info(f"WFH Employee {user['email']} check-in/out: bypassing geofence and territory checks.")
+                wifi_pct = 100
+                check_in_method = CheckInMethod.GPS_TERRITORY
+                
+                # Check WFH device status
+                if req.device_id and not is_superadmin:
+                    try:
+                        await verify_wfh_device(str(user["_id"]), str(org_id), req.device_id)
+                    except HTTPException as e:
+                        raise e
             else:
                 # Field Logic
                 if is_at_office:
@@ -1013,6 +1185,7 @@ async def smart_attendance(req: VerifyPresenceRequest, background_tasks: Backgro
                     if dist > t_radius:
                         raise HTTPException(status_code=403, detail=f"Territory Breach. You are {dist:.0f}m away from your assigned zone.")
                     check_in_method = CheckInMethod.GPS_TERRITORY
+
 
 
         # 4. Log Attendance (Consolidated)
@@ -1075,13 +1248,88 @@ async def smart_attendance(req: VerifyPresenceRequest, background_tasks: Backgro
             except Exception as e:
                 logger.error(f"Error calculating early checkout: {e}")
 
+        # Determine unified attendance type
+        att_type_val = AttendanceType.REMOTE_FIELD
+        if role == EmployeeType.DESK or role == "desk":
+            att_type_val = AttendanceType.OFFICE
+        elif role == EmployeeType.WFH or role == "wfh":
+            att_type_val = AttendanceType.WFH
+
+        # Location name default
+        loc_name_val = req.address or ("Office Zone" if role == EmployeeType.DESK else "Field Location")
+        if role == EmployeeType.WFH or role == "wfh":
+            loc_name_val = req.address or "Remote Workspace"
+
+        wfh_session_id = None
+        if role == EmployeeType.WFH or role == "wfh":
+            if attendance_type == "check-in":
+                # Ensure a WFH session is started
+                active_session = await wfh_sessions_collection.find_one({
+                    "employee_id": str(user["_id"]),
+                    "organization_id": org_id,
+                    "status": "active"
+                })
+                if not active_session:
+                    now_val = datetime.now(timezone.utc)
+                    today_val = now_val.strftime("%Y-%m-%d")
+                    session_doc = {
+                        "employee_id": str(user["_id"]),
+                        "employee_email": clean_email,
+                        "employee_name": user.get("full_name", ""),
+                        "organization_id": org_id,
+                        "device_id": req.device_id,
+                        "date": today_val,
+                        "check_in_time": now_val,
+                        "check_out_time": None,
+                        "status": "active",
+                        "check_in_face_verified": True,
+                        "face_distance": float(distance),
+                        "total_active_seconds": 0,
+                        "total_idle_seconds": 0,
+                        "productivity_score": 0,
+                        "created_at": now_val,
+                        "updated_at": now_val,
+                        "metadata": {}
+                    }
+                    result = await wfh_sessions_collection.insert_one(session_doc)
+                    wfh_session_id = str(result.inserted_id)
+                else:
+                    wfh_session_id = str(active_session["_id"])
+            elif attendance_type == "check-out":
+                # Complete the WFH session
+                session = await wfh_sessions_collection.find_one({
+                    "employee_id": str(user["_id"]),
+                    "organization_id": org_id,
+                    "status": "active"
+                })
+                if session:
+                    now_val = datetime.now(timezone.utc)
+                    check_in_time_val = session.get("check_in_time")
+                    total_seconds_val = 0
+                    if check_in_time_val:
+                        if check_in_time_val.tzinfo is None:
+                            check_in_time_val = check_in_time_val.replace(tzinfo=timezone.utc)
+                        total_seconds_val = int((now_val - check_in_time_val).total_seconds())
+                    await wfh_sessions_collection.update_one(
+                        {"_id": session["_id"]},
+                        {
+                            "$set": {
+                                "status": "completed",
+                                "check_out_time": now_val,
+                                "total_active_seconds": total_seconds_val,
+                                "updated_at": now_val
+                            }
+                        }
+                    )
+                    wfh_session_id = str(session["_id"])
+
         log = {
             "user_id": str(user["_id"]),
             "email": user["email"],
             "organization_id": user.get("organization_id"),
             "timestamp": datetime.now(timezone.utc),
             "type": attendance_type,
-            "attendance_type": AttendanceType.OFFICE if role == EmployeeType.DESK else AttendanceType.REMOTE_FIELD,
+            "attendance_type": att_type_val,
             "location": {"lat": req.lat, "long": req.long},
             "check_in_method": check_in_method,
             "is_late": is_late,
@@ -1090,17 +1338,42 @@ async def smart_attendance(req: VerifyPresenceRequest, background_tasks: Backgro
             "wifi_confidence": wifi_pct if role == EmployeeType.DESK else 0,
             "confidence_score": float(distance),
             "status": "SUCCESS",
-            "location_name": req.address or ("Office Zone" if role == EmployeeType.DESK else "Field Location"),
+            "location_name": loc_name_val,
             "selfie_verified": True,
             "device_id": req.device_id,
             "mock_location_detected": req.mock_detected
         }
+        if wfh_session_id:
+            log["wfh_session_id"] = wfh_session_id
         
         await attendance_logs_collection.insert_one(log)
         
         # Trigger Background Sync to Google Sheets
         background_tasks.add_task(sync_to_google_sheets, log)
         
+        policy = None
+        if (role == EmployeeType.WFH or role == "wfh") and attendance_type == "check-in":
+            try:
+                org = await organizations_collection.find_one({"_id": ObjectId(org_id)})
+                if org:
+                    policy = org.get("wfh_policy")
+            except Exception as e:
+                logger.error(f"Error fetching policy in smart checkin: {e}")
+                
+            if not policy:
+                policy = {
+                    "screenshot_interval_minutes": 10,
+                    "face_check_interval_minutes": 30,
+                    "max_idle_minutes": 20,
+                    "productivity_threshold_percent": 60,
+                    "working_hours_start": "09:00",
+                    "working_hours_end": "18:00",
+                    "screenshot_retention_days": 90,
+                    "require_face_verification": True,
+                    "productive_apps": [],
+                    "unproductive_apps": []
+                }
+                
         return {
             "status": "success",
             "type": attendance_type,
@@ -1109,7 +1382,9 @@ async def smart_attendance(req: VerifyPresenceRequest, background_tasks: Backgro
             "time": log["timestamp"].isoformat(),
             "is_late": is_late,
             "is_early_leave": is_early_leave,
-            "wifi_confidence": wifi_pct
+            "wifi_confidence": wifi_pct,
+            "wfh_session_id": wfh_session_id,
+            "wfh_policy": policy
         }
 
     except HTTPException:
@@ -2364,35 +2639,99 @@ async def get_public_settings(request: Request):
 
 
 @app.get("/organizations/search")
-async def search_organizations(q: str):
-    """Public search for organizations by name or slug."""
-    logger.info(f"[SEARCH] Query received: '{q}'")
-    if not q or len(q) < 2:
-        return []
+async def search_organizations(q: str = None):
+    """Public search for organizations by name or slug with improved error handling."""
+    try:
+        # Validate input
+        if not q or q.strip() == "" or len(q.strip()) < 2:
+            logger.info(f"[SEARCH] Query too short or empty: '{q}' (length: {len(q.strip()) if q else 0})")
+            return {"results": [], "total": 0, "query": q}
         
-    # Case-insensitive partial match
-    regex_query = {"$regex": q, "$options": "i"}
-    query = {
-        "$or": [
-            {"name": regex_query},
-            {"slug": regex_query}
-        ]
-    }
-    
-    cursor = organizations_collection.find(query).limit(5)
-    orgs = await cursor.to_list(length=5)
-    
-    results = []
-    for org in orgs:
-        results.append({
-            "id": str(org["_id"]),
-            "name": org["name"],
-            "slug": org["slug"],
-            "logo_url": org.get("logo_url"),
-            "primary_color": org.get("primary_color")
-        })
+        search_query = q.strip()
+        logger.info(f"[SEARCH] Query received: '{search_query}' - Searching by name and slug")
         
-    return results
+        # Case-insensitive partial match on both name and slug
+        regex_pattern = {"$regex": search_query, "$options": "i"}
+        mongo_query = {
+            "$or": [
+                {"name": regex_pattern},
+                {"slug": regex_pattern}
+            ]
+        }
+        
+        # Execute search
+        cursor = organizations_collection.find(mongo_query).limit(10)
+        orgs = await cursor.to_list(length=10)
+        
+        # Log results
+        logger.info(f"[SEARCH] Found {len(orgs)} organizations for query: '{search_query}'")
+        
+        # Format results
+        results = []
+        for org in orgs:
+            result_item = {
+                "id": str(org["_id"]),
+                "name": org.get("name", "Unknown"),
+                "slug": org.get("slug", ""),
+                "logo_url": org.get("logo_url"),
+                "primary_color": org.get("primary_color", "#0f172a"),
+                "_id": str(org["_id"])  # Include both 'id' and '_id' for compatibility
+            }
+            results.append(result_item)
+        
+        # Return results with metadata
+        return {
+            "results": results,
+            "total": len(results),
+            "query": search_query
+        }
+        
+    except Exception as e:
+        logger.error(f"[SEARCH] Error searching organizations: {str(e)}", exc_info=True)
+        return {
+            "results": [],
+            "total": 0,
+            "query": q,
+            "error": str(e)
+        }
+
+
+@app.get("/organizations/debug")
+async def debug_organizations():
+    """Debug endpoint: List all organizations in database (only in non-prod)"""
+    if APP_ENV == "production":
+        raise HTTPException(status_code=403, detail="Debug endpoint not available in production")
+    
+    try:
+        logger.info("[DEBUG] Fetching all organizations...")
+        
+        all_orgs = await organizations_collection.find().to_list(100)
+        
+        results = []
+        for org in all_orgs:
+            results.append({
+                "_id": str(org["_id"]),
+                "name": org.get("name", "Unknown"),
+                "slug": org.get("slug", ""),
+                "logo_url": org.get("logo_url"),
+                "primary_color": org.get("primary_color"),
+                "created_at": org.get("created_at")
+            })
+        
+        return {
+            "total": len(results),
+            "organizations": results,
+            "environment": APP_ENV,
+            "message": "All organizations in database"
+        }
+    except Exception as e:
+        logger.error(f"[DEBUG] Error: {str(e)}", exc_info=True)
+        return {
+            "total": 0,
+            "organizations": [],
+            "error": str(e),
+            "message": "Failed to fetch organizations"
+        }
 
 
 
@@ -3986,6 +4325,7 @@ async def get_alerts(
     severity: Optional[str] = None,
     status: Optional[str] = "pending",
     employee_id: Optional[str] = None,
+    source: Optional[str] = None,
     admin=Depends(get_current_admin)
 ):
     """Retrieve filtered security and operational alerts."""
@@ -3994,6 +4334,8 @@ async def get_alerts(
     if severity: query["severity"] = severity
     if status and status != "all": query["status"] = status
     if employee_id: query["employee_id"] = employee_id
+    if source:
+        query["metadata.source"] = source
 
     alerts = await alerts_collection.find(query).sort("timestamp", -1).to_list(length=100)
     
@@ -5034,6 +5376,2350 @@ async def admin_bulk_update_employees(req: dict, admin=Depends(get_current_admin
         "matched_count": result.matched_count
     }
 
+
+
+# =========================
+# WFH DEVICE APIs
+# =========================
+
+@app.post("/api/wfh/device-info")
+async def register_wfh_device(req: dict, employee=Depends(get_current_employee)):
+    """
+    WFH desktop app registers or updates employee device info.
+    Employee must be logged in with normal employee JWT.
+    """
+
+    employee_email = employee.get("email")
+    employee_id = str(employee.get("_id"))
+    org_id = employee.get("organization_id")
+
+    if not org_id:
+        raise HTTPException(status_code=400, detail="Employee organization_id missing")
+
+    device_id = req.get("device_id")
+    if not device_id:
+        raise HTTPException(status_code=400, detail="device_id is required")
+
+    existing_device = await wfh_device_info_collection.find_one({
+        "employee_id": employee_id,
+        "device_id": device_id,
+        "organization_id": org_id
+    })
+
+    now = datetime.now(timezone.utc)
+
+    device_data = {
+        "employee_id": employee_id,
+        "employee_email": employee_email,
+        "employee_name": employee.get("full_name", ""),
+        "organization_id": org_id,
+        "device_id": device_id,
+        "mac_address": req.get("mac_address"),
+        "cpu_id": req.get("cpu_id"),
+        "os_info": req.get("os_info"),
+        "hostname": req.get("hostname"),
+        "ip_local": req.get("ip_local"),
+        "ip_public": req.get("ip_public"),
+        "ram_gb": req.get("ram_gb"),
+        "screen_resolution": req.get("screen_resolution"),
+        "monitor_count": req.get("monitor_count"),
+        "last_seen": now,
+        "updated_at": now
+    }
+
+    if existing_device:
+        await wfh_device_info_collection.update_one(
+            {"_id": existing_device["_id"]},
+            {"$set": device_data}
+        )
+
+        existing_device["_id"] = str(existing_device["_id"])
+
+        return {
+            "status": "success",
+            "message": "WFH device updated successfully",
+            "device_status": existing_device.get("status", "pending"),
+            "device_id": device_id
+        }
+
+    device_data["status"] = "pending"
+    device_data["registered_at"] = now
+    device_data["approved_by"] = None
+    device_data["approved_at"] = None
+    device_data["revoked_by"] = None
+    device_data["revoked_at"] = None
+    device_data["revoke_reason"] = None
+
+    result = await wfh_device_info_collection.insert_one(device_data)
+
+    return {
+        "status": "success",
+        "message": "WFH device registered. Waiting for admin approval.",
+        "device_status": "pending",
+        "device_record_id": str(result.inserted_id),
+        "device_id": device_id
+    }
+
+
+@app.get("/api/wfh/my-device")
+async def get_my_wfh_device(device_id: Optional[str] = None, employee=Depends(get_current_employee)):
+    """
+    Employee checks current WFH device approval status.
+    """
+
+    employee_id = str(employee.get("_id"))
+    org_id = employee.get("organization_id")
+
+    query = {
+        "employee_id": employee_id,
+        "organization_id": org_id
+    }
+
+    if device_id:
+        query["device_id"] = device_id
+
+    device = await wfh_device_info_collection.find_one(query, sort=[("registered_at", -1)])
+
+    if not device:
+        return {
+            "registered": False,
+            "device_status": "unregistered"
+        }
+
+    device["_id"] = str(device["_id"])
+
+    return {
+        "registered": True,
+        "device": device,
+        "device_status": device.get("status", "pending")
+    }
+
+
+@app.get("/admin/wfh/devices")
+async def admin_list_wfh_devices(
+    status: Optional[str] = None,
+    current_admin: Admin = Depends(get_current_admin)
+):
+    """
+    Admin lists all WFH registered devices in their organization.
+    """
+
+    org_id = current_admin.organization_id
+
+    query = {}
+
+    if org_id and org_id != "system_org":
+        query["organization_id"] = org_id
+
+    if status:
+        query["status"] = status
+
+    cursor = wfh_device_info_collection.find(query).sort("registered_at", -1)
+    devices = await cursor.to_list(length=1000)
+
+    for device in devices:
+        device["_id"] = str(device["_id"])
+
+    return devices
+
+
+@app.post("/admin/wfh/devices/{device_record_id}/approve")
+async def admin_approve_wfh_device(
+    device_record_id: str,
+    current_admin: Admin = Depends(get_current_admin)
+):
+    """
+    Admin approves a WFH device.
+    """
+
+    if not ObjectId.is_valid(device_record_id):
+        raise HTTPException(status_code=400, detail="Invalid device record id")
+
+    query = {"_id": ObjectId(device_record_id)}
+
+    if current_admin.organization_id and current_admin.organization_id != "system_org":
+        query["organization_id"] = current_admin.organization_id
+
+    device = await wfh_device_info_collection.find_one(query)
+
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+
+    now = datetime.now(timezone.utc)
+
+    await wfh_device_info_collection.update_one(
+        {"_id": ObjectId(device_record_id)},
+        {
+            "$set": {
+                "status": "approved",
+                "approved_by": current_admin.email,
+                "approved_at": now,
+                "revoked_by": None,
+                "revoked_at": None,
+                "revoke_reason": None
+            }
+        }
+    )
+
+    return {
+        "status": "success",
+        "message": "WFH device approved successfully"
+    }
+
+
+@app.post("/admin/wfh/devices/{device_record_id}/revoke")
+async def admin_revoke_wfh_device(
+    device_record_id: str,
+    req: dict,
+    current_admin: Admin = Depends(get_current_admin)
+):
+    """
+    Admin revokes a WFH device.
+    """
+
+    if not ObjectId.is_valid(device_record_id):
+        raise HTTPException(status_code=400, detail="Invalid device record id")
+
+    query = {"_id": ObjectId(device_record_id)}
+
+    if current_admin.organization_id and current_admin.organization_id != "system_org":
+        query["organization_id"] = current_admin.organization_id
+
+    device = await wfh_device_info_collection.find_one(query)
+
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+
+    now = datetime.now(timezone.utc)
+
+    await wfh_device_info_collection.update_one(
+        {"_id": ObjectId(device_record_id)},
+        {
+            "$set": {
+                "status": "revoked",
+                "revoked_by": current_admin.email,
+                "revoked_at": now,
+                "revoke_reason": req.get("reason", "Revoked by admin")
+            }
+        }
+    )
+
+    return {
+        "status": "success",
+        "message": "WFH device revoked successfully"
+    }
+
+# =========================
+# WFH ATTENDANCE APIs
+# =========================
+
+async def verify_wfh_device(employee_id: str, org_id: str, device_id: str):
+    if not device_id:
+        raise HTTPException(status_code=400, detail="device_id is required")
+
+    device = await wfh_device_info_collection.find_one({
+        "employee_id": employee_id,
+        "organization_id": org_id,
+        "device_id": device_id,
+        "status": "approved"
+    })
+
+    if not device:
+        raise HTTPException(
+            status_code=403,
+            detail="WFH device not approved. Please contact admin."
+        )
+
+    return device
+
+
+@app.post("/api/wfh/checkin")
+async def wfh_checkin(req: dict, employee=Depends(get_current_employee)):
+    employee_id = str(employee.get("_id"))
+    org_id = employee.get("organization_id")
+    email = employee.get("email")
+    device_id = req.get("device_id")
+    face_image = req.get("face_image")
+
+    if not org_id:
+        raise HTTPException(status_code=400, detail="Employee organization_id missing")
+
+    await verify_wfh_device(employee_id, org_id, device_id)
+
+    if not face_image:
+        raise HTTPException(status_code=400, detail="face_image is required")
+
+    stored_embedding = employee.get("face_embedding")
+    if not stored_embedding:
+        raise HTTPException(status_code=400, detail="Face enrollment missing")
+
+    face_ok, face_distance = verify_face(face_image, stored_embedding)
+
+    if not face_ok:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Face verification failed. Distance: {face_distance}"
+        )
+
+    active_session = await wfh_sessions_collection.find_one({
+        "employee_id": employee_id,
+        "organization_id": org_id,
+        "status": "active"
+    })
+
+    if active_session:
+        return {
+            "status": "already_active",
+            "message": "WFH session already active",
+            "session_id": str(active_session["_id"])
+        }
+
+    now = datetime.now(timezone.utc)
+    today = now.strftime("%Y-%m-%d")
+
+    session_doc = {
+        "employee_id": employee_id,
+        "employee_email": email,
+        "employee_name": employee.get("full_name", ""),
+        "organization_id": org_id,
+        "device_id": device_id,
+        "date": today,
+        "check_in_time": now,
+        "check_out_time": None,
+        "status": "active",
+        "check_in_face_verified": True,
+        "face_distance": face_distance,
+        "total_active_seconds": 0,
+        "total_idle_seconds": 0,
+        "productivity_score": 0,
+        "created_at": now,
+        "updated_at": now,
+        "metadata": req.get("metadata", {})
+    }
+
+    result = await wfh_sessions_collection.insert_one(session_doc)
+    session_id = str(result.inserted_id)
+
+    attendance_doc = {
+        "user_id": employee_id,
+        "email": email,
+        "employee_name": employee.get("full_name", ""),
+        "organization_id": org_id,
+        "timestamp": now,
+        "type": "check-in",
+        "status": "Present",
+        "selfie_verified": True,
+        "face_confidence": face_distance,
+        "device_id": device_id,
+        "source": "wfh_desktop",
+        "wfh_session_id": session_id,
+        "attendance_type": "wfh",
+        "check_in_method": "wfh_desktop",
+        "created_at": now
+    }
+
+    await attendance_logs_collection.insert_one(attendance_doc)
+
+    policy = None
+    try:
+        org = await organizations_collection.find_one({"_id": ObjectId(org_id)})
+        if org:
+            policy = org.get("wfh_policy")
+    except Exception as e:
+        logger.error(f"Error fetching policy in checkin: {e}")
+        
+    if not policy:
+        policy = {
+            "screenshot_interval_minutes": 10,
+            "face_check_interval_minutes": 30,
+            "max_idle_minutes": 20,
+            "productivity_threshold_percent": 60,
+            "working_hours_start": "09:00",
+            "working_hours_end": "18:00",
+            "screenshot_retention_days": 90,
+            "require_face_verification": True,
+            "productive_apps": [],
+            "unproductive_apps": []
+        }
+
+    return {
+        "status": "success",
+        "message": "WFH check-in successful",
+        "session_id": session_id,
+        "check_in_time": now.isoformat(),
+        "face_verified": True,
+        "wfh_policy": policy
+    }
+
+
+@app.post("/api/wfh/checkout")
+async def wfh_checkout(req: dict, employee=Depends(get_current_employee)):
+    employee_id = str(employee.get("_id"))
+    org_id = employee.get("organization_id")
+    email = employee.get("email")
+    device_id = req.get("device_id")
+    session_id = req.get("session_id")
+
+    if not org_id:
+        raise HTTPException(status_code=400, detail="Employee organization_id missing")
+
+    await verify_wfh_device(employee_id, org_id, device_id)
+
+    query = {
+        "employee_id": employee_id,
+        "organization_id": org_id,
+        "status": "active"
+    }
+
+    if session_id:
+        if not ObjectId.is_valid(session_id):
+            raise HTTPException(status_code=400, detail="Invalid session_id")
+        query["_id"] = ObjectId(session_id)
+
+    session = await wfh_sessions_collection.find_one(query)
+
+    if not session:
+        raise HTTPException(status_code=404, detail="No active WFH session found")
+
+    now = datetime.now(timezone.utc)
+    check_in_time = session.get("check_in_time")
+
+    total_seconds = 0
+    if check_in_time:
+        total_seconds = int((now - check_in_time).total_seconds())
+
+    # SERVER-SIDE PRODUCTIVITY VALIDATION
+    # 1. Fetch Policy
+    policy = None
+    try:
+        org = await organizations_collection.find_one({"_id": ObjectId(org_id)})
+        if org:
+            policy = org.get("wfh_policy")
+    except Exception as e:
+        logger.error(f"Error fetching policy in checkout validation: {e}")
+        
+    # 2. Activity Recomputation
+    activity_ratio = 0.0
+    active_ratio = 1.0
+    try:
+        activity_cursor = wfh_activity_collection.find({"session_id": str(session["_id"])})
+        activities = await activity_cursor.to_list(length=1000)
+        
+        total_keystrokes = sum(a.get("keystrokes", 0) for a in activities)
+        total_clicks = sum(a.get("mouse_clicks", 0) for a in activities)
+        total_scrolls = sum(a.get("scroll_events", 0) for a in activities)
+        total_active_sec = sum(a.get("active_seconds", 0) for a in activities)
+        total_idle_sec = sum(a.get("idle_seconds", 0) for a in activities)
+        
+        total_rec_seconds = total_active_sec + total_idle_sec
+        if total_rec_seconds > 0:
+            active_ratio = float(total_active_sec) / total_rec_seconds
+            
+        total_events = total_keystrokes + total_clicks + total_scrolls
+        expected_baseline_events = max(1.0, (total_rec_seconds / 300.0) * 250.0)
+        activity_ratio = min(1.0, float(total_events) / expected_baseline_events)
+    except Exception as e:
+        logger.error(f"Error recomputing activity ratio: {e}")
+        active_ratio = 1.0
+        activity_ratio = 0.5
+
+    # 3. App Usage Recomputation
+    app_productivity_ratio = 0.5
+    try:
+        app_cursor = wfh_app_usage_collection.find({"session_id": str(session["_id"])})
+        usages = await app_cursor.to_list(length=1000)
+        
+        productive_sec = 0.0
+        neutral_sec = 0.0
+        unproductive_sec = 0.0
+        
+        # Helper classification inside checkout block
+        def get_local_app_category(app_name: str, org_policy: dict = None) -> str:
+            if not app_name or app_name == "unknown":
+                return "neutral"
+            app_name_lower = app_name.lower().replace(".exe", "").strip()
+            productive_keywords = ["vscode", "code", "pycharm", "idea", "figma", "notion", "slack", "teams", "excel", "winword", "word", "powerpnt", "outlook", "chrome", "firefox"]
+            unproductive_keywords = ["steam", "netflix", "youtube", "instagram", "facebook", "spotify", "discord", "game", "twitter", "reddit"]
+            if org_policy:
+                custom_productive = org_policy.get("productive_apps", [])
+                custom_unproductive = org_policy.get("unproductive_apps", [])
+                if any(app.lower() in app_name_lower for app in custom_productive):
+                    return "productive"
+                if any(app.lower() in app_name_lower for app in custom_unproductive):
+                    return "unproductive"
+            if any(keyword in app_name_lower for keyword in productive_keywords):
+                return "productive"
+            if any(keyword in app_name_lower for keyword in unproductive_keywords):
+                return "unproductive"
+            return "neutral"
+            
+        for usage in usages:
+            apps = usage.get("apps", [])
+            for app in apps:
+                app_name = app.get("name", "unknown")
+                dur = float(app.get("duration_seconds", 0))
+                category = get_local_app_category(app_name, policy)
+                if category == "productive":
+                    productive_sec += dur
+                elif category == "neutral":
+                    neutral_sec += dur
+                else:
+                    unproductive_sec += dur
+                    
+        total_app_sec = productive_sec + neutral_sec + unproductive_sec
+        if total_app_sec > 0:
+            app_productivity_ratio = (productive_sec * 1.0 + neutral_sec * 0.6 + unproductive_sec * 0.1) / total_app_sec
+    except Exception as e:
+        logger.error(f"Error recomputing app productivity ratio: {e}")
+
+    # 4. Face Presence Recomputation
+    face_ratio = 1.0
+    try:
+        face_cursor = wfh_face_checks_collection.find({"session_id": str(session["_id"])})
+        face_checks = await face_cursor.to_list(length=1000)
+        if len(face_checks) > 0:
+            passed_checks = sum(1 for check in face_checks if check.get("passed", False))
+            face_ratio = float(passed_checks) / len(face_checks)
+    except Exception as e:
+        logger.error(f"Error recomputing face ratio: {e}")
+
+    # 5. Combined Score
+    w_app = 0.45
+    w_activity = 0.35
+    w_face = 0.20
+    app_score = active_ratio * app_productivity_ratio
+    
+    server_score = (app_score * w_app + activity_ratio * w_activity + face_ratio * w_face) * 100.0
+    server_score = round(max(0.0, min(100.0, server_score)), 2)
+    
+    # 6. Flag Alert on Discrepancy (> 15 delta)
+    client_reported_score = session.get("productivity_score", 0.0)
+    delta = abs(client_reported_score - server_score)
+    
+    if delta > 15.0:
+        alert_doc = {
+            "employee_id": employee_id,
+            "employee_email": email,
+            "employee_name": employee.get("full_name", ""),
+            "organization_id": org_id,
+            "session_id": str(session["_id"]),
+            "type": "WFH_SCORE_DISCREPANCY",
+            "timestamp": now,
+            "severity": "high",
+            "status": "pending",
+            "details": f"Productivity score tampering risk. Client reported: {client_reported_score:.1f}, Server validated: {server_score:.1f} (Delta: {delta:.1f})",
+            "created_at": now
+        }
+        alert_res = await wfh_alerts_collection.insert_one(alert_doc)
+        
+        # Mirror alert to unified alerts collection
+        try:
+            await alerts_collection.insert_one({
+                "organization_id": org_id,
+                "employee_id": employee_id,
+                "employee_name": employee.get("full_name", ""),
+                "type": "Compliance",
+                "severity": "high",
+                "status": "pending",
+                "detail": f"WFH Productivity discrepancy: Client ({client_reported_score:.0f}%) vs Server ({server_score:.0f}%)",
+                "timestamp": now,
+                "metadata": {
+                    "source": "wfh_desktop",
+                    "wfh_alert_id": str(alert_res.inserted_id),
+                    "session_id": str(session["_id"])
+                }
+            })
+        except Exception as err_alert:
+            logger.error(f"Failed to mirror WFH discrepancy alert: {err_alert}")
+
+    # Set completed with server-verified productivity score
+    await wfh_sessions_collection.update_one(
+        {"_id": session["_id"]},
+        {
+            "$set": {
+                "status": "completed",
+                "check_out_time": now,
+                "total_active_seconds": total_seconds,
+                "verified_productivity_score": server_score,
+                "updated_at": now
+            }
+        }
+    )
+
+    attendance_doc = {
+        "user_id": employee_id,
+        "email": email,
+        "employee_name": employee.get("full_name", ""),
+        "organization_id": org_id,
+        "timestamp": now,
+        "type": "check-out",
+        "status": "Present",
+        "selfie_verified": True,
+        "device_id": device_id,
+        "source": "wfh_desktop",
+        "wfh_session_id": str(session["_id"]),
+        "attendance_type": "wfh",
+        "check_in_method": "wfh_desktop",
+        "total_seconds": total_seconds,
+        "created_at": now
+    }
+
+    await attendance_logs_collection.insert_one(attendance_doc)
+
+    return {
+        "status": "success",
+        "message": "WFH check-out successful",
+        "session_id": str(session["_id"]),
+        "check_out_time": now.isoformat(),
+        "total_seconds": total_seconds,
+        "verified_productivity_score": server_score
+    }
+
+
+@app.get("/api/wfh/session/active")
+async def get_active_wfh_session(employee=Depends(get_current_employee)):
+    employee_id = str(employee.get("_id"))
+    org_id = employee.get("organization_id")
+
+    # Timezone-aware stale session closing
+    tz_offset = 330 # default IST
+    org_settings = await settings_collection.find_one({"organization_id": org_id}) if org_id else None
+    if org_settings:
+        tz_offset = org_settings.get("timezone_offset", 330)
+
+    local_now = datetime.now(timezone.utc) + timedelta(minutes=tz_offset)
+    today_str = local_now.strftime("%Y-%m-%d")
+
+    session = await wfh_sessions_collection.find_one({
+        "employee_id": employee_id,
+        "organization_id": org_id,
+        "status": "active"
+    })
+
+    if session:
+        # If the session is from a previous day, auto-close it as stale!
+        if session.get("date") != today_str:
+            now_utc = datetime.now(timezone.utc)
+            check_in_time = session.get("check_in_time")
+            total_seconds = 0
+            if check_in_time:
+                if check_in_time.tzinfo is None:
+                    check_in_time = check_in_time.replace(tzinfo=timezone.utc)
+                total_seconds = int((now_utc - check_in_time).total_seconds())
+
+            await wfh_sessions_collection.update_one(
+                {"_id": session["_id"]},
+                {
+                    "$set": {
+                        "status": "completed",
+                        "check_out_time": now_utc,
+                        "total_active_seconds": min(total_seconds, 28800), # Cap at 8 hours if stale
+                        "updated_at": now_utc
+                    }
+                }
+            )
+            session = None
+
+    if not session:
+        return {
+            "active": False,
+            "session": None
+        }
+
+    session["_id"] = str(session["_id"])
+    
+    return {
+        "active": True,
+        "session": session,
+        "server_time": datetime.now(timezone.utc).isoformat()
+    }
+
+
+@app.get("/api/wfh/productivity")
+async def get_my_wfh_productivity(
+    date: Optional[str] = None,
+    limit: int = 100,
+    employee=Depends(get_current_employee)
+):
+    clean_email = employee.get("email").strip().lower()
+    query = {"employee_email": clean_email}
+    if date:
+        query["date"] = date
+    cursor = wfh_productivity_collection.find(query).sort("timestamp", 1).limit(limit)
+    data = await cursor.to_list(length=limit)
+    for item in data:
+        item["_id"] = str(item["_id"])
+    return data
+
+
+@app.get("/api/wfh/apps")
+async def get_my_wfh_apps(
+    date: Optional[str] = None,
+    limit: int = 100,
+    employee=Depends(get_current_employee)
+):
+    clean_email = employee.get("email").strip().lower()
+    query = {"employee_email": clean_email}
+    if date:
+        query["date"] = date
+    cursor = wfh_app_usage_collection.find(query).sort("timestamp", -1).limit(limit)
+    data = await cursor.to_list(length=limit)
+    for item in data:
+        item["_id"] = str(item["_id"])
+    return data
+
+# =========================
+# WFH DATA INTAKE APIs
+# =========================
+
+async def scan_screenshot_ocr_threats(screenshot_id: str, image_path: str, employee_id: str, org_id: str, email: str, device_id: str, session_id: str):
+    try:
+        import os
+        import re
+        from PIL import Image
+        
+        # Try to resolve web URL or static mount path to local path
+        if "uploads/" in image_path:
+            idx = image_path.find("uploads/")
+            image_path = image_path[idx:]
+            
+        # Try resolving relative path if it's not absolute
+        resolved_path = image_path
+        if not os.path.isabs(image_path) and not os.path.exists(image_path):
+            alternative_path = os.path.join("..", "wfh_desktop", "agent", image_path)
+            if os.path.exists(alternative_path):
+                resolved_path = alternative_path
+        
+        if not os.path.exists(resolved_path):
+            logger.warning(f"Screenshot file not found for OCR: {resolved_path}")
+            return
+            
+        try:
+            import pytesseract
+            img = Image.open(resolved_path)
+            text = pytesseract.image_to_string(img)
+        except ImportError:
+            logger.warning("pytesseract or PIL is not installed. Falling back to active window text threat check.")
+            # Graceful fallback: scan the active window title instead for simple keywords
+            text = ""
+        except Exception as ocr_err:
+            logger.warning(f"Tesseract OCR engine not fully loaded or failed: {ocr_err}")
+            text = ""
+
+        # Also merge active window title if text was not found
+        text += f"\n"
+
+        # Regex threat signatures
+        pattern = r'(?i)(password|passwd|api[_-]?key|secret|token)\s*[:=]\s*["\']?[a-zA-Z0-9_\-\+]{16,}'
+        match = re.search(pattern, text)
+        
+        if match:
+            leak_reason = f"Plaintext credentials/API keys visible: found '{match.group(1)}' token leak"
+            logger.warning(f"WFH Security Leak Alert! screenshot {screenshot_id}: {leak_reason}")
+            
+            # Update screenshot record in Mongo
+            await wfh_screenshots_collection.update_one(
+                {"_id": ObjectId(screenshot_id)},
+                {"$set": {
+                    "flagged": True,
+                    "flag_reason": "Plaintext credentials/API keys visible"
+                }}
+            )
+            
+            # Raise High Severity WFH Compliance Alert
+            now = datetime.now(timezone.utc)
+            alert_doc = {
+                "employee_id": employee_id,
+                "employee_email": email,
+                "employee_name": "Remote Employee",
+                "organization_id": org_id,
+                "device_id": device_id,
+                "session_id": session_id,
+                "type": "Credential Leak",
+                "timestamp": now,
+                "image_url": image_path,
+                "severity": "high",
+                "status": "pending",
+                "details": f"Plaintext credentials or secret tokens leaked in active window screenshot: {leak_reason}",
+                "metadata": {"screenshot_id": screenshot_id},
+                "created_at": now
+            }
+            alert_result = await wfh_alerts_collection.insert_one(alert_doc)
+            
+            # Mirror WFH alert into unified alerts collection
+            try:
+                await alerts_collection.insert_one({
+                    "organization_id": org_id,
+                    "employee_id": employee_id,
+                    "employee_name": "Remote Employee",
+                    "type": "Productivity",
+                    "severity": "high",
+                    "status": "pending",
+                    "detail": f"WFH Security Leak Alert: Credential leak detected via background OCR scanning.",
+                    "timestamp": now,
+                    "metadata": {
+                        "source": "wfh_desktop",
+                        "wfh_alert_id": str(alert_result.inserted_id),
+                        "device_id": device_id,
+                        "session_id": session_id
+                    }
+                })
+            except Exception as mirror_err:
+                logger.error(f"Failed to mirror unified WFH alert: {mirror_err}")
+    except Exception as e:
+        logger.error(f"OCR threat scan failed: {e}")
+
+@app.get("/api/wfh/screenshots")
+async def get_my_screenshots(
+    date: Optional[str] = None,
+    limit: int = 100,
+    employee=Depends(get_current_employee)
+):
+    email = employee.get("email")
+    if not email:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+        
+    query = {"employee_email": email}
+    if date:
+        query["date"] = date
+        
+    cursor = wfh_screenshots_collection.find(query).sort("timestamp", -1).limit(limit)
+    screenshots = await cursor.to_list(length=limit)
+    
+    for item in screenshots:
+        item["_id"] = str(item["_id"])
+        
+    return {"screenshots": screenshots}
+
+def build_static_upload_url(request: Request, relative_path: str) -> str:
+    base_url = str(request.base_url).rstrip("/")
+    if not relative_path.startswith("/"):
+        relative_path = "/" + relative_path
+    return f"{base_url}{relative_path}"
+
+
+@app.post("/api/wfh/screenshot")
+async def wfh_submit_screenshot(req: dict, background_tasks: BackgroundTasks, request: Request, employee=Depends(get_current_employee)):
+    employee_id = str(employee.get("_id"))
+    org_id = employee.get("organization_id")
+    device_id = req.get("device_id")
+
+    await verify_wfh_device(employee_id, org_id, device_id)
+
+    image_url = req.get("image_url")
+    if not image_url:
+        raise HTTPException(status_code=400, detail="image_url is required")
+
+    now = datetime.now(timezone.utc)
+
+    def is_base64_payload(value: str) -> bool:
+        return (value.startswith("data:image/") or ";base64," in value or (not value.startswith("http") and not value.startswith("/uploads") and len(value) > 1000))
+
+    if is_base64_payload(image_url):
+        import base64
+        import uuid
+        import time
+        header = ""
+        base64_data = image_url
+        if "," in image_url:
+            header, base64_data = image_url.split(",", 1)
+
+        try:
+            image_bytes = base64.b64decode(base64_data)
+            ext = ".jpg"
+            if "png" in header:
+                ext = ".png"
+            elif "gif" in header:
+                ext = ".gif"
+            filename = f"screenshot_{int(time.time())}_{uuid.uuid4().hex[:8]}{ext}"
+            image_url = await upload_file_to_storage(image_bytes, filename, "wfh_screenshots")
+        except Exception as err:
+            logger.error(f"Failed to decode base64 screenshot: {err}")
+            raise HTTPException(status_code=400, detail=f"Invalid base64 image data: {err}")
+    elif image_url.startswith("/uploads/"):
+        pass
+
+    doc = {
+        "employee_id": employee_id,
+        "employee_email": employee.get("email"),
+        "employee_name": employee.get("full_name", ""),
+        "organization_id": org_id,
+        "device_id": device_id,
+        "session_id": req.get("session_id"),
+        "date": now.strftime("%Y-%m-%d"),
+        "timestamp": now,
+        "image_url": image_url,
+        "thumbnail_url": req.get("thumbnail_url"),
+        "active_app": req.get("active_app"),
+        "active_window": req.get("active_window"),
+        "flagged": req.get("flagged", False),
+        "flag_reason": req.get("flag_reason"),
+        "created_at": now
+    }
+
+    result = await wfh_screenshots_collection.insert_one(doc)
+    screenshot_id = str(result.inserted_id)
+
+    # Queue background threat scan using OCR parser
+    background_tasks.add_task(
+        scan_screenshot_ocr_threats,
+        screenshot_id,
+        image_url,
+        employee_id,
+        org_id,
+        employee.get("email"),
+        device_id,
+        req.get("session_id")
+    )
+
+    return {
+        "status": "success",
+        "message": "WFH screenshot saved",
+        "screenshot_id": screenshot_id
+    }
+
+
+@app.post("/api/wfh/activity")
+async def wfh_submit_activity(req: dict, employee=Depends(get_current_employee)):
+    employee_id = str(employee.get("_id"))
+    org_id = employee.get("organization_id")
+    device_id = req.get("device_id")
+
+    await verify_wfh_device(employee_id, org_id, device_id)
+
+    now = datetime.now(timezone.utc)
+
+    doc = {
+        "employee_id": employee_id,
+        "employee_email": employee.get("email"),
+        "employee_name": employee.get("full_name", ""),
+        "organization_id": org_id,
+        "device_id": device_id,
+        "session_id": req.get("session_id"),
+        "timestamp": now,
+        "period_minutes": req.get("period_minutes", 5),
+        "keystrokes": req.get("keystrokes", 0),
+        "mouse_clicks": req.get("mouse_clicks", 0),
+        "mouse_distance_px": req.get("mouse_distance_px", 0),
+        "scroll_events": req.get("scroll_events", 0),
+        "idle_seconds": req.get("idle_seconds", 0),
+        "active_seconds": req.get("active_seconds", 0),
+        "created_at": now
+    }
+
+    result = await wfh_activity_collection.insert_one(doc)
+
+    return {
+        "status": "success",
+        "message": "WFH activity saved",
+        "activity_id": str(result.inserted_id)
+    }
+
+
+@app.post("/api/wfh/app-usage")
+async def wfh_submit_app_usage(req: dict, employee=Depends(get_current_employee)):
+    employee_id = str(employee.get("_id"))
+    org_id = employee.get("organization_id")
+    device_id = req.get("device_id")
+
+    await verify_wfh_device(employee_id, org_id, device_id)
+
+    now = datetime.now(timezone.utc)
+
+    doc = {
+        "employee_id": employee_id,
+        "employee_email": employee.get("email"),
+        "employee_name": employee.get("full_name", ""),
+        "organization_id": org_id,
+        "device_id": device_id,
+        "session_id": req.get("session_id"),
+        "timestamp": now,
+        "date": req.get("date", now.strftime("%Y-%m-%d")),
+        "apps": req.get("apps", []),
+        "created_at": now
+    }
+
+    result = await wfh_app_usage_collection.insert_one(doc)
+
+    return {
+        "status": "success",
+        "message": "WFH app usage saved",
+        "app_usage_id": str(result.inserted_id)
+    }
+
+
+@app.post("/api/wfh/productivity")
+async def wfh_submit_productivity(req: dict, employee=Depends(get_current_employee)):
+    employee_id = str(employee.get("_id"))
+    org_id = employee.get("organization_id")
+    device_id = req.get("device_id")
+
+    await verify_wfh_device(employee_id, org_id, device_id)
+
+    now = datetime.now(timezone.utc)
+
+    score = float(req.get("score", 0))
+    score = max(0, min(score, 100))
+
+    doc = {
+        "employee_id": employee_id,
+        "employee_email": employee.get("email"),
+        "employee_name": employee.get("full_name", ""),
+        "organization_id": org_id,
+        "device_id": device_id,
+        "session_id": req.get("session_id"),
+        "timestamp": now,
+        "date": req.get("date", now.strftime("%Y-%m-%d")),
+        "score": score,
+        "breakdown": req.get("breakdown", {}),
+        "created_at": now
+    }
+
+    result = await wfh_productivity_collection.insert_one(doc)
+
+    if req.get("session_id") and ObjectId.is_valid(req.get("session_id")):
+        await wfh_sessions_collection.update_one(
+            {"_id": ObjectId(req.get("session_id")), "employee_id": employee_id},
+            {
+                "$set": {
+                    "productivity_score": score,
+                    "updated_at": now
+                }
+            }
+        )
+
+    return {
+        "status": "success",
+        "message": "WFH productivity saved",
+        "productivity_id": str(result.inserted_id),
+        "score": score
+    }
+
+
+@app.post("/api/wfh/alert")
+async def wfh_submit_alert(req: dict, employee=Depends(get_current_employee)):
+    employee_id = str(employee.get("_id"))
+    org_id = employee.get("organization_id")
+    device_id = req.get("device_id")
+
+    await verify_wfh_device(employee_id, org_id, device_id)
+
+    now = datetime.now(timezone.utc)
+
+    alert_type = req.get("type")
+    if not alert_type:
+        raise HTTPException(status_code=400, detail="alert type is required")
+
+    severity = req.get("severity", "medium")
+
+    doc = {
+        "employee_id": employee_id,
+        "employee_email": employee.get("email"),
+        "employee_name": employee.get("full_name", ""),
+        "organization_id": org_id,
+        "device_id": device_id,
+        "session_id": req.get("session_id"),
+        "type": alert_type,
+        "timestamp": now,
+        "image_url": req.get("image_url"),
+        "severity": severity,
+        "status": "pending",
+        "details": req.get("details"),
+        "metadata": req.get("metadata", {}),
+        "created_at": now
+    }
+
+    result = await wfh_alerts_collection.insert_one(doc)
+
+    # Also mirror WFH alert into existing unified alerts collection
+    try:
+        # Map WFH alert types to admin-friendly categories
+        wfh_type_map = {
+            "WFH_IDLE_EXTENDED": "Productivity",
+            "WFH_IDENTITY_MISMATCH": "Identity",
+            "Continuous Auth Failure": "Identity",
+            "WFH_FACE_CHECK_FAILURE": "Identity",
+            "WFH_FAKE_WEBCAM": "Identity",
+            "WFH_SCREENSHOT_THREAT": "Compliance",
+            "WFH_SUSPICIOUS_APP": "Compliance",
+        }
+        mapped_type = wfh_type_map.get(alert_type, "Productivity")
+
+        # Create a clean, human-readable detail for the admin
+        raw_detail = req.get('details', '')
+        friendly_detail = raw_detail if raw_detail else f"{alert_type} detected for this employee."
+
+        await alerts_collection.insert_one({
+            "organization_id": org_id,
+            "employee_id": employee_id,
+            "employee_name": employee.get("full_name", ""),
+            "type": mapped_type,
+            "severity": severity,
+            "status": "pending",
+            "detail": friendly_detail,
+            "timestamp": now,
+            "metadata": {
+                "source": "wfh_desktop",
+                "wfh_alert_id": str(result.inserted_id),
+                "wfh_alert_type": alert_type,
+                "device_id": device_id,
+                "session_id": req.get("session_id")
+            }
+        })
+    except Exception as e:
+        logger.error(f"Failed to mirror WFH alert into alerts collection: {e}")
+
+    return {
+        "status": "success",
+        "message": "WFH alert saved",
+        "alert_id": str(result.inserted_id)
+    }
+
+
+@app.post("/api/wfh/meeting")
+async def wfh_submit_meeting(req: dict, employee=Depends(get_current_employee)):
+    employee_id = str(employee.get("_id"))
+    org_id = employee.get("organization_id")
+    device_id = req.get("device_id")
+
+    await verify_wfh_device(employee_id, org_id, device_id)
+
+    now = datetime.now(timezone.utc)
+
+    platform = req.get("platform")
+    if not platform:
+        raise HTTPException(status_code=400, detail="platform is required")
+
+    doc = {
+        "employee_id": employee_id,
+        "employee_email": employee.get("email"),
+        "employee_name": employee.get("full_name", ""),
+        "organization_id": org_id,
+        "device_id": device_id,
+        "session_id": req.get("session_id"),
+        "platform": platform,
+        "start_time": req.get("start_time"),
+        "end_time": req.get("end_time"),
+        "duration_minutes": req.get("duration_minutes"),
+        "date": req.get("date", now.strftime("%Y-%m-%d")),
+        "created_at": now
+    }
+
+    result = await wfh_meetings_collection.insert_one(doc)
+
+    return {
+        "status": "success",
+        "message": "WFH meeting saved",
+        "meeting_id": str(result.inserted_id)
+    }
+
+@app.get("/api/wfh/team/active")
+async def wfh_get_active_team(employee=Depends(get_current_employee)):
+    org_id = employee.get("organization_id")
+    if not org_id:
+        raise HTTPException(status_code=400, detail="Employee organization_id missing")
+    
+    # Find active WFH sessions in the same organization, excluding current employee
+    cursor = wfh_sessions_collection.find({
+        "organization_id": org_id,
+        "status": "active",
+        "employee_email": {"$ne": employee.get("email")}
+    })
+    sessions = await cursor.to_list(length=100)
+    
+    team_members = []
+    for s in sessions:
+        team_members.append({
+            "employee_id": s.get("employee_id"),
+            "employee_email": s.get("employee_email"),
+            "employee_name": s.get("employee_name", ""),
+            "check_in_time": s.get("check_in_time").isoformat() if s.get("check_in_time") else None,
+            "productivity_score": s.get("productivity_score", 0)
+        })
+    return team_members
+
+@app.post("/api/wfh/meeting/signal")
+async def wfh_post_signal(req: dict, employee=Depends(get_current_employee)):
+    sender_email = employee.get("email")
+    receiver_email = req.get("receiver_email")
+    signal_type = req.get("type") # 'offer', 'answer', 'candidate'
+    data = req.get("data")
+    
+    if not receiver_email or not signal_type or not data:
+        raise HTTPException(status_code=400, detail="receiver_email, type, and data are required")
+        
+    doc = {
+        "sender_email": sender_email,
+        "receiver_email": receiver_email,
+        "type": signal_type,
+        "data": data,
+        "timestamp": datetime.now(timezone.utc),
+        "delivered": False
+    }
+    
+    await wfh_signals_collection.insert_one(doc)
+    return {"status": "success", "message": "Signal sent"}
+
+@app.get("/api/wfh/meeting/signal")
+async def wfh_get_signals(employee=Depends(get_current_employee)):
+    email = employee.get("email")
+    
+    # Fetch all undelivered signals for current employee
+    cursor = wfh_signals_collection.find({
+        "receiver_email": email,
+        "delivered": False
+    }).sort("timestamp", 1)
+    
+    signals = await cursor.to_list(length=100)
+    
+    # Mark as delivered
+    if signals:
+        signal_ids = [s["_id"] for s in signals]
+        await wfh_signals_collection.update_many(
+            {"_id": {"$in": signal_ids}},
+            {"$set": {"delivered": True}}
+        )
+        
+    result = []
+    for s in signals:
+        result.append({
+            "id": str(s["_id"]),
+            "sender_email": s.get("sender_email"),
+            "type": s.get("type"),
+            "data": s.get("data"),
+            "timestamp": s.get("timestamp").isoformat() if s.get("timestamp") else None
+        })
+        
+    return result
+
+# =========================
+# ADMIN WFH VIEW APIs
+# =========================
+
+@app.get("/admin/wfh/stats")
+async def admin_wfh_stats(current_admin: Admin = Depends(get_current_admin)):
+    org_id = current_admin.organization_id
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    query = {}
+    if org_id and org_id != "system_org":
+        query["organization_id"] = org_id
+
+    active_sessions = await wfh_sessions_collection.count_documents({
+        **query,
+        "status": "active"
+    })
+
+    today_alerts = await wfh_alerts_collection.count_documents({
+        **query,
+        "status": "pending",
+        "timestamp": {
+            "$gte": datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        }
+    })
+
+    productivity_cursor = wfh_productivity_collection.find({
+        **query,
+        "date": today
+    })
+
+    productivity_list = await productivity_cursor.to_list(length=1000)
+
+    avg_productivity = 0
+    if productivity_list:
+        avg_productivity = round(
+            sum(item.get("score", 0) for item in productivity_list) / len(productivity_list),
+            2
+        )
+
+    wfh_employees = await employees_collection.count_documents({
+        **query,
+        "employee_type": "wfh"
+    })
+
+    return {
+        "active_sessions": active_sessions,
+        "wfh_employees": wfh_employees,
+        "pending_alerts": today_alerts,
+        "avg_productivity": avg_productivity,
+        "date": today
+    }
+
+
+@app.get("/admin/wfh/live-view")
+async def admin_wfh_live_view(current_admin: Admin = Depends(get_current_admin)):
+    org_id = current_admin.organization_id
+
+    query = {"status": "active"}
+
+    if org_id and org_id != "system_org":
+        query["organization_id"] = org_id
+
+    sessions = await wfh_sessions_collection.find(query).sort("check_in_time", -1).to_list(length=500)
+
+    result = []
+
+    for session in sessions:
+        session_id = str(session["_id"])
+
+        latest_screenshot = await wfh_screenshots_collection.find_one(
+            {"session_id": session_id},
+            sort=[("timestamp", -1)]
+        )
+
+        latest_activity = await wfh_activity_collection.find_one(
+            {"session_id": session_id},
+            sort=[("timestamp", -1)]
+        )
+
+        result.append({
+            "session_id": session_id,
+            "employee_id": session.get("employee_id"),
+            "employee_email": session.get("employee_email"),
+            "employee_name": session.get("employee_name"),
+            "check_in_time": session.get("check_in_time"),
+            "productivity_score": session.get("productivity_score", 0),
+            "device_id": session.get("device_id"),
+            "latest_screenshot": {
+                "_id": str(latest_screenshot["_id"]),
+                "image_url": latest_screenshot.get("image_url"),
+                "timestamp": latest_screenshot.get("timestamp"),
+                "active_app": latest_screenshot.get("active_app"),
+                "active_window": latest_screenshot.get("active_window")
+            } if latest_screenshot else None,
+            "latest_activity": {
+                "_id": str(latest_activity["_id"]),
+                "keystrokes": latest_activity.get("keystrokes", 0),
+                "mouse_clicks": latest_activity.get("mouse_clicks", 0),
+                "idle_seconds": latest_activity.get("idle_seconds", 0),
+                "active_seconds": latest_activity.get("active_seconds", 0),
+                "timestamp": latest_activity.get("timestamp")
+            } if latest_activity else None
+        })
+
+    return result
+
+@app.post("/admin/wfh/employee/{email}/trigger-screenshot")
+async def admin_trigger_screenshot(email: str, current_admin: Admin = Depends(get_current_admin)):
+    clean_email = email.strip().lower()
+    
+    # Check if employee exists
+    user = await employees_collection.find_one({"email": clean_email})
+    if not user:
+        raise HTTPException(status_code=404, detail="Employee not found")
+        
+    doc = {
+        "employee_email": clean_email,
+        "command": "trigger_screenshot",
+        "status": "pending",
+        "timestamp": datetime.now(timezone.utc)
+    }
+    
+    await wfh_commands_collection.insert_one(doc)
+    return {"status": "success", "message": "Trigger command enqueued successfully"}
+
+@app.post("/admin/wfh/employee/{email}/force-end")
+async def admin_force_end_session(email: str, req: dict, current_admin: Admin = Depends(get_current_admin)):
+    clean_email = email.strip().lower()
+    reason = req.get("reason", "Force-ended by administrator").strip()
+    
+    user = await employees_collection.find_one({"email": clean_email})
+    if not user:
+        raise HTTPException(status_code=404, detail="Employee not found")
+        
+    active_session = await wfh_sessions_collection.find_one({
+        "employee_email": clean_email,
+        "status": "active"
+    })
+    
+    if not active_session:
+        raise HTTPException(status_code=400, detail="No active WFH session found for this employee.")
+        
+    now = datetime.now(timezone.utc)
+    session_id = active_session["_id"]
+    
+    check_in_time_val = active_session.get("check_in_time")
+    total_seconds_val = 0
+    if check_in_time_val:
+        if check_in_time_val.tzinfo is None:
+            check_in_time_val = check_in_time_val.replace(tzinfo=timezone.utc)
+        total_seconds_val = int((now - check_in_time_val).total_seconds())
+        
+    # Update active session
+    await wfh_sessions_collection.update_one(
+        {"_id": session_id},
+        {
+            "$set": {
+                "status": "force_ended",
+                "check_out_time": now,
+                "total_active_seconds": total_seconds_val,
+                "force_ended_by": current_admin.email,
+                "force_end_reason": reason,
+                "updated_at": now
+            }
+        }
+    )
+    
+    # Write checkout log in attendance_logs
+    checkout_log = {
+        "user_id": str(user["_id"]),
+        "email": clean_email,
+        "employee_name": user.get("full_name", ""),
+        "organization_id": user.get("organization_id"),
+        "timestamp": now,
+        "type": "check-out",
+        "attendance_type": "wfh",
+        "location": None,
+        "check_in_method": "wfh_desktop",
+        "status": "SUCCESS",
+        "location_name": "Force Ended by Admin",
+        "selfie_verified": False,
+        "device_id": active_session.get("device_id"),
+        "wfh_session_id": str(session_id),
+        "method": "admin_force_end",
+        "force_ended_by": current_admin.email
+    }
+    await attendance_logs_collection.insert_one(checkout_log)
+    
+    # Enqueue logout command to agent
+    cmd_doc = {
+        "employee_email": clean_email,
+        "command": "force_end_session",
+        "status": "pending",
+        "timestamp": now,
+        "reason": reason
+    }
+    await wfh_commands_collection.insert_one(cmd_doc)
+    
+    # Generate WFH Alert
+    alert_doc = {
+        "employee_id": str(user["_id"]),
+        "employee_email": clean_email,
+        "employee_name": user.get("full_name", ""),
+        "organization_id": user.get("organization_id"),
+        "type": "WFH_SESSION_FORCE_ENDED",
+        "timestamp": now,
+        "severity": "info",
+        "status": "pending",
+        "details": f"Session force-ended by admin {current_admin.email}. Reason: {reason}",
+        "created_at": now
+    }
+    alert_res = await wfh_alerts_collection.insert_one(alert_doc)
+    
+    # Mirror into unified alerts collection
+    try:
+        await alerts_collection.insert_one({
+            "organization_id": user.get("organization_id"),
+            "employee_id": str(user["_id"]),
+            "employee_name": user.get("full_name", ""),
+            "type": "Compliance",
+            "severity": "medium",
+            "status": "pending",
+            "detail": f"WFH Session force-ended by admin: {reason}",
+            "timestamp": now,
+            "metadata": {
+                "source": "wfh_desktop",
+                "wfh_alert_id": str(alert_res.inserted_id),
+                "session_id": str(session_id)
+            }
+        })
+    except Exception as e:
+        logger.error(f"Failed to mirror force-end alert: {e}")
+        
+    return {
+        "status": "success",
+        "message": "Session force-ended successfully",
+        "session_id": str(session_id)
+    }
+
+@app.get("/admin/wfh/policy")
+async def get_wfh_policy(current_admin: Admin = Depends(get_current_admin)):
+    org_id = current_admin.organization_id
+    if not org_id:
+        raise HTTPException(status_code=400, detail="Admin organization missing")
+    
+    org = await organizations_collection.find_one({"_id": ObjectId(org_id)})
+    if not org:
+        raise HTTPException(status_code=404, detail="Organization not found")
+        
+    policy = org.get("wfh_policy")
+    if not policy:
+        policy = {
+            "screenshot_interval_minutes": 10,
+            "face_check_interval_minutes": 30,
+            "max_idle_minutes": 20,
+            "productivity_threshold_percent": 60,
+            "working_hours_start": "09:00",
+            "working_hours_end": "18:00",
+            "screenshot_retention_days": 90,
+            "require_face_verification": True,
+            "productive_apps": [],
+            "unproductive_apps": []
+        }
+    return policy
+
+@app.put("/admin/wfh/policy")
+async def update_wfh_policy(req: dict, current_admin: Admin = Depends(get_current_admin)):
+    org_id = current_admin.organization_id
+    if not org_id:
+        raise HTTPException(status_code=400, detail="Admin organization missing")
+        
+    policy = {
+        "screenshot_interval_minutes": int(req.get("screenshot_interval_minutes", 10)),
+        "face_check_interval_minutes": int(req.get("face_check_interval_minutes", 30)),
+        "max_idle_minutes": int(req.get("max_idle_minutes", 20)),
+        "productivity_threshold_percent": int(req.get("productivity_threshold_percent", 60)),
+        "working_hours_start": str(req.get("working_hours_start", "09:00")),
+        "working_hours_end": str(req.get("working_hours_end", "18:00")),
+        "screenshot_retention_days": int(req.get("screenshot_retention_days", 90)),
+        "require_face_verification": bool(req.get("require_face_verification", True)),
+        "productive_apps": list(req.get("productive_apps", [])),
+        "unproductive_apps": list(req.get("unproductive_apps", []))
+    }
+    
+    result = await organizations_collection.update_one(
+        {"_id": ObjectId(org_id)},
+        {"$set": {"wfh_policy": policy}}
+    )
+    
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Organization not found")
+        
+    return {"status": "success", "message": "WFH policy updated successfully", "policy": policy}
+
+@app.get("/api/wfh/policy")
+async def api_get_wfh_policy(employee = Depends(get_current_employee)):
+    org_id = employee.get("organization_id")
+    if not org_id:
+        raise HTTPException(status_code=400, detail="Employee organization_id missing")
+        
+    org = await organizations_collection.find_one({"_id": ObjectId(org_id)})
+    if not org:
+        raise HTTPException(status_code=404, detail="Organization not found")
+        
+    policy = org.get("wfh_policy")
+    if not policy:
+        policy = {
+            "screenshot_interval_minutes": 10,
+            "face_check_interval_minutes": 30,
+            "max_idle_minutes": 20,
+            "productivity_threshold_percent": 60,
+            "working_hours_start": "09:00",
+            "working_hours_end": "18:00",
+            "screenshot_retention_days": 90,
+            "require_face_verification": True,
+            "productive_apps": [],
+            "unproductive_apps": []
+        }
+    return policy
+
+@app.post("/api/wfh/face-check")
+async def wfh_face_check(req: dict, employee=Depends(get_current_employee)):
+    employee_id = str(employee.get("_id"))
+    org_id = employee.get("organization_id")
+    
+    session_id = req.get("session_id")
+    passed = bool(req.get("passed", True))
+    face_score = float(req.get("face_score", 1.0))
+    failure_reason = req.get("failure_reason", "")
+    image_base64 = req.get("image_base64")
+    
+    now = datetime.now(timezone.utc)
+    
+    image_url = None
+    if image_base64:
+        import uuid
+        import time
+        filename = f"face_check_{int(time.time())}_{uuid.uuid4().hex[:8]}.jpg"
+        import base64
+        try:
+            base64_data = image_base64
+            if "," in image_base64:
+                base64_data = image_base64.split(",", 1)[1]
+            image_bytes = base64.b64decode(base64_data)
+            image_url = await upload_file_to_storage(image_bytes, filename, "wfh_face_checks")
+        except Exception as e:
+            logger.error(f"Failed to save face check image: {e}")
+            
+    doc = {
+        "employee_id": employee_id,
+        "employee_email": employee.get("email"),
+        "employee_name": employee.get("full_name", ""),
+        "organization_id": org_id,
+        "session_id": session_id,
+        "timestamp": now,
+        "passed": passed,
+        "face_score": face_score,
+        "failure_reason": failure_reason,
+        "image_url": image_url,
+        "created_at": now
+    }
+    
+    result = await wfh_face_checks_collection.insert_one(doc)
+    
+    # Update active session counters
+    if session_id and ObjectId.is_valid(session_id):
+        update_op = {
+            "$inc": {
+                "face_check_count": 1,
+                "face_check_passed": 1 if passed else 0
+            },
+            "$set": {
+                "updated_at": now
+            }
+        }
+        await wfh_sessions_collection.update_one(
+            {"_id": ObjectId(session_id), "employee_id": employee_id},
+            update_op
+        )
+        
+    # If failed, raise alert
+    if not passed:
+        alert_doc = {
+            "employee_id": employee_id,
+            "employee_email": employee.get("email"),
+            "employee_name": employee.get("full_name", ""),
+            "organization_id": org_id,
+            "session_id": session_id,
+            "type": "WFH_FACE_CHECK_FAILED",
+            "timestamp": now,
+            "image_url": image_url,
+            "severity": "critical" if "fake" in failure_reason.lower() else "high",
+            "status": "pending",
+            "details": f"WFH face verification failed: {failure_reason}",
+            "created_at": now
+        }
+        alert_res = await wfh_alerts_collection.insert_one(alert_doc)
+        
+        # Mirror alert to unified alerts collection
+        try:
+            await alerts_collection.insert_one({
+                "organization_id": org_id,
+                "employee_id": employee_id,
+                "employee_name": employee.get("full_name", ""),
+                "type": "Identity",
+                "severity": "critical" if "fake" in failure_reason.lower() else "high",
+                "status": "pending",
+                "detail": f"WFH face check failed: {failure_reason}",
+                "timestamp": now,
+                "metadata": {
+                    "source": "wfh_desktop",
+                    "wfh_alert_id": str(alert_res.inserted_id),
+                    "session_id": session_id
+                }
+            })
+        except Exception as e:
+            logger.error(f"Failed to mirror WFH face-check failure alert: {e}")
+            
+    return {
+        "status": "success",
+        "message": "Face check recorded",
+        "face_check_id": str(result.inserted_id),
+        "passed": passed
+    }
+
+
+@app.get("/api/wfh/commands/pending")
+async def get_pending_commands(employee=Depends(get_current_employee)):
+    email = employee.get("email")
+    if not email:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+        
+    cursor = wfh_commands_collection.find({
+        "employee_email": email.strip().lower(),
+        "status": "pending"
+    }).sort("timestamp", 1)
+    
+    commands = await cursor.to_list(length=100)
+    
+    result = []
+    for c in commands:
+        result.append({
+            "id": str(c["_id"]),
+            "command": c.get("command"),
+            "status": c.get("status"),
+            "timestamp": c.get("timestamp").isoformat() if c.get("timestamp") else None
+        })
+        
+    return {"commands": result}
+
+@app.post("/api/wfh/commands/{command_id}/complete")
+async def complete_command(command_id: str, employee=Depends(get_current_employee)):
+    if not ObjectId.is_valid(command_id):
+        raise HTTPException(status_code=400, detail="Invalid command ID")
+        
+    result = await wfh_commands_collection.update_one(
+        {"_id": ObjectId(command_id), "employee_email": employee.get("email").strip().lower()},
+        {"$set": {"status": "completed", "completed_at": datetime.now(timezone.utc)}}
+    )
+    
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Command not found or unauthorized")
+        
+    return {"status": "success", "message": "Command marked as completed"}
+
+@app.get("/admin/wfh/employee/{email}/screenshots")
+async def admin_wfh_employee_screenshots(
+    email: str,
+    date: Optional[str] = None,
+    limit: int = 100,
+    current_admin: Admin = Depends(get_current_admin)
+):
+    clean_email = email.strip().lower()
+
+    query = {"employee_email": clean_email}
+
+    if current_admin.organization_id and current_admin.organization_id != "system_org":
+        query["organization_id"] = current_admin.organization_id
+
+    if date:
+        query["date"] = date
+
+    cursor = wfh_screenshots_collection.find(query).sort("timestamp", -1).limit(limit)
+    screenshots = await cursor.to_list(length=limit)
+
+    for item in screenshots:
+        item["_id"] = str(item["_id"])
+
+    return screenshots
+
+
+@app.get("/admin/wfh/employee/{email}/activity")
+async def admin_wfh_employee_activity(
+    email: str,
+    date: Optional[str] = None,
+    limit: int = 200,
+    current_admin: Admin = Depends(get_current_admin)
+):
+    clean_email = email.strip().lower()
+
+    query = {"employee_email": clean_email}
+
+    if current_admin.organization_id and current_admin.organization_id != "system_org":
+        query["organization_id"] = current_admin.organization_id
+
+    if date:
+        start = datetime.fromisoformat(date + "T00:00:00+00:00")
+        end = start + timedelta(days=1)
+        query["timestamp"] = {"$gte": start, "$lt": end}
+
+    cursor = wfh_activity_collection.find(query).sort("timestamp", 1).limit(limit)
+    data = await cursor.to_list(length=limit)
+
+    for item in data:
+        item["_id"] = str(item["_id"])
+
+    return data
+
+
+@app.get("/admin/wfh/employee/{email}/apps")
+async def admin_wfh_employee_apps(
+    email: str,
+    date: Optional[str] = None,
+    limit: int = 100,
+    current_admin: Admin = Depends(get_current_admin)
+):
+    clean_email = email.strip().lower()
+
+    query = {"employee_email": clean_email}
+
+    if current_admin.organization_id and current_admin.organization_id != "system_org":
+        query["organization_id"] = current_admin.organization_id
+
+    if date:
+        query["date"] = date
+
+    cursor = wfh_app_usage_collection.find(query).sort("timestamp", -1).limit(limit)
+    data = await cursor.to_list(length=limit)
+
+    for item in data:
+        item["_id"] = str(item["_id"])
+
+    return data
+
+
+@app.get("/admin/wfh/employee/{email}/productivity")
+async def admin_wfh_employee_productivity(
+    email: str,
+    date: Optional[str] = None,
+    limit: int = 100,
+    current_admin: Admin = Depends(get_current_admin)
+):
+    clean_email = email.strip().lower()
+
+    query = {"employee_email": clean_email}
+
+    if current_admin.organization_id and current_admin.organization_id != "system_org":
+        query["organization_id"] = current_admin.organization_id
+
+    if date:
+        query["date"] = date
+
+    cursor = wfh_productivity_collection.find(query).sort("timestamp", 1).limit(limit)
+    data = await cursor.to_list(length=limit)
+
+    for item in data:
+        item["_id"] = str(item["_id"])
+
+    return data
+
+
+@app.get("/admin/wfh/employee/{email}/timeline")
+async def admin_wfh_employee_timeline(
+    email: str,
+    date: Optional[str] = None,
+    current_admin: Admin = Depends(get_current_admin)
+):
+    clean_email = email.strip().lower()
+
+    base_query = {"employee_email": clean_email}
+
+    if current_admin.organization_id and current_admin.organization_id != "system_org":
+        base_query["organization_id"] = current_admin.organization_id
+
+    if date:
+        start = datetime.fromisoformat(date + "T00:00:00+00:00")
+        end = start + timedelta(days=1)
+        time_filter = {"timestamp": {"$gte": start, "$lt": end}}
+    else:
+        time_filter = {}
+
+    timeline = []
+
+    screenshots = await wfh_screenshots_collection.find({**base_query, **time_filter}).to_list(length=300)
+    for item in screenshots:
+        timeline.append({
+            "type": "screenshot",
+            "timestamp": item.get("timestamp"),
+            "data": {
+                "_id": str(item["_id"]),
+                "image_url": item.get("image_url"),
+                "active_app": item.get("active_app"),
+                "active_window": item.get("active_window")
+            }
+        })
+
+    activities = await wfh_activity_collection.find({**base_query, **time_filter}).to_list(length=300)
+    for item in activities:
+        timeline.append({
+            "type": "activity",
+            "timestamp": item.get("timestamp"),
+            "data": {
+                "_id": str(item["_id"]),
+                "keystrokes": item.get("keystrokes", 0),
+                "mouse_clicks": item.get("mouse_clicks", 0),
+                "idle_seconds": item.get("idle_seconds", 0),
+                "active_seconds": item.get("active_seconds", 0)
+            }
+        })
+
+    alerts = await wfh_alerts_collection.find({**base_query, **time_filter}).to_list(length=300)
+    for item in alerts:
+        timeline.append({
+            "type": "alert",
+            "timestamp": item.get("timestamp"),
+            "data": {
+                "_id": str(item["_id"]),
+                "alert_type": item.get("type"),
+                "severity": item.get("severity"),
+                "details": item.get("details")
+            }
+        })
+
+    timeline.sort(key=lambda x: x.get("timestamp") or datetime.min, reverse=True)
+
+    return timeline
+
+
+@app.get("/admin/wfh/alerts")
+async def admin_wfh_alerts(
+    status: Optional[str] = None,
+    severity: Optional[str] = None,
+    limit: int = 100,
+    current_admin: Admin = Depends(get_current_admin)
+):
+    query = {}
+
+    if current_admin.organization_id and current_admin.organization_id != "system_org":
+        query["organization_id"] = current_admin.organization_id
+
+    if status:
+        query["status"] = status
+
+    if severity:
+        query["severity"] = severity
+
+    cursor = wfh_alerts_collection.find(query).sort("timestamp", -1).limit(limit)
+    alerts = await cursor.to_list(length=limit)
+
+    for item in alerts:
+        item["_id"] = str(item["_id"])
+
+    return alerts
+
+
+@app.post("/admin/wfh/alerts/{alert_id}/review")
+async def admin_review_wfh_alert(
+    alert_id: str,
+    req: dict,
+    current_admin: Admin = Depends(get_current_admin)
+):
+    if not ObjectId.is_valid(alert_id):
+        raise HTTPException(status_code=400, detail="Invalid alert id")
+
+    query = {"_id": ObjectId(alert_id)}
+
+    if current_admin.organization_id and current_admin.organization_id != "system_org":
+        query["organization_id"] = current_admin.organization_id
+
+    alert = await wfh_alerts_collection.find_one(query)
+
+    if not alert:
+        raise HTTPException(status_code=404, detail="Alert not found")
+
+    await wfh_alerts_collection.update_one(
+        {"_id": ObjectId(alert_id)},
+        {
+            "$set": {
+                "status": req.get("status", "reviewed"),
+                "reviewed_by": current_admin.email,
+                "reviewed_at": datetime.now(timezone.utc),
+                "review_note": req.get("note")
+            }
+        }
+    )
+
+    return {
+        "status": "success",
+        "message": "WFH alert reviewed successfully"
+    }
+
+@app.get("/api/wfh/my-alerts")
+async def get_my_wfh_alerts(employee = Depends(get_current_employee)):
+    clean_email = employee.get("email").strip().lower()
+    cursor = wfh_alerts_collection.find({"employee_email": clean_email}).sort("timestamp", -1)
+    alerts = await cursor.to_list(length=100)
+    for a in alerts:
+        a["_id"] = str(a["_id"])
+    return alerts
+
+# =========================
+# WFH TASK MONITORING APIs
+# =========================
+
+from database import tasks_collection
+
+@app.get("/api/tasks")
+async def get_my_tasks(employee = Depends(get_current_employee)):
+    email = employee.get("email").strip().lower()
+    cursor = tasks_collection.find({"employee_email": email}).sort("created_at", -1)
+    tasks = await cursor.to_list(length=200)
+    for task in tasks:
+        task["_id"] = str(task["_id"])
+    return tasks
+
+@app.post("/api/tasks")
+async def create_my_task(req: dict, employee = Depends(get_current_employee)):
+    email = employee.get("email").strip().lower()
+    title = req.get("title")
+    if not title:
+        raise HTTPException(status_code=400, detail="Task title is required")
+    
+    now = datetime.now(timezone.utc)
+    task_doc = {
+        "employee_id": str(employee["_id"]),
+        "employee_email": email,
+        "organization_id": employee.get("organization_id"),
+        "title": title.strip(),
+        "description": req.get("description", "").strip(),
+        "status": req.get("status", "todo"),
+        "priority": req.get("priority", "medium"),
+        "worked_minutes": 0,
+        "created_at": now,
+        "updated_at": now
+    }
+    
+    result = await tasks_collection.insert_one(task_doc)
+    task_doc["_id"] = str(result.inserted_id)
+    return task_doc
+
+@app.put("/api/tasks/{task_id}")
+async def update_my_task(task_id: str, req: dict, employee = Depends(get_current_employee)):
+    email = employee.get("email").strip().lower()
+    
+    task = await tasks_collection.find_one({"_id": ObjectId(task_id), "employee_email": email})
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+        
+    update_data = {}
+    if "status" in req:
+        update_data["status"] = req["status"]
+    if "description" in req:
+        update_data["description"] = req["description"]
+    if "priority" in req:
+        update_data["priority"] = req["priority"]
+    if "worked_minutes" in req:
+        update_data["worked_minutes"] = req["worked_minutes"]
+        
+    if not update_data:
+        return {"status": "success", "message": "No fields to update"}
+        
+    update_data["updated_at"] = datetime.now(timezone.utc)
+    
+    await tasks_collection.update_one(
+        {"_id": ObjectId(task_id)},
+        {"$set": update_data}
+    )
+    return {"status": "success", "message": "Task updated successfully"}
+
+# Admin route to fetch an employee's tasks
+@app.get("/admin/wfh/employee/{email}/tasks")
+async def admin_get_employee_tasks(email: str, current_admin: Admin = Depends(get_current_admin)):
+    clean_email = email.strip().lower()
+    query = {"employee_email": clean_email}
+    
+    if current_admin.organization_id and current_admin.organization_id != "system_org":
+        query["organization_id"] = current_admin.organization_id
+        
+    cursor = tasks_collection.find(query).sort("created_at", -1)
+    tasks = await cursor.to_list(length=200)
+    for task in tasks:
+        task["_id"] = str(task["_id"])
+    return tasks
+
+# Admin route to assign a task to an employee
+@app.post("/admin/wfh/employee/{email}/tasks")
+async def admin_assign_employee_task(email: str, req: dict, current_admin: Admin = Depends(get_current_admin)):
+    clean_email = email.strip().lower()
+    title = req.get("title")
+    if not title:
+        raise HTTPException(status_code=400, detail="Task title is required")
+        
+    emp_query = {"email": clean_email}
+    if current_admin.organization_id and current_admin.organization_id != "system_org":
+        emp_query["organization_id"] = current_admin.organization_id
+        
+    emp = await employees_collection.find_one(emp_query)
+    if not emp:
+        raise HTTPException(status_code=404, detail="Employee not found or access denied")
+        
+    now = datetime.now(timezone.utc)
+    task_doc = {
+        "employee_id": str(emp["_id"]),
+        "employee_email": clean_email,
+        "organization_id": emp.get("organization_id"),
+        "title": title.strip(),
+        "description": req.get("description", "").strip(),
+        "status": "todo",
+        "priority": req.get("priority", "medium"),
+        "worked_minutes": 0,
+        "created_at": now,
+        "updated_at": now
+    }
+    
+    result = await tasks_collection.insert_one(task_doc)
+    task_doc["_id"] = str(result.inserted_id)
+    return task_doc
+
+# =========================
+# WFH REPORTS & ANALYTICS APIs
+# =========================
+
+from fastapi.responses import Response
+import csv
+import io
+
+@app.get("/admin/wfh/reports/productivity")
+async def get_wfh_reports_productivity(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    employee_email: Optional[str] = None,
+    format: str = "json",
+    current_admin: Admin = Depends(get_current_admin)
+):
+    query = {}
+    if current_admin.organization_id and current_admin.organization_id != "system_org":
+        query["organization_id"] = current_admin.organization_id
+    if employee_email:
+        query["employee_email"] = employee_email.strip().lower()
+    
+    date_filter = {}
+    if start_date:
+        date_filter["$gte"] = start_date
+    if end_date:
+        date_filter["$lte"] = end_date
+    if date_filter:
+        query["date"] = date_filter
+        
+    cursor = wfh_sessions_collection.find(query).sort("check_in_time", -1)
+    sessions = await cursor.to_list(length=1000)
+    
+    report_data = []
+    for s in sessions:
+        check_in_str = s["check_in_time"].isoformat() if s.get("check_in_time") else ""
+        check_out_str = s["check_out_time"].isoformat() if s.get("check_out_time") else ""
+        duration_hrs = round(s.get("total_active_seconds", 0) / 3600.0, 2)
+        
+        report_data.append({
+            "employee_email": s.get("employee_email", ""),
+            "employee_name": s.get("employee_name", ""),
+            "date": s.get("date", ""),
+            "check_in_time": check_in_str,
+            "check_out_time": check_out_str,
+            "duration_hours": duration_hrs,
+            "productivity_score": s.get("productivity_score", 0),
+            "verified_productivity_score": s.get("verified_productivity_score", s.get("productivity_score", 0)),
+            "face_check_passed": s.get("face_check_passed", 0),
+            "face_check_count": s.get("face_check_count", 0),
+            "status": s.get("status", "")
+        })
+        
+    if format == "csv":
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow([
+            "Employee Email", "Employee Name", "Date", "Check-in Time", "Check-out Time",
+            "Duration (Hours)", "Productivity Score (%)", "Verified Productivity Score (%)",
+            "Face Checks Passed", "Total Face Checks", "Status"
+        ])
+        for row in report_data:
+            writer.writerow([
+                row["employee_email"], row["employee_name"], row["date"], row["check_in_time"],
+                row["check_out_time"], row["duration_hours"], row["productivity_score"],
+                row["verified_productivity_score"], row["face_check_passed"], row["face_check_count"],
+                row["status"]
+            ])
+        return Response(
+            content=output.getvalue(),
+            media_type="text/csv",
+            headers={"Content-Disposition": "attachment; filename=wfh_productivity_report.csv"}
+        )
+        
+    return report_data
+
+
+@app.get("/admin/wfh/reports/app-usage")
+async def get_wfh_reports_app_usage(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    employee_email: Optional[str] = None,
+    format: str = "json",
+    current_admin: Admin = Depends(get_current_admin)
+):
+    query = {}
+    if current_admin.organization_id and current_admin.organization_id != "system_org":
+        query["organization_id"] = current_admin.organization_id
+    if employee_email:
+        query["employee_email"] = employee_email.strip().lower()
+        
+    date_filter = {}
+    if start_date:
+        date_filter["$gte"] = start_date
+    if end_date:
+        date_filter["$lte"] = end_date
+    if date_filter:
+        query["date"] = date_filter
+        
+    cursor = wfh_app_usage_collection.find(query).sort("timestamp", -1)
+    usages = await cursor.to_list(length=1000)
+    
+    # Aggregate duration by (email, name, app_name)
+    app_aggregates = {}
+    for u in usages:
+        email = u.get("employee_email", "")
+        name = u.get("employee_name", "")
+        apps = u.get("apps", [])
+        for app in apps:
+            app_name = app.get("name", "unknown")
+            duration = float(app.get("duration_seconds", 0))
+            category = app.get("status", "neutral")
+            
+            key = (email, name, app_name, category)
+            app_aggregates[key] = app_aggregates.get(key, 0.0) + duration
+            
+    report_data = []
+    for (email, name, app_name, category), total_dur in app_aggregates.items():
+        report_data.append({
+            "employee_email": email,
+            "employee_name": name,
+            "app_name": app_name,
+            "category": category,
+            "total_minutes": round(total_dur / 60.0, 2)
+        })
+        
+    if format == "csv":
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["Employee Email", "Employee Name", "App Name", "Classification", "Total Duration (Minutes)"])
+        for row in report_data:
+            writer.writerow([row["employee_email"], row["employee_name"], row["app_name"], row["category"], row["total_minutes"]])
+        return Response(
+            content=output.getvalue(),
+            media_type="text/csv",
+            headers={"Content-Disposition": "attachment; filename=wfh_app_usage_report.csv"}
+        )
+        
+    return report_data
+
+
+@app.get("/admin/wfh/reports/attendance")
+async def get_wfh_reports_attendance(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    employee_email: Optional[str] = None,
+    format: str = "json",
+    current_admin: Admin = Depends(get_current_admin)
+):
+    query = {}
+    if current_admin.organization_id and current_admin.organization_id != "system_org":
+        query["organization_id"] = current_admin.organization_id
+    if employee_email:
+        query["employee_email"] = employee_email.strip().lower()
+        
+    date_filter = {}
+    if start_date:
+        date_filter["$gte"] = start_date
+    if end_date:
+        date_filter["$lte"] = end_date
+    if date_filter:
+        query["date"] = date_filter
+        
+    cursor = wfh_sessions_collection.find(query).sort("check_in_time", -1)
+    sessions = await cursor.to_list(length=1000)
+    
+    # Group by employee to calculate summary metrics
+    emp_summary = {}
+    for s in sessions:
+        email = s.get("employee_email", "")
+        name = s.get("employee_name", "")
+        active_sec = s.get("total_active_seconds", 0) or 0
+        score = s.get("verified_productivity_score", s.get("productivity_score", 0)) or 0
+        
+        # Approximate active/idle seconds if missing
+        if active_sec == 0:
+            if s.get("check_in_time") and s.get("check_out_time"):
+                active_sec = int((s["check_out_time"] - s["check_in_time"]).total_seconds())
+                
+        if email not in emp_summary:
+            emp_summary[email] = {
+                "employee_email": email,
+                "employee_name": name,
+                "sessions_count": 0,
+                "total_duration_hours": 0.0,
+                "productivity_scores_sum": 0.0,
+                "productivity_scores_count": 0
+            }
+            
+        emp_summary[email]["sessions_count"] += 1
+        emp_summary[email]["total_duration_hours"] += round(active_sec / 3600.0, 2)
+        if score > 0:
+            emp_summary[email]["productivity_scores_sum"] += score
+            emp_summary[email]["productivity_scores_count"] += 1
+            
+    report_data = []
+    for email, data in emp_summary.items():
+        avg_score = 0.0
+        if data["productivity_scores_count"] > 0:
+            avg_score = round(data["productivity_scores_sum"] / data["productivity_scores_count"], 2)
+            
+        report_data.append({
+            "employee_email": data["employee_email"],
+            "employee_name": data["employee_name"],
+            "total_sessions": data["sessions_count"],
+            "total_duration_hours": round(data["total_duration_hours"], 2),
+            "average_productivity_score": avg_score
+        })
+        
+    if format == "csv":
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["Employee Email", "Employee Name", "Total Sessions", "Total Duration (Hours)", "Average Productivity Score (%)"])
+        for row in report_data:
+            writer.writerow([row["employee_email"], row["employee_name"], row["total_sessions"], row["total_duration_hours"], row["average_productivity_score"]])
+        return Response(
+            content=output.getvalue(),
+            media_type="text/csv",
+            headers={"Content-Disposition": "attachment; filename=wfh_attendance_report.csv"}
+        )
+        
+    return report_data
+
+
+@app.get("/admin/wfh/reports/screenshots")
+async def get_wfh_reports_screenshots(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    employee_email: Optional[str] = None,
+    format: str = "json",
+    current_admin: Admin = Depends(get_current_admin)
+):
+    query = {}
+    if current_admin.organization_id and current_admin.organization_id != "system_org":
+        query["organization_id"] = current_admin.organization_id
+        
+    # Get employee ID first if email is provided
+    if employee_email:
+        emp = await employees_collection.find_one({"email": employee_email.strip().lower()})
+        if emp:
+            query["employee_id"] = str(emp["_id"])
+        else:
+            query["employee_id"] = "nonexistent"
+            
+    # Timestamp date logic
+    time_filter = {}
+    if start_date:
+        time_filter["$gte"] = datetime.fromisoformat(start_date)
+    if end_date:
+        time_filter["$lte"] = datetime.fromisoformat(end_date)
+    if time_filter:
+        query["timestamp"] = time_filter
+        
+    cursor = wfh_screenshots_collection.find(query).sort("timestamp", -1)
+    screenshots = await cursor.to_list(length=1000)
+    
+    report_data = []
+    for s in screenshots:
+        emp_email = ""
+        emp_name = ""
+        try:
+            emp = await employees_collection.find_one({"_id": ObjectId(s["employee_id"])})
+            if emp:
+                emp_email = emp.get("email", "")
+                emp_name = emp.get("full_name", "")
+        except Exception:
+            pass
+            
+        report_data.append({
+            "employee_email": emp_email,
+            "employee_name": emp_name,
+            "timestamp": s["timestamp"].isoformat() if s.get("timestamp") else "",
+            "active_app": s.get("active_app", ""),
+            "active_window": s.get("active_window", ""),
+            "flagged": s.get("flagged", False),
+            "flag_reason": s.get("flag_reason", "")
+        })
+        
+    if format == "csv":
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["Employee Email", "Employee Name", "Timestamp", "Active App", "Active Window", "Flagged Status", "Flag Reason"])
+        for row in report_data:
+            writer.writerow([
+                row["employee_email"], row["employee_name"], row["timestamp"], row["active_app"],
+                row["active_window"], "Flagged" if row["flagged"] else "Normal", row["flag_reason"]
+            ])
+        return Response(
+            content=output.getvalue(),
+            media_type="text/csv",
+            headers={"Content-Disposition": "attachment; filename=wfh_screenshots_report.csv"}
+        )
+        
+    return report_data
+
+
+@app.get("/debug/routes")
+async def debug_routes():
+    return [route.path for route in app.routes]
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8001, reload=False, reload_excludes=["*.log", "logs/*"])

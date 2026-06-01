@@ -8,6 +8,7 @@ class EmployeeType(str, Enum):
     DESK = "desk"
     FIELD = "field"
     OFFICE = "office"
+    WFH = "wfh"
 
 
 class TerritoryType(str, Enum):
@@ -18,6 +19,7 @@ class TerritoryType(str, Enum):
 class AttendanceType(str, Enum):
     OFFICE = "office"
     REMOTE_FIELD = "remote_field"
+    WFH = "wfh"
 
 
 class CheckInMethod(str, Enum):
@@ -476,3 +478,93 @@ class SyncBatchRequest(BaseModel):
     visits: List[dict] = []
     pings: List[dict] = []
 
+# =========================
+# WFH Desktop Monitoring Models
+# =========================
+
+class WFHDeviceInfo(BaseModel):
+    employee_id: str
+    organization_id: str
+    device_id: str
+    mac_address: Optional[str] = None
+    cpu_id: Optional[str] = None
+    os_info: Optional[str] = None
+    hostname: Optional[str] = None
+    ip_local: Optional[str] = None
+    ip_public: Optional[str] = None
+    ram_gb: Optional[float] = None
+    screen_resolution: Optional[str] = None
+    monitor_count: Optional[int] = None
+    status: str = "pending"  # pending | approved | revoked
+    registered_at: datetime = Field(default_factory=datetime.utcnow)
+    last_seen: datetime = Field(default_factory=datetime.utcnow)
+    approved_by: Optional[str] = None
+    approved_at: Optional[datetime] = None
+    revoked_by: Optional[str] = None
+    revoked_at: Optional[datetime] = None
+    revoke_reason: Optional[str] = None
+
+
+class WFHScreenshot(BaseModel):
+    employee_id: str
+    organization_id: str
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    image_url: str
+    active_app: Optional[str] = None
+    active_window: Optional[str] = None
+    thumbnail_url: Optional[str] = None
+    flagged: bool = False
+    flag_reason: Optional[str] = None
+
+
+class WFHActivity(BaseModel):
+    employee_id: str
+    organization_id: str
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    period_minutes: int = 5
+    keystrokes: int = 0
+    mouse_clicks: int = 0
+    mouse_distance_px: int = 0
+    scroll_events: int = 0
+    idle_seconds: int = 0
+    active_seconds: int = 0
+
+
+class WFHAppUsage(BaseModel):
+    employee_id: str
+    organization_id: str
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    date: str
+    apps: List[dict] = []
+
+
+class WFHProductivity(BaseModel):
+    employee_id: str
+    organization_id: str
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    date: str
+    score: float = 0.0
+    breakdown: Optional[dict] = None
+
+
+class WFHAlert(BaseModel):
+    employee_id: str
+    organization_id: str
+    type: str
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    image_url: Optional[str] = None
+    severity: str = "medium"
+    status: str = "pending"
+    details: Optional[str] = None
+    reviewed_by: Optional[str] = None
+    reviewed_at: Optional[datetime] = None
+
+
+class WFHMeeting(BaseModel):
+    employee_id: str
+    organization_id: str
+    platform: str
+    start_time: datetime
+    end_time: Optional[datetime] = None
+    duration_minutes: Optional[int] = None
+    date: str
