@@ -6230,7 +6230,17 @@ async def wfh_submit_screenshot(req: dict, background_tasks: BackgroundTasks, re
     if not image_url:
         raise HTTPException(status_code=400, detail="image_url is required")
 
-    now = datetime.now(timezone.utc)
+    server_now = datetime.now(timezone.utc)
+    timestamp_str = req.get("timestamp")
+    if timestamp_str:
+        try:
+            if timestamp_str.endswith('Z'):
+                timestamp_str = timestamp_str[:-1] + '+00:00'
+            now = datetime.fromisoformat(timestamp_str)
+        except Exception:
+            now = server_now
+    else:
+        now = server_now
 
     def is_base64_payload(value: str) -> bool:
         return (value.startswith("data:image/") or ";base64," in value or (not value.startswith("http") and not value.startswith("/uploads") and len(value) > 1000))
@@ -6274,7 +6284,7 @@ async def wfh_submit_screenshot(req: dict, background_tasks: BackgroundTasks, re
         "active_window": req.get("active_window"),
         "flagged": req.get("flagged", False),
         "flag_reason": req.get("flag_reason"),
-        "created_at": now
+        "created_at": server_now
     }
 
     result = await wfh_screenshots_collection.insert_one(doc)
@@ -6856,6 +6866,84 @@ async def admin_force_end_session(email: str, req: dict, current_admin: Admin = 
         "status": "success",
         "message": "Session force-ended successfully",
         "session_id": str(session_id)
+    }
+
+@app.post("/admin/wfh/employee/{email}/force-logout")
+async def admin_force_logout(email: str, current_admin: Admin = Depends(get_current_admin)):
+    clean_email = email.strip().lower()
+    
+    user = await employees_collection.find_one({"email": clean_email})
+    if not user:
+        raise HTTPException(status_code=404, detail="Employee not found")
+        
+    now = datetime.now(timezone.utc)
+    
+    # Enqueue force_logout command to agent
+    cmd_doc = {
+        "employee_email": clean_email,
+        "command": "force_logout",
+        "status": "pending",
+        "timestamp": now,
+        "reason": f"Force logged out by admin {current_admin.email}"
+    }
+    await wfh_commands_collection.insert_one(cmd_doc)
+    
+    # Also force-end active WFH session if exists
+    active_session = await wfh_sessions_collection.find_one({
+        "employee_email": clean_email,
+        "status": "active"
+    })
+    
+    session_id_str = None
+    if active_session:
+        session_id = active_session["_id"]
+        session_id_str = str(session_id)
+        check_in_time_val = active_session.get("check_in_time")
+        total_seconds_val = 0
+        if check_in_time_val:
+            if check_in_time_val.tzinfo is None:
+                check_in_time_val = check_in_time_val.replace(tzinfo=timezone.utc)
+            total_seconds_val = int((now - check_in_time_val).total_seconds())
+            
+        await wfh_sessions_collection.update_one(
+            {"_id": session_id},
+            {
+                "$set": {
+                    "status": "force_ended",
+                    "check_out_time": now,
+                    "total_active_seconds": total_seconds_val,
+                    "force_ended_by": current_admin.email,
+                    "force_end_reason": "Logged out by admin",
+                    "updated_at": now
+                }
+            }
+        )
+        
+        # Write checkout log in attendance_logs
+        checkout_log = {
+            "user_id": str(user["_id"]),
+            "email": clean_email,
+            "employee_name": user.get("full_name", ""),
+            "organization_id": user.get("organization_id"),
+            "timestamp": now,
+            "type": "check-out",
+            "attendance_type": "wfh",
+            "location": None,
+            "check_in_method": "wfh_desktop",
+            "status": "SUCCESS",
+            "location_name": "Logged out by Admin",
+            "selfie_verified": False,
+            "device_id": active_session.get("device_id"),
+            "wfh_session_id": session_id_str,
+            "method": "admin_force_logout",
+            "force_ended_by": current_admin.email
+        }
+        await attendance_logs_collection.insert_one(checkout_log)
+
+    return {
+        "status": "success",
+        "message": "Force-logout command queued successfully",
+        "session_id": session_id_str
     }
 
 @app.get("/admin/wfh/policy")
