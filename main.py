@@ -5797,6 +5797,8 @@ async def wfh_checkout(req: dict, employee=Depends(get_current_employee)):
 
     total_seconds = 0
     if check_in_time:
+        if check_in_time.tzinfo is None:
+            check_in_time = check_in_time.replace(tzinfo=timezone.utc)
         total_seconds = int((now - check_in_time).total_seconds())
 
     # SERVER-SIDE PRODUCTIVITY VALIDATION
@@ -6668,36 +6670,42 @@ async def admin_wfh_stats(current_admin: Admin = Depends(get_current_admin)):
 async def admin_wfh_live_view(current_admin: Admin = Depends(get_current_admin)):
     org_id = current_admin.organization_id
 
-    query = {"status": "active"}
-
+    query = {"employee_type": "wfh"}
     if org_id and org_id != "system_org":
         query["organization_id"] = org_id
 
-    sessions = await wfh_sessions_collection.find(query).sort("check_in_time", -1).to_list(length=500)
+    employees = await employees_collection.find(query).to_list(length=500)
 
     result = []
 
-    for session in sessions:
-        session_id = str(session["_id"])
+    for employee in employees:
+        employee_id = str(employee["_id"])
+        employee_email = employee.get("email")
+
+        # Find active session if any
+        active_session = await wfh_sessions_collection.find_one({
+            "employee_id": employee_id,
+            "status": "active"
+        })
 
         latest_screenshot = await wfh_screenshots_collection.find_one(
-            {"session_id": session_id},
+            {"employee_id": employee_id},
             sort=[("timestamp", -1)]
         )
 
         latest_activity = await wfh_activity_collection.find_one(
-            {"session_id": session_id},
+            {"employee_id": employee_id},
             sort=[("timestamp", -1)]
         )
 
         result.append({
-            "session_id": session_id,
-            "employee_id": session.get("employee_id"),
-            "employee_email": session.get("employee_email"),
-            "employee_name": session.get("employee_name"),
-            "check_in_time": session.get("check_in_time"),
-            "productivity_score": session.get("productivity_score", 0),
-            "device_id": session.get("device_id"),
+            "session_id": str(active_session["_id"]) if active_session else f"offline-{employee_email}",
+            "employee_id": employee_id,
+            "employee_email": employee_email,
+            "employee_name": employee.get("full_name"),
+            "check_in_time": active_session.get("check_in_time") if active_session else None,
+            "productivity_score": active_session.get("productivity_score", 0) if active_session else 0,
+            "device_id": active_session.get("device_id") if active_session else None,
             "latest_screenshot": {
                 "_id": str(latest_screenshot["_id"]),
                 "image_url": latest_screenshot.get("image_url"),
