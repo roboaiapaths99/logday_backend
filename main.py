@@ -7256,39 +7256,55 @@ async def admin_wfh_employee_screenshots_download(
         img.save(out_buf, format="JPEG", quality=50)
         return out_buf.getvalue()
 
+    import asyncio
+    semaphore = asyncio.Semaphore(15)
+
+    async def process_item(index, item):
+        image_url = item.get("image_url", "")
+        if not image_url:
+            return None
+
+        ts = item.get("timestamp")
+        time_str = "unknown"
+        if isinstance(ts, datetime):
+            time_str = ts.strftime("%H-%M-%S")
+        elif isinstance(ts, str):
+            try:
+                dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                time_str = dt.strftime("%H-%M-%S")
+            except Exception:
+                time_str = "".join(c if c.isalnum() or c in "-_" else "_" for c in ts)
+
+        active_app = item.get("active_app") or "UnknownApp"
+        sanitized_app = "".join(c if c.isalnum() or c in " ._-" else "_" for c in active_app)
+        sanitized_app = sanitized_app[:30].strip()
+
+        filename = f"screenshot_{index:03d}_{time_str}_{sanitized_app}.jpg"
+
+        async with semaphore:
+            try:
+                compressed_data = await run_in_threadpool(compress_screenshot, image_url)
+                return {"filename": filename, "data": compressed_data, "success": True}
+            except Exception as e:
+                err_msg = f"Failed to compress {image_url}: {str(e)}"
+                return {"filename": filename, "error": err_msg, "success": False}
+
+    tasks = [process_item(index, item) for index, item in enumerate(screenshots, 1)]
+    results = await asyncio.gather(*tasks)
+
     zip_buffer = io.BytesIO()
 
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
         errors = []
-        for index, item in enumerate(screenshots, 1):
-            image_url = item.get("image_url", "")
-            if not image_url:
+        for res in results:
+            if not res:
                 continue
-
-            ts = item.get("timestamp")
-            time_str = "unknown"
-            if isinstance(ts, datetime):
-                time_str = ts.strftime("%H-%M-%S")
-            elif isinstance(ts, str):
-                try:
-                    dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-                    time_str = dt.strftime("%H-%M-%S")
-                except Exception:
-                    time_str = "".join(c if c.isalnum() or c in "-_" else "_" for c in ts)
-
-            active_app = item.get("active_app") or "UnknownApp"
-            sanitized_app = "".join(c if c.isalnum() or c in " ._-" else "_" for c in active_app)
-            sanitized_app = sanitized_app[:30].strip()
-
-            filename = f"screenshot_{index:03d}_{time_str}_{sanitized_app}.jpg"
-
-            try:
-                compressed_data = await run_in_threadpool(compress_screenshot, image_url)
-                zip_file.writestr(filename, compressed_data)
-            except Exception as e:
-                err_msg = f"Failed to compress {image_url}: {str(e)}"
-                errors.append(err_msg)
-                zip_file.writestr(f"error_screenshot_{index:03d}.txt", err_msg.encode("utf-8"))
+            if res["success"]:
+                zip_file.writestr(res["filename"], res["data"])
+            else:
+                errors.append(res["error"])
+                err_filename = f"error_{res['filename'].replace('.jpg', '.txt')}"
+                zip_file.writestr(err_filename, res["error"].encode("utf-8"))
 
         if errors:
             error_log = "\n".join(errors)
