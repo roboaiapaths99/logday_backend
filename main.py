@@ -7193,16 +7193,116 @@ async def admin_wfh_employee_screenshots(
     cursor = wfh_screenshots_collection.find(query).sort("timestamp", -1).limit(limit)
     screenshots = await cursor.to_list(length=limit)
 
-    for item in screenshots:
-        item["_id"] = str(item["_id"])
-        image_url = item.get("image_url", "")
-        if image_url and image_url.startswith("/uploads/"):
-            item["image_url"] = build_static_upload_url(request, image_url)
-        thumbnail_url = item.get("thumbnail_url", "")
-        if thumbnail_url and thumbnail_url.startswith("/uploads/"):
-            item["thumbnail_url"] = build_static_upload_url(request, thumbnail_url)
-
     return screenshots
+
+
+@app.get("/admin/wfh/employee/{email}/screenshots/download")
+async def admin_wfh_employee_screenshots_download(
+    request: Request,
+    email: str,
+    date: Optional[str] = None,
+    current_admin: Admin = Depends(get_current_admin)
+):
+    import zipfile
+    import io
+    import os
+    import requests
+    from PIL import Image
+    from fastapi.concurrency import run_in_threadpool
+    from starlette.responses import StreamingResponse
+
+    clean_email = email.strip().lower()
+
+    query = {"employee_email": clean_email}
+
+    if current_admin.organization_id and current_admin.organization_id != "system_org":
+        query["organization_id"] = current_admin.organization_id
+
+    if date:
+        query["date"] = date
+
+    cursor = wfh_screenshots_collection.find(query).sort("timestamp", 1)
+    screenshots = await cursor.to_list(length=1000)
+
+    if not screenshots:
+        raise HTTPException(status_code=404, detail="No screenshots found for the selected date")
+
+    def compress_screenshot(image_url: str) -> bytes:
+        img_bytes = None
+        if image_url.startswith("http://") or image_url.startswith("https://"):
+            resp = requests.get(image_url, timeout=10)
+            resp.raise_for_status()
+            img_bytes = resp.content
+        else:
+            local_path = image_url.lstrip("/")
+            if not os.path.exists(local_path):
+                raise FileNotFoundError(f"File not found: {local_path}")
+            with open(local_path, "rb") as f:
+                img_bytes = f.read()
+
+        img = Image.open(io.BytesIO(img_bytes))
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        out_buf = io.BytesIO()
+        img.save(out_buf, format="JPEG", quality=50)
+        return out_buf.getvalue()
+
+    zip_buffer = io.BytesIO()
+
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+        errors = []
+        for index, item in enumerate(screenshots, 1):
+            image_url = item.get("image_url", "")
+            if not image_url:
+                continue
+
+            ts = item.get("timestamp")
+            time_str = "unknown"
+            if isinstance(ts, datetime):
+                time_str = ts.strftime("%H-%M-%S")
+            elif isinstance(ts, str):
+                try:
+                    dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                    time_str = dt.strftime("%H-%M-%S")
+                except Exception:
+                    time_str = "".join(c if c.isalnum() or c in "-_" else "_" for c in ts)
+
+            active_app = item.get("active_app") or "UnknownApp"
+            sanitized_app = "".join(c if c.isalnum() or c in " ._-" else "_" for c in active_app)
+            sanitized_app = sanitized_app[:30].strip()
+
+            filename = f"screenshot_{index:03d}_{time_str}_{sanitized_app}.jpg"
+
+            try:
+                compressed_data = await run_in_threadpool(compress_screenshot, image_url)
+                zip_file.writestr(filename, compressed_data)
+            except Exception as e:
+                err_msg = f"Failed to compress {image_url}: {str(e)}"
+                errors.append(err_msg)
+                zip_file.writestr(f"error_screenshot_{index:03d}.txt", err_msg.encode("utf-8"))
+
+        if errors:
+            error_log = "\n".join(errors)
+            zip_file.writestr("error_log.txt", error_log.encode("utf-8"))
+
+    zip_buffer.seek(0)
+
+    filename_date = date if date else datetime.now().strftime("%Y-%m-%d")
+    zip_filename = f"screenshots_{clean_email}_{filename_date}.zip"
+
+    headers = {
+        "Content-Disposition": f'attachment; filename="{zip_filename}"',
+        "Access-Control-Expose-Headers": "Content-Disposition"
+    }
+
+    return StreamingResponse(
+        zip_buffer,
+        media_type="application/zip",
+        headers=headers
+    )
+
+
+
 
 
 @app.get("/admin/wfh/employee/{email}/activity")
