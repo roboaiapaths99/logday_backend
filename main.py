@@ -388,7 +388,7 @@ async def purge_old_screenshots():
         for org in orgs:
             org_id = str(org["_id"])
             policy = org.get("wfh_policy", {}) or {}
-            retention_days = policy.get("screenshot_retention_days", 90)
+            retention_days = policy.get("screenshot_retention_days", 5)
             
             cutoff_date = now - timedelta(days=retention_days)
             query = {
@@ -1379,7 +1379,7 @@ async def smart_attendance(req: VerifyPresenceRequest, background_tasks: Backgro
                     "productivity_threshold_percent": 60,
                     "working_hours_start": "09:00",
                     "working_hours_end": "18:00",
-                    "screenshot_retention_days": 90,
+                    "screenshot_retention_days": 5,
                     "require_face_verification": True,
                     "productive_apps": [],
                     "unproductive_apps": []
@@ -5747,7 +5747,7 @@ async def wfh_checkin(req: dict, employee=Depends(get_current_employee)):
             "productivity_threshold_percent": 60,
             "working_hours_start": "09:00",
             "working_hours_end": "18:00",
-            "screenshot_retention_days": 90,
+            "screenshot_retention_days": 5,
             "require_face_verification": True,
             "productive_apps": [],
             "unproductive_apps": []
@@ -6965,7 +6965,7 @@ async def get_wfh_policy(current_admin: Admin = Depends(get_current_admin)):
             "productivity_threshold_percent": 60,
             "working_hours_start": "09:00",
             "working_hours_end": "18:00",
-            "screenshot_retention_days": 90,
+            "screenshot_retention_days": 5,
             "require_face_verification": True,
             "productive_apps": [],
             "unproductive_apps": []
@@ -6985,7 +6985,7 @@ async def update_wfh_policy(req: dict, current_admin: Admin = Depends(get_curren
         "productivity_threshold_percent": int(req.get("productivity_threshold_percent", 60)),
         "working_hours_start": str(req.get("working_hours_start", "09:00")),
         "working_hours_end": str(req.get("working_hours_end", "18:00")),
-        "screenshot_retention_days": int(req.get("screenshot_retention_days", 90)),
+        "screenshot_retention_days": int(req.get("screenshot_retention_days", 5)),
         "require_face_verification": bool(req.get("require_face_verification", True)),
         "productive_apps": list(req.get("productive_apps", [])),
         "unproductive_apps": list(req.get("unproductive_apps", []))
@@ -7020,7 +7020,7 @@ async def api_get_wfh_policy(employee = Depends(get_current_employee)):
             "productivity_threshold_percent": 60,
             "working_hours_start": "09:00",
             "working_hours_end": "18:00",
-            "screenshot_retention_days": 90,
+            "screenshot_retention_days": 5,
             "require_face_verification": True,
             "productive_apps": [],
             "unproductive_apps": []
