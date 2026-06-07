@@ -6213,9 +6213,13 @@ async def get_my_screenshots(
 
 def build_static_upload_url(request: Request, relative_path: str) -> str:
     base_url = str(request.base_url).rstrip("/")
+    forwarded_proto = request.headers.get("x-forwarded-proto")
+    if forwarded_proto == "https" and base_url.startswith("http://"):
+        base_url = base_url.replace("http://", "https://", 1)
     if not relative_path.startswith("/"):
         relative_path = "/" + relative_path
     return f"{base_url}{relative_path}"
+
 
 
 @app.post("/api/wfh/screenshot")
