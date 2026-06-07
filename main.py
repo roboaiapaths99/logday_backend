@@ -7192,8 +7192,17 @@ async def admin_wfh_employee_screenshots(
 
     cursor = wfh_screenshots_collection.find(query).sort("timestamp", -1).limit(limit)
     screenshots = await cursor.to_list(length=limit)
+    for item in screenshots:
+        item["_id"] = str(item["_id"])
+        image_url = item.get("image_url", "")
+        if image_url and image_url.startswith("/uploads/"):
+            item["image_url"] = build_static_upload_url(request, image_url)
+        thumbnail_url = item.get("thumbnail_url", "")
+        if thumbnail_url and thumbnail_url.startswith("/uploads/"):
+            item["thumbnail_url"] = build_static_upload_url(request, thumbnail_url)
 
     return screenshots
+
 
 
 @app.get("/admin/wfh/employee/{email}/screenshots/download")
