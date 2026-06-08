@@ -63,20 +63,23 @@ async def ensure_employee_indexes():
     await wfh_sessions_collection.create_index([("employee_email", 1), ("status", 1)])
     await wfh_sessions_collection.create_index([("organization_id", 1), ("status", 1)])
 
-    # WFH Screenshots: queries sorted by timestamp, filtered by employee_id
+    # WFH Screenshots: queries sorted by timestamp, filtered by employee_id or employee_email
     await wfh_screenshots_collection.create_index([("employee_id", 1), ("timestamp", -1)])
+    await wfh_screenshots_collection.create_index([("employee_email", 1), ("timestamp", -1)])
     await wfh_screenshots_collection.create_index("timestamp")  # for purge job
 
-    # WFH Activity: queries sorted by timestamp, filtered by employee_id
+    # WFH Activity: queries sorted by timestamp, filtered by employee_id or employee_email
     await wfh_activity_collection.create_index([("employee_id", 1), ("timestamp", -1)])
+    await wfh_activity_collection.create_index([("employee_email", 1), ("timestamp", -1)])
 
     # WFH Productivity: queries by date + org — THIS was causing the 20s timeout
     await wfh_productivity_collection.create_index([("date", 1), ("organization_id", 1)])
     await wfh_productivity_collection.create_index([("employee_id", 1), ("date", 1)])
 
-    # WFH Alerts: queries by status + timestamp
+    # WFH Alerts: queries by status + timestamp, and by employee_email for timeline
     await wfh_alerts_collection.create_index([("status", 1), ("timestamp", -1)])
     await wfh_alerts_collection.create_index([("organization_id", 1), ("status", 1), ("timestamp", -1)])
+    await wfh_alerts_collection.create_index([("employee_email", 1), ("timestamp", -1)])
 
     # WFH Commands: queries by employee_email + status (polling endpoint)
     await wfh_commands_collection.create_index([("employee_email", 1), ("status", 1)])

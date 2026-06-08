@@ -7490,51 +7490,71 @@ async def admin_wfh_employee_timeline(
     else:
         time_filter = {}
 
-    timeline = []
+    try:
+        # Run all 3 queries in parallel instead of sequentially
+        screenshots_task = wfh_screenshots_collection.find({**base_query, **time_filter}).to_list(length=300)
+        activities_task = wfh_activity_collection.find({**base_query, **time_filter}).to_list(length=300)
+        alerts_task = wfh_alerts_collection.find({**base_query, **time_filter}).to_list(length=300)
 
-    screenshots = await wfh_screenshots_collection.find({**base_query, **time_filter}).to_list(length=300)
-    for item in screenshots:
-        timeline.append({
-            "type": "screenshot",
-            "timestamp": item.get("timestamp"),
-            "data": {
-                "_id": str(item["_id"]),
-                "image_url": item.get("image_url"),
-                "active_app": item.get("active_app"),
-                "active_window": item.get("active_window")
-            }
-        })
+        screenshots, activities, alerts = await asyncio.gather(
+            screenshots_task, activities_task, alerts_task,
+            return_exceptions=True
+        )
 
-    activities = await wfh_activity_collection.find({**base_query, **time_filter}).to_list(length=300)
-    for item in activities:
-        timeline.append({
-            "type": "activity",
-            "timestamp": item.get("timestamp"),
-            "data": {
-                "_id": str(item["_id"]),
-                "keystrokes": item.get("keystrokes", 0),
-                "mouse_clicks": item.get("mouse_clicks", 0),
-                "idle_seconds": item.get("idle_seconds", 0),
-                "active_seconds": item.get("active_seconds", 0)
-            }
-        })
+        timeline = []
 
-    alerts = await wfh_alerts_collection.find({**base_query, **time_filter}).to_list(length=300)
-    for item in alerts:
-        timeline.append({
-            "type": "alert",
-            "timestamp": item.get("timestamp"),
-            "data": {
-                "_id": str(item["_id"]),
-                "alert_type": item.get("type"),
-                "severity": item.get("severity"),
-                "details": item.get("details")
-            }
-        })
+        if isinstance(screenshots, list):
+            for item in screenshots:
+                timeline.append({
+                    "type": "screenshot",
+                    "timestamp": item.get("timestamp"),
+                    "data": {
+                        "_id": str(item["_id"]),
+                        "image_url": item.get("image_url"),
+                        "active_app": item.get("active_app"),
+                        "active_window": item.get("active_window")
+                    }
+                })
+        else:
+            logger.error(f"timeline: screenshots query failed: {screenshots}")
 
-    timeline.sort(key=lambda x: x.get("timestamp") or datetime.min, reverse=True)
+        if isinstance(activities, list):
+            for item in activities:
+                timeline.append({
+                    "type": "activity",
+                    "timestamp": item.get("timestamp"),
+                    "data": {
+                        "_id": str(item["_id"]),
+                        "keystrokes": item.get("keystrokes", 0),
+                        "mouse_clicks": item.get("mouse_clicks", 0),
+                        "idle_seconds": item.get("idle_seconds", 0),
+                        "active_seconds": item.get("active_seconds", 0)
+                    }
+                })
+        else:
+            logger.error(f"timeline: activities query failed: {activities}")
 
-    return timeline
+        if isinstance(alerts, list):
+            for item in alerts:
+                timeline.append({
+                    "type": "alert",
+                    "timestamp": item.get("timestamp"),
+                    "data": {
+                        "_id": str(item["_id"]),
+                        "alert_type": item.get("type"),
+                        "severity": item.get("severity"),
+                        "details": item.get("details")
+                    }
+                })
+        else:
+            logger.error(f"timeline: alerts query failed: {alerts}")
+
+        timeline.sort(key=lambda x: x.get("timestamp") or datetime.min, reverse=True)
+
+        return timeline
+    except Exception as e:
+        logger.error(f"admin_wfh_employee_timeline crashed: {e}", exc_info=True)
+        return []
 
 
 @app.get("/admin/wfh/alerts")
