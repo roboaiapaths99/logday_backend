@@ -6639,105 +6639,152 @@ async def admin_wfh_stats(current_admin: Admin = Depends(get_current_admin)):
     if org_id and org_id != "system_org":
         query["organization_id"] = org_id
 
-    active_sessions = await wfh_sessions_collection.count_documents({
-        **query,
-        "status": "active"
-    })
+    try:
+        # Run all 4 queries in parallel to minimize latency
+        today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
 
-    today_alerts = await wfh_alerts_collection.count_documents({
-        **query,
-        "status": "pending",
-        "timestamp": {
-            "$gte": datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-        }
-    })
+        active_sessions_task = wfh_sessions_collection.count_documents({
+            **query,
+            "status": "active"
+        })
+        today_alerts_task = wfh_alerts_collection.count_documents({
+            **query,
+            "status": "pending",
+            "timestamp": {"$gte": today_start}
+        })
+        wfh_employees_task = employees_collection.count_documents({
+            **query,
+            "employee_type": "wfh"
+        })
+        productivity_task = wfh_productivity_collection.find({
+            **query,
+            "date": today
+        }).to_list(length=500)
 
-    productivity_cursor = wfh_productivity_collection.find({
-        **query,
-        "date": today
-    })
-
-    productivity_list = await productivity_cursor.to_list(length=1000)
-
-    avg_productivity = 0
-    if productivity_list:
-        avg_productivity = round(
-            sum(item.get("score", 0) for item in productivity_list) / len(productivity_list),
-            2
+        active_sessions, today_alerts, wfh_employees, productivity_list = await asyncio.gather(
+            active_sessions_task,
+            today_alerts_task,
+            wfh_employees_task,
+            productivity_task,
+            return_exceptions=True
         )
 
-    wfh_employees = await employees_collection.count_documents({
-        **query,
-        "employee_type": "wfh"
-    })
+        # Handle any individual query failures gracefully
+        if isinstance(active_sessions, Exception):
+            logger.error(f"stats: active_sessions query failed: {active_sessions}")
+            active_sessions = 0
+        if isinstance(today_alerts, Exception):
+            logger.error(f"stats: today_alerts query failed: {today_alerts}")
+            today_alerts = 0
+        if isinstance(wfh_employees, Exception):
+            logger.error(f"stats: wfh_employees query failed: {wfh_employees}")
+            wfh_employees = 0
+        if isinstance(productivity_list, Exception):
+            logger.error(f"stats: productivity query failed: {productivity_list}")
+            productivity_list = []
 
-    return {
-        "active_sessions": active_sessions,
-        "wfh_employees": wfh_employees,
-        "pending_alerts": today_alerts,
-        "avg_productivity": avg_productivity,
-        "date": today
-    }
+        avg_productivity = 0
+        if productivity_list and isinstance(productivity_list, list):
+            scores = [item.get("score", 0) for item in productivity_list if isinstance(item, dict)]
+            if scores:
+                avg_productivity = round(sum(scores) / len(scores), 2)
+
+        return {
+            "active_sessions": active_sessions,
+            "wfh_employees": wfh_employees,
+            "pending_alerts": today_alerts,
+            "avg_productivity": avg_productivity,
+            "date": today
+        }
+    except Exception as e:
+        logger.error(f"admin_wfh_stats crashed: {e}", exc_info=True)
+        # Return safe fallback instead of 500 — CORS headers will still be sent
+        return {
+            "active_sessions": 0,
+            "wfh_employees": 0,
+            "pending_alerts": 0,
+            "avg_productivity": 0,
+            "date": today,
+            "error": "Stats temporarily unavailable"
+        }
 
 
 @app.get("/admin/wfh/live-view")
 async def admin_wfh_live_view(current_admin: Admin = Depends(get_current_admin)):
     org_id = current_admin.organization_id
 
-    query = {"employee_type": "wfh"}
-    if org_id and org_id != "system_org":
-        query["organization_id"] = org_id
+    try:
+        query = {"employee_type": "wfh"}
+        if org_id and org_id != "system_org":
+            query["organization_id"] = org_id
 
-    employees = await employees_collection.find(query).to_list(length=500)
+        employees = await employees_collection.find(query).to_list(length=500)
 
-    result = []
+        if not employees:
+            return []
 
-    for employee in employees:
-        employee_id = str(employee["_id"])
-        employee_email = employee.get("email")
+        employee_ids = [str(emp["_id"]) for emp in employees]
 
-        # Find active session if any
-        active_session = await wfh_sessions_collection.find_one({
-            "employee_id": employee_id,
-            "status": "active"
-        })
-
-        latest_screenshot = await wfh_screenshots_collection.find_one(
-            {"employee_id": employee_id},
-            sort=[("timestamp", -1)]
+        # Fetch ALL sessions, screenshots, activities in 3 bulk queries (not N*3 sequential)
+        active_sessions_list, latest_screenshots_raw, latest_activities_raw = await asyncio.gather(
+            wfh_sessions_collection.find(
+                {"employee_id": {"$in": employee_ids}, "status": "active"}
+            ).to_list(length=500),
+            wfh_screenshots_collection.aggregate([
+                {"$match": {"employee_id": {"$in": employee_ids}}},
+                {"$sort": {"timestamp": -1}},
+                {"$group": {"_id": "$employee_id", "doc": {"$first": "$$ROOT"}}}
+            ]).to_list(length=500),
+            wfh_activity_collection.aggregate([
+                {"$match": {"employee_id": {"$in": employee_ids}}},
+                {"$sort": {"timestamp": -1}},
+                {"$group": {"_id": "$employee_id", "doc": {"$first": "$$ROOT"}}}
+            ]).to_list(length=500)
         )
 
-        latest_activity = await wfh_activity_collection.find_one(
-            {"employee_id": employee_id},
-            sort=[("timestamp", -1)]
-        )
+        # Build lookup dicts keyed by employee_id
+        sessions_by_emp = {s["employee_id"]: s for s in (active_sessions_list or [])}
+        screenshots_by_emp = {item["_id"]: item["doc"] for item in (latest_screenshots_raw or [])}
+        activities_by_emp = {item["_id"]: item["doc"] for item in (latest_activities_raw or [])}
 
-        result.append({
-            "session_id": str(active_session["_id"]) if active_session else f"offline-{employee_email}",
-            "employee_id": employee_id,
-            "employee_email": employee_email,
-            "employee_name": employee.get("full_name"),
-            "check_in_time": active_session.get("check_in_time") if active_session else None,
-            "productivity_score": active_session.get("productivity_score", 0) if active_session else 0,
-            "device_id": active_session.get("device_id") if active_session else None,
-            "latest_screenshot": {
-                "_id": str(latest_screenshot["_id"]),
-                "image_url": latest_screenshot.get("image_url"),
-                "timestamp": latest_screenshot.get("timestamp"),
-                "active_app": latest_screenshot.get("active_app"),
-                "active_window": latest_screenshot.get("active_window")
-            } if latest_screenshot else None,
-            "latest_activity": {
-                "_id": str(latest_activity["_id"]),
-                "keystrokes": latest_activity.get("keystrokes", 0),
-                "mouse_clicks": latest_activity.get("mouse_clicks", 0),
-                "idle_seconds": latest_activity.get("idle_seconds", 0),
-                "active_seconds": latest_activity.get("active_seconds", 0),
-                "timestamp": latest_activity.get("timestamp")
-            } if latest_activity else None
-        })
+        result = []
+        for employee in employees:
+            employee_id = str(employee["_id"])
+            employee_email = employee.get("email")
 
-    return result
+            active_session = sessions_by_emp.get(employee_id)
+            latest_screenshot = screenshots_by_emp.get(employee_id)
+            latest_activity = activities_by_emp.get(employee_id)
+
+            result.append({
+                "session_id": str(active_session["_id"]) if active_session else f"offline-{employee_email}",
+                "employee_id": employee_id,
+                "employee_email": employee_email,
+                "employee_name": employee.get("full_name"),
+                "check_in_time": active_session.get("check_in_time") if active_session else None,
+                "productivity_score": active_session.get("productivity_score", 0) if active_session else 0,
+                "device_id": active_session.get("device_id") if active_session else None,
+                "latest_screenshot": {
+                    "_id": str(latest_screenshot["_id"]),
+                    "image_url": latest_screenshot.get("image_url"),
+                    "timestamp": latest_screenshot.get("timestamp"),
+                    "active_app": latest_screenshot.get("active_app"),
+                    "active_window": latest_screenshot.get("active_window")
+                } if latest_screenshot else None,
+                "latest_activity": {
+                    "_id": str(latest_activity["_id"]),
+                    "keystrokes": latest_activity.get("keystrokes", 0),
+                    "mouse_clicks": latest_activity.get("mouse_clicks", 0),
+                    "idle_seconds": latest_activity.get("idle_seconds", 0),
+                    "active_seconds": latest_activity.get("active_seconds", 0),
+                    "timestamp": latest_activity.get("timestamp")
+                } if latest_activity else None
+            })
+
+        return result
+    except Exception as e:
+        logger.error(f"admin_wfh_live_view crashed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Live view temporarily unavailable: {str(e)}")
 
 @app.post("/admin/wfh/employee/{email}/trigger-screenshot")
 async def admin_trigger_screenshot(email: str, current_admin: Admin = Depends(get_current_admin)):
