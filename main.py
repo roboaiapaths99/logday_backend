@@ -7242,7 +7242,15 @@ async def admin_wfh_employee_screenshots_download(
 
     def compress_screenshot(image_url: str) -> bytes:
         img_bytes = None
-        if image_url.startswith("http://") or image_url.startswith("https://"):
+        local_path = None
+        if "/uploads/" in image_url:
+            idx = image_url.find("/uploads/")
+            local_path = image_url[idx:].lstrip("/")
+
+        if local_path and os.path.exists(local_path):
+            with open(local_path, "rb") as f:
+                img_bytes = f.read()
+        elif image_url.startswith("http://") or image_url.startswith("https://"):
             resp = requests.get(image_url, timeout=10)
             resp.raise_for_status()
             img_bytes = resp.content
