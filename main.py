@@ -5489,10 +5489,12 @@ async def register_wfh_device(req: dict, employee=Depends(get_current_employee))
             "device_id": device_id
         }
 
-    device_data["status"] = "pending"
+    AUTO_APPROVE = os.getenv("AUTO_APPROVE_WFH_DEVICES", "false").lower() == "true"
+
+    device_data["status"] = "approved" if AUTO_APPROVE else "pending"
     device_data["registered_at"] = now
-    device_data["approved_by"] = None
-    device_data["approved_at"] = None
+    device_data["approved_by"] = "auto-approved" if AUTO_APPROVE else None
+    device_data["approved_at"] = now if AUTO_APPROVE else None
     device_data["revoked_by"] = None
     device_data["revoked_at"] = None
     device_data["revoke_reason"] = None
@@ -5501,8 +5503,8 @@ async def register_wfh_device(req: dict, employee=Depends(get_current_employee))
 
     return {
         "status": "success",
-        "message": "WFH device registered. Waiting for admin approval.",
-        "device_status": "pending",
+        "message": "WFH device approved." if AUTO_APPROVE else "WFH device registered. Waiting for admin approval.",
+        "device_status": "approved" if AUTO_APPROVE else "pending",
         "device_record_id": str(result.inserted_id),
         "device_id": device_id
     }
@@ -5664,14 +5666,49 @@ async def verify_wfh_device(employee_id: str, org_id: str, device_id: str):
     if not device_id:
         raise HTTPException(status_code=400, detail="device_id is required")
 
+    AUTO_APPROVE = os.getenv("AUTO_APPROVE_WFH_DEVICES", "false").lower() == "true"
+
     device = await wfh_device_info_collection.find_one({
         "employee_id": employee_id,
         "organization_id": org_id,
-        "device_id": device_id,
-        "status": "approved"
+        "device_id": device_id
     })
 
     if not device:
+        if AUTO_APPROVE:
+            from bson import ObjectId
+            employee = await employees_collection.find_one({"_id": ObjectId(employee_id)})
+            now = datetime.now(timezone.utc)
+            device_doc = {
+                "employee_id": employee_id,
+                "employee_email": employee.get("email") if employee else "",
+                "employee_name": employee.get("full_name", "") if employee else "",
+                "organization_id": org_id,
+                "device_id": device_id,
+                "status": "approved",
+                "registered_at": now,
+                "approved_at": now,
+                "approved_by": "auto-approved",
+                "last_seen": now,
+                "updated_at": now
+            }
+            await wfh_device_info_collection.insert_one(device_doc)
+            return device_doc
+
+        raise HTTPException(
+            status_code=403,
+            detail="WFH device not approved. Please contact admin."
+        )
+
+    if device.get("status") != "approved":
+        if AUTO_APPROVE:
+            await wfh_device_info_collection.update_one(
+                {"_id": device["_id"]},
+                {"$set": {"status": "approved", "approved_at": datetime.now(timezone.utc), "approved_by": "auto-approved"}}
+            )
+            device["status"] = "approved"
+            return device
+
         raise HTTPException(
             status_code=403,
             detail="WFH device not approved. Please contact admin."
