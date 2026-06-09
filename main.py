@@ -306,12 +306,14 @@ def get_screenshot_display_url(url: str, request: Request = None) -> str:
         s3_key = get_s3_key_from_url(url)
         if s3_key:
             try:
+                from botocore.client import Config
                 s3_client = boto3.client(
                     "s3",
                     endpoint_url=S3_ENDPOINT_URL,
                     aws_access_key_id=S3_ACCESS_KEY_ID,
                     aws_secret_access_key=S3_SECRET_ACCESS_KEY,
-                    region_name=S3_REGION_NAME
+                    region_name=S3_REGION_NAME,
+                    config=Config(signature_version='s3v4')
                 )
                 presigned_url = s3_client.generate_presigned_url(
                     'get_object',
