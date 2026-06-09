@@ -275,6 +275,7 @@ class SubAdminCreate(BaseModel):
     email: str
     password: str
     role: AdminRole = AdminRole.HR
+    organization_id: Optional[str] = None
 
 
 class EmployeeUpdate(BaseModel):

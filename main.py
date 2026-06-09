@@ -60,7 +60,8 @@ from database import (
     wfh_device_info_collection,
     wfh_signals_collection,
     wfh_commands_collection,
-    wfh_face_checks_collection
+    wfh_face_checks_collection,
+    ensure_employee_indexes
 )
 from models import (
     RegisterRequest, LoginRequest, VerifyPresenceRequest, Token, LoginResponse, EmployeeProfile, UpdateFaceRequest,
@@ -284,6 +285,44 @@ S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME") or os.getenv("AWS_STORAGE_BUCKET_NA
 S3_REGION_NAME = os.getenv("S3_REGION_NAME", "us-east-1")
 S3_PUBLIC_URL_PREFIX = os.getenv("S3_PUBLIC_URL_PREFIX") or os.getenv("R2_PUBLIC_URL_PREFIX")
 
+def get_s3_key_from_url(url: str) -> str:
+    for folder in ["wfh_view", "wfh_face_checks"]:
+        marker = f"/{folder}/"
+        if marker in url:
+            idx = url.find(marker)
+            return url[idx+1:]
+    return ""
+
+def get_screenshot_display_url(url: str, request: Request = None) -> str:
+    if not url:
+        return ""
+    if url.startswith("/uploads/"):
+        if request:
+            return build_static_upload_url(request, url)
+        return url
+    
+    # Generate Presigned URL for private S3/R2 storage
+    if S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY:
+        s3_key = get_s3_key_from_url(url)
+        if s3_key:
+            try:
+                s3_client = boto3.client(
+                    "s3",
+                    endpoint_url=S3_ENDPOINT_URL,
+                    aws_access_key_id=S3_ACCESS_KEY_ID,
+                    aws_secret_access_key=S3_SECRET_ACCESS_KEY,
+                    region_name=S3_REGION_NAME
+                )
+                presigned_url = s3_client.generate_presigned_url(
+                    'get_object',
+                    Params={'Bucket': S3_BUCKET_NAME, 'Key': s3_key},
+                    ExpiresIn=3600 # 1 hour
+                )
+                return presigned_url
+            except Exception as e:
+                logger.error(f"Failed to generate presigned URL for key {s3_key}: {e}")
+    return url
+
 async def upload_file_to_storage(image_bytes: bytes, filename: str, folder: str = "wfh_view") -> str:
     """
     Enterprise hybrid storage: Uploads to S3/MinIO/R2 if configured, otherwise falls back to local disk.
@@ -456,6 +495,9 @@ async def purge_old_screenshots():
 async def startup_db_client():
     """Create indexes on startup (non-fatal if DB is temporarily unreachable)."""
     try:
+        # WFH & Employee indexes
+        await ensure_employee_indexes()
+        
         # Core Indexes
         await employees_collection.create_index("email", unique=True)
         await employees_collection.create_index("employee_id")
@@ -1104,7 +1146,12 @@ async def smart_attendance(req: VerifyPresenceRequest, background_tasks: Backgro
             if last_ts and last_ts.tzinfo is None:
                 last_ts = last_ts.replace(tzinfo=timezone.utc)
             if last_ts and last_ts < today_start_utc:
-                auto_checkout_time = last_ts.replace(hour=23, minute=59, second=59) if last_ts.hour < 23 else last_ts + timedelta(seconds=1)
+                local_ts = last_ts + timedelta(minutes=tz_offset)
+                if local_ts.hour < 23:
+                    local_end = local_ts.replace(hour=23, minute=59, second=59, microsecond=0)
+                    auto_checkout_time = local_end - timedelta(minutes=tz_offset)
+                else:
+                    auto_checkout_time = last_ts + timedelta(seconds=1)
                 auto_checkout_log = {
                     "user_id": str(user["_id"]),
                     "type": "check-out",
@@ -2151,7 +2198,7 @@ async def list_sub_admins(current_admin: Admin = Depends(get_current_admin)):
     if current_admin.role not in ["owner", "superadmin", "admin"]:
         raise HTTPException(status_code=403, detail="Only organization owners/admins can manage the admin team.")
     
-    query = {"organization_id": current_admin.organization_id}
+    query = {} if _is_superadmin(current_admin) else {"organization_id": current_admin.organization_id}
     cursor = admins_collection.find(query, {"hashed_password": 0})
     admins = await cursor.to_list(length=100)
     for a in admins:
@@ -2178,7 +2225,7 @@ async def create_sub_admin(req: SubAdminCreate, current_admin: Admin = Depends(g
         "hashed_password": hashed_password,
         "full_name": req.full_name,
         "role": req.role if hasattr(req, 'role') and req.role else "admin",
-        "organization_id": current_admin.organization_id,
+        "organization_id": req.organization_id if (req.organization_id and _is_superadmin(current_admin)) else current_admin.organization_id,
         "created_at": datetime.now(timezone.utc),
         "allowed_features": ["dashboard", "employees", "attendance", "leaves", "expenses", "reports", "war_room", "territory", "nudge", "leaderboard"]
     }
@@ -2196,11 +2243,10 @@ async def delete_sub_admin(email: str, current_admin: Admin = Depends(get_curren
         raise HTTPException(status_code=400, detail="You cannot delete yourself.")
         
     # Security: Ensure we only delete admins from the same organization and who are NOT owners
-    result = await admins_collection.delete_one({
-        "email": email,
-        "organization_id": current_admin.organization_id,
-        "role": "admin" # Can only delete sub-admins, not owners
-    })
+    delete_query = {"email": email, "role": "admin"}
+    if not _is_superadmin(current_admin):
+        delete_query["organization_id"] = current_admin.organization_id
+    result = await admins_collection.delete_one(delete_query)
     
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Sub-admin not found, or you don't have permission to delete this account.")
@@ -2238,8 +2284,11 @@ async def update_sub_admin_permissions(email: str, req: dict, current_admin: Adm
     if role:
         update_fields["role"] = role
     
+    perm_query = {"email": email}
+    if not _is_superadmin(current_admin):
+        perm_query["organization_id"] = current_admin.organization_id
     result = await admins_collection.update_one(
-        {"email": email, "organization_id": current_admin.organization_id},
+        perm_query,
         {"$set": update_fields}
     )
     if result.matched_count == 0:
@@ -2295,8 +2344,11 @@ async def admin_bulk_update_employee_type(req: dict, current_admin: Admin = Depe
     if not emails or not new_type:
         raise HTTPException(status_code=400, detail="employee_emails and employee_type are required")
         
+    bulk_query = {"email": {"$in": emails}}
+    if not _is_superadmin(current_admin):
+        bulk_query["organization_id"] = current_admin.organization_id
     result = await employees_collection.update_many(
-        {"email": {"$in": emails}, "organization_id": current_admin.organization_id},
+        bulk_query,
         {"$set": {"employee_type": new_type}}
     )
     
@@ -2307,7 +2359,7 @@ async def admin_bulk_update_employee_type(req: dict, current_admin: Admin = Depe
 async def admin_delete_employee(email: str, current_admin: Admin = Depends(get_current_admin)):
     """Remove an employee and their logs."""
     query = {"email": email}
-    if current_admin.organization_id:
+    if current_admin.organization_id and not _is_superadmin(current_admin):
         query["organization_id"] = current_admin.organization_id
         
     user = await employees_collection.find_one(query)
@@ -2339,7 +2391,8 @@ async def admin_all_logs(
     else:
         # For non-manager admins, we still need to filter by org usually
         # but our helper handles that mapping based on roles
-        org_employees = await employees_collection.find({"organization_id": current_admin.organization_id}, {"_id": 1}).to_list(None)
+        log_emp_filter = get_employee_filter(current_admin)
+        org_employees = await employees_collection.find(log_emp_filter, {"_id": 1}).to_list(None)
         org_emp_ids = [str(emp["_id"]) for emp in org_employees]
         log_query = {"user_id": {"$in": org_emp_ids}}
 
@@ -2408,7 +2461,7 @@ async def admin_create_employee(req: RegisterRequest, current_admin: Admin = Dep
         "created_at": datetime.now(timezone.utc),
         "needs_face_enrollment": True if not embedding else False,
         "employee_type": req.employee_type,
-        "organization_id": current_admin.organization_id, # Bind to admin's org
+        "organization_id": req.organization_id if (req.organization_id and _is_superadmin(current_admin)) else current_admin.organization_id,  # Superadmin can target any org
         "force_password_change": True,  # Employee must set their own password on first desk login
     }
 
@@ -2482,11 +2535,15 @@ async def admin_clear_binding(email: str, current_admin: Admin = Depends(get_cur
 
 
 # --- HELPER FUNCTIONS ---
+def _is_superadmin(admin: Admin) -> bool:
+    """Check if admin is a superadmin (by role or system_org binding)."""
+    return admin.role == AdminRole.SUPERADMIN or admin.organization_id == "system_org"
+
 def get_employee_filter(current_admin: Admin):
     """Returns a MongoDB filter based on admin role for multi-tenant segmenting."""
     org_id = current_admin.organization_id
-    if not org_id:
-        # Fallback for superadmin without org
+    if not org_id or _is_superadmin(current_admin):
+        # Superadmin / system_org sees all organizations
         return {}
     
     role = current_admin.role
@@ -6159,25 +6216,50 @@ async def get_my_wfh_apps(
 # =========================
 
 async def scan_screenshot_ocr_threats(screenshot_id: str, image_path: str, employee_id: str, org_id: str, email: str, device_id: str, session_id: str):
+    temp_file_path = None
     try:
         import os
         import re
         from PIL import Image
         
         # Try to resolve web URL or static mount path to local path
-        if "uploads/" in image_path:
-            idx = image_path.find("uploads/")
-            image_path = image_path[idx:]
-            
-        # Try resolving relative path if it's not absolute
-        resolved_path = image_path
-        if not os.path.isabs(image_path) and not os.path.exists(image_path):
-            alternative_path = os.path.join("..", "wfh_desktop", "agent", image_path)
-            if os.path.exists(alternative_path):
-                resolved_path = alternative_path
+        if image_path.startswith("http://") or image_path.startswith("https://"):
+            import urllib.request
+            import tempfile
+            try:
+                # Get display URL (which will be presigned if S3/R2)
+                download_url = get_screenshot_display_url(image_path)
+                
+                # Create a temporary file and close the fd immediately
+                fd, temp_file_path = tempfile.mkstemp(suffix=".jpg")
+                os.close(fd)
+                
+                # Fetch headers to bypass potential user-agent blocks if any
+                req = urllib.request.Request(
+                    download_url, 
+                    headers={'User-Agent': 'Mozilla/5.0'}
+                )
+                with urllib.request.urlopen(req, timeout=15) as response, open(temp_file_path, 'wb') as out_file:
+                    out_file.write(response.read())
+                
+                resolved_path = temp_file_path
+            except Exception as download_err:
+                logger.error(f"Failed to download screenshot from R2/HTTP for OCR: {download_err}")
+                resolved_path = ""
+        else:
+            if "uploads/" in image_path:
+                idx = image_path.find("uploads/")
+                image_path = image_path[idx:]
+                
+            # Try resolving relative path if it's not absolute
+            resolved_path = image_path
+            if not os.path.isabs(image_path) and not os.path.exists(image_path):
+                alternative_path = os.path.join("..", "wfh_desktop", "agent", image_path)
+                if os.path.exists(alternative_path):
+                    resolved_path = alternative_path
         
-        if not os.path.exists(resolved_path):
-            logger.warning(f"Screenshot file not found for OCR: {resolved_path}")
+        if not resolved_path or not os.path.exists(resolved_path):
+            logger.warning(f"Screenshot file not found for OCR: {image_path}")
             return
             
         try:
@@ -6254,6 +6336,12 @@ async def scan_screenshot_ocr_threats(screenshot_id: str, image_path: str, emplo
                 logger.error(f"Failed to mirror unified WFH alert: {mirror_err}")
     except Exception as e:
         logger.error(f"OCR threat scan failed: {e}")
+    finally:
+        if temp_file_path and os.path.exists(temp_file_path):
+            try:
+                os.remove(temp_file_path)
+            except Exception as cleanup_err:
+                logger.warning(f"Failed to cleanup temp OCR screenshot file: {cleanup_err}")
 
 @app.get("/api/wfh/screenshots")
 async def get_my_screenshots(
@@ -6275,12 +6363,9 @@ async def get_my_screenshots(
     
     for item in screenshots:
         item["_id"] = str(item["_id"])
-        image_url = item.get("image_url", "")
-        if image_url and image_url.startswith("/uploads/"):
-            item["image_url"] = build_static_upload_url(request, image_url)
-        thumbnail_url = item.get("thumbnail_url", "")
-        if thumbnail_url and thumbnail_url.startswith("/uploads/"):
-            item["thumbnail_url"] = build_static_upload_url(request, thumbnail_url)
+        item["image_url"] = get_screenshot_display_url(item.get("image_url", ""), request)
+        if item.get("thumbnail_url"):
+            item["thumbnail_url"] = get_screenshot_display_url(item["thumbnail_url"], request)
         
     return {"screenshots": screenshots}
 
@@ -6783,7 +6868,7 @@ async def admin_wfh_stats(current_admin: Admin = Depends(get_current_admin)):
 
 
 @app.get("/admin/wfh/live-view")
-async def admin_wfh_live_view(current_admin: Admin = Depends(get_current_admin)):
+async def admin_wfh_live_view(request: Request, current_admin: Admin = Depends(get_current_admin)):
     org_id = current_admin.organization_id
 
     try:
@@ -6839,7 +6924,7 @@ async def admin_wfh_live_view(current_admin: Admin = Depends(get_current_admin))
                 "device_id": active_session.get("device_id") if active_session else None,
                 "latest_screenshot": {
                     "_id": str(latest_screenshot["_id"]),
-                    "image_url": latest_screenshot.get("image_url"),
+                    "image_url": get_screenshot_display_url(latest_screenshot.get("image_url", ""), request),
                     "timestamp": latest_screenshot.get("timestamp"),
                     "active_app": latest_screenshot.get("active_app"),
                     "active_window": latest_screenshot.get("active_window")
@@ -7318,12 +7403,9 @@ async def admin_wfh_employee_screenshots(
     screenshots = await cursor.to_list(length=limit)
     for item in screenshots:
         item["_id"] = str(item["_id"])
-        image_url = item.get("image_url", "")
-        if image_url and image_url.startswith("/uploads/"):
-            item["image_url"] = build_static_upload_url(request, image_url)
-        thumbnail_url = item.get("thumbnail_url", "")
-        if thumbnail_url and thumbnail_url.startswith("/uploads/"):
-            item["thumbnail_url"] = build_static_upload_url(request, thumbnail_url)
+        item["image_url"] = get_screenshot_display_url(item.get("image_url", ""), request)
+        if item.get("thumbnail_url"):
+            item["thumbnail_url"] = get_screenshot_display_url(item["thumbnail_url"], request)
 
     return screenshots
 
