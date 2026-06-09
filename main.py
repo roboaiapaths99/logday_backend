@@ -883,23 +883,28 @@ async def login(req: LoginRequest, request: Request):
         raise HTTPException(status_code=500, detail=f"Login Validation Error: {str(e)}")
 @app.post("/auth/check")
 async def auth_check(employee=Depends(get_current_employee)):
-    """Toggle check‑in status and return updated info."""
-    # Inlined from deleted attendance_service.py
+    """Return current check‑in status and session info without modifying them."""
     emp = await employees_collection.find_one({"email": employee["email"]})
     if not emp:
         raise HTTPException(status_code=404, detail="Employee not found")
-    new_status = not emp.get("checked_in", False)
-    update_fields = {"checked_in": new_status, "last_checkin": datetime.now(timezone.utc)}
-    if new_status:
-        update_fields["session_id"] = str(uuid.uuid4())
-    else:
-        update_fields["session_id"] = None
-    await employees_collection.update_one({"email": employee["email"]}, {"$set": update_fields})
-    emp.update(update_fields)
+        
+    # Check if there is an active WFH session
+    active_session = await wfh_sessions_collection.find_one({
+        "employee_id": str(emp["_id"]),
+        "status": "active"
+    })
+    
+    checked_in = emp.get("checked_in", False)
+    session_id = emp.get("session_id")
+    
+    if active_session:
+        checked_in = True
+        session_id = str(active_session["_id"])
+        
     return {
         "status": "success",
-        "checked_in": emp.get("checked_in", False),
-        "session_id": emp.get("session_id")
+        "checked_in": checked_in,
+        "session_id": session_id
     }
 
 
