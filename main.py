@@ -282,10 +282,11 @@ S3_ACCESS_KEY_ID = os.getenv("S3_ACCESS_KEY_ID") or os.getenv("AWS_ACCESS_KEY_ID
 S3_SECRET_ACCESS_KEY = os.getenv("S3_SECRET_ACCESS_KEY") or os.getenv("AWS_SECRET_ACCESS_KEY")
 S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME") or os.getenv("AWS_STORAGE_BUCKET_NAME", "logday-wfh-screenshots")
 S3_REGION_NAME = os.getenv("S3_REGION_NAME", "us-east-1")
+S3_PUBLIC_URL_PREFIX = os.getenv("S3_PUBLIC_URL_PREFIX") or os.getenv("R2_PUBLIC_URL_PREFIX")
 
 async def upload_file_to_storage(image_bytes: bytes, filename: str, folder: str = "wfh_view") -> str:
     """
-    Enterprise hybrid storage: Uploads to S3/MinIO if configured, otherwise falls back to local disk.
+    Enterprise hybrid storage: Uploads to S3/MinIO/R2 if configured, otherwise falls back to local disk.
     """
     if S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY:
         try:
@@ -296,17 +297,20 @@ async def upload_file_to_storage(image_bytes: bytes, filename: str, folder: str 
                 aws_secret_access_key=S3_SECRET_ACCESS_KEY,
                 region_name=S3_REGION_NAME
             )
-            # Ensure bucket exists
+            # Ensure bucket exists (gracefully ignore failures since Cloudflare R2 has different bucket creation rules)
             try:
                 s3_client.head_bucket(Bucket=S3_BUCKET_NAME)
             except Exception:
-                if S3_REGION_NAME == "us-east-1":
-                    s3_client.create_bucket(Bucket=S3_BUCKET_NAME)
-                else:
-                    s3_client.create_bucket(
-                        Bucket=S3_BUCKET_NAME,
-                        CreateBucketConfiguration={"LocationConstraint": S3_REGION_NAME}
-                    )
+                try:
+                    if S3_REGION_NAME == "us-east-1":
+                        s3_client.create_bucket(Bucket=S3_BUCKET_NAME)
+                    else:
+                        s3_client.create_bucket(
+                            Bucket=S3_BUCKET_NAME,
+                            CreateBucketConfiguration={"LocationConstraint": S3_REGION_NAME}
+                        )
+                except Exception as bucket_err:
+                    logger.warning(f"Could not verify/create bucket {S3_BUCKET_NAME}, proceeding anyway: {bucket_err}")
             
             s3_key = f"{folder}/{filename}"
             s3_client.put_object(
@@ -316,7 +320,9 @@ async def upload_file_to_storage(image_bytes: bytes, filename: str, folder: str 
                 ContentType="image/png" if filename.endswith(".png") else "image/jpeg"
             )
             
-            if S3_ENDPOINT_URL:
+            if S3_PUBLIC_URL_PREFIX:
+                url = f"{S3_PUBLIC_URL_PREFIX.rstrip('/')}/{s3_key}"
+            elif S3_ENDPOINT_URL:
                 url = f"{S3_ENDPOINT_URL.rstrip('/')}/{S3_BUCKET_NAME}/{s3_key}"
             else:
                 url = f"https://{S3_BUCKET_NAME}.s3.amazonaws.com/{s3_key}"
@@ -331,6 +337,41 @@ async def upload_file_to_storage(image_bytes: bytes, filename: str, folder: str 
     with open(filepath, "wb") as f:
         f.write(image_bytes)
     return f"/uploads/{folder}/{filename}"
+
+
+async def delete_file_from_storage(image_url: str):
+    """
+    Deletes the file from S3/R2 or local filesystem.
+    """
+    if not image_url:
+        return
+
+    if image_url.startswith("/uploads/"):
+        local_path = image_url.lstrip("/")
+        if os.path.exists(local_path):
+            try:
+                os.remove(local_path)
+                logger.info(f"Deleted local file: {local_path}")
+            except Exception as delete_err:
+                logger.error(f"Failed to delete local screenshot file: {delete_err}")
+        return
+
+    if S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY:
+        key_start = image_url.find("/wfh_view/")
+        if key_start != -1:
+            s3_key = image_url[key_start + 1:]
+            try:
+                s3_client = boto3.client(
+                    "s3",
+                    endpoint_url=S3_ENDPOINT_URL,
+                    aws_access_key_id=S3_ACCESS_KEY_ID,
+                    aws_secret_access_key=S3_SECRET_ACCESS_KEY,
+                    region_name=S3_REGION_NAME
+                )
+                s3_client.delete_object(Bucket=S3_BUCKET_NAME, Key=s3_key)
+                logger.info(f"Successfully deleted {s3_key} from S3/R2 bucket {S3_BUCKET_NAME}")
+            except Exception as e:
+                logger.error(f"Failed to delete {s3_key} from S3/R2 bucket {S3_BUCKET_NAME}: {e}")
 
 
 async def check_missed_visits():
@@ -402,13 +443,7 @@ async def purge_old_screenshots():
             
             for screen in expired_screens:
                 image_url = screen.get("image_url", "")
-                if image_url and image_url.startswith("/uploads/"):
-                    local_path = image_url.lstrip("/")
-                    if os.path.exists(local_path):
-                        try:
-                            os.remove(local_path)
-                        except Exception as delete_err:
-                            logger.error(f"Failed to delete local screenshot file: {delete_err}")
+                await delete_file_from_storage(image_url)
                 await wfh_screenshots_collection.delete_one({"_id": screen["_id"]})
                 purged_count += 1
                 
