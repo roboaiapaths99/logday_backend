@@ -5823,7 +5823,19 @@ async def wfh_checkin(req: dict, employee=Depends(get_current_employee)):
         }
 
     now = datetime.now(timezone.utc)
-    today = now.strftime("%Y-%m-%d")
+    # IMPORTANT: Use LOCAL date (with org timezone offset) so it matches
+    # the stale-session check in /api/wfh/session/active which uses local date.
+    # Using UTC date here caused instant "stale session" closure for IST users
+    # between midnight and 5:30 AM local time.
+    tz_offset_mins = 330  # default IST
+    try:
+        org_settings = await settings_collection.find_one({"organization_id": org_id}) if org_id else None
+        if org_settings:
+            tz_offset_mins = org_settings.get("timezone_offset", 330)
+    except Exception:
+        pass
+    local_now = now + timedelta(minutes=tz_offset_mins)
+    today = local_now.strftime("%Y-%m-%d")
 
     session_doc = {
         "employee_id": employee_id,
