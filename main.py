@@ -6902,28 +6902,34 @@ async def admin_wfh_live_view(request: Request, current_admin: Admin = Depends(g
 
         employee_ids = [str(emp["_id"]) for emp in employees]
 
-        # Fetch ALL sessions, screenshots, activities in 3 bulk queries (not N*3 sequential)
-        active_sessions_list, latest_screenshots_raw, latest_activities_raw = await asyncio.gather(
-            wfh_sessions_collection.find(
-                {"employee_id": {"$in": employee_ids}, "status": "active"}
-            ).to_list(length=500),
-            wfh_screenshots_collection.aggregate([
-                {"$match": {"employee_id": {"$in": employee_ids}}},
-                {"$sort": {"timestamp": -1}},
-                {"$group": {"_id": "$employee_id", "doc": {"$first": "$$ROOT"}}}
-            ], allowDiskUse=True).to_list(length=500),
-            wfh_activity_collection.aggregate([
-                {"$match": {"employee_id": {"$in": employee_ids}}},
-                {"$sort": {"timestamp": -1}},
-                {"$group": {"_id": "$employee_id", "doc": {"$first": "$$ROOT"}}}
-            ], allowDiskUse=True).to_list(length=500)
+        # Fetch active sessions in bulk
+        active_sessions_list = await wfh_sessions_collection.find(
+            {"employee_id": {"$in": employee_ids}, "status": "active"}
+        ).to_list(length=500)
 
-        )
+        # Fetch latest screenshot and activity per employee using fast indexed find_one
+        screenshots_by_emp = {}
+        activities_by_emp = {}
+        
+        async def fetch_emp_latest(emp_id):
+            shot_task = wfh_screenshots_collection.find_one(
+                {"employee_id": emp_id},
+                sort=[("timestamp", -1)]
+            )
+            act_task = wfh_activity_collection.find_one(
+                {"employee_id": emp_id},
+                sort=[("timestamp", -1)]
+            )
+            shot, act = await asyncio.gather(shot_task, act_task)
+            if shot:
+                screenshots_by_emp[emp_id] = shot
+            if act:
+                activities_by_emp[emp_id] = act
+
+        await asyncio.gather(*(fetch_emp_latest(emp_id) for emp_id in employee_ids))
 
         # Build lookup dicts keyed by employee_id
         sessions_by_emp = {s["employee_id"]: s for s in (active_sessions_list or [])}
-        screenshots_by_emp = {item["_id"]: item["doc"] for item in (latest_screenshots_raw or [])}
-        activities_by_emp = {item["_id"]: item["doc"] for item in (latest_activities_raw or [])}
 
         result = []
         for employee in employees:
