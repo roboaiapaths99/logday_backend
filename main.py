@@ -6911,12 +6911,13 @@ async def admin_wfh_live_view(request: Request, current_admin: Admin = Depends(g
                 {"$match": {"employee_id": {"$in": employee_ids}}},
                 {"$sort": {"timestamp": -1}},
                 {"$group": {"_id": "$employee_id", "doc": {"$first": "$$ROOT"}}}
-            ]).to_list(length=500),
+            ], allowDiskUse=True).to_list(length=500),
             wfh_activity_collection.aggregate([
                 {"$match": {"employee_id": {"$in": employee_ids}}},
                 {"$sort": {"timestamp": -1}},
                 {"$group": {"_id": "$employee_id", "doc": {"$first": "$$ROOT"}}}
-            ]).to_list(length=500)
+            ], allowDiskUse=True).to_list(length=500)
+
         )
 
         # Build lookup dicts keyed by employee_id
