@@ -49,6 +49,16 @@ wfh_signals_collection = db["wfh_signals"]
 wfh_commands_collection = db["wfh_commands"]
 wfh_face_checks_collection = db["wfh_face_checks"]
 tasks_collection = db["tasks"]
+wfh_requests_collection = db["wfh_requests"]
+
+
+# HRMS Collections
+onboardings_collection = db["onboardings"]
+payrolls_collection = db["payrolls"]
+exit_managements_collection = db["exit_managements"]
+salary_structures_collection = db["salary_structures"]
+holidays_collection = db["holidays"]
+
 
 # Ensure indexes for employee check-in status and session tracking
 async def ensure_employee_indexes():

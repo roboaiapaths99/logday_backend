@@ -61,13 +61,18 @@ from database import (
     wfh_signals_collection,
     wfh_commands_collection,
     wfh_face_checks_collection,
-    ensure_employee_indexes
+    wfh_requests_collection,
+    ensure_employee_indexes,
+    onboardings_collection,
+    payrolls_collection,
+    exit_managements_collection,
+    salary_structures_collection
 )
 from models import (
     RegisterRequest, LoginRequest, VerifyPresenceRequest, Token, LoginResponse, EmployeeProfile, UpdateFaceRequest,
     AdminLoginRequest, EmployeeUpdate, SystemSettings, Admin, AdminRole, Organization, OrganizationRegisterRequest, SubAdminCreate,
     EmployeeType, TerritoryType, AttendanceType, CheckInMethod, PlanStatus, VisitPlan, Visit, LocationPing, ExpenseClaim,
-    LeaveType, LeaveStatus, DiscussionMessage, LeaveRequest, SyncBatchRequest, ChangePasswordRequest
+    LeaveType, LeaveStatus, DiscussionMessage, LeaveRequest, SyncBatchRequest, ChangePasswordRequest, SalaryStructure
 )
 from auth import (
     get_password_hash, verify_password, create_access_token, 
@@ -87,6 +92,21 @@ app = FastAPI(
     docs_url="/docs" if APP_ENV != "production" else None,
     redoc_url="/redoc" if APP_ENV != "production" else None,
 )
+
+# HRMS Routers
+from hrms_onboarding import router as onboarding_router
+from hrms_payroll import router as payroll_router
+from hrms_exit import router as exit_router
+from hrms_employee import router as employee_router
+from hrms_wfh import router as wfh_router
+
+app.include_router(onboarding_router, prefix="/admin/onboarding")
+app.include_router(onboarding_router, prefix="/hrms/onboarding")
+app.include_router(payroll_router)
+app.include_router(exit_router)
+app.include_router(employee_router)
+app.include_router(wfh_router)
+
 
 # Configure CORS
 _raw_origins = os.getenv("ALLOWED_ORIGINS", "")
@@ -136,23 +156,37 @@ async def health_check():
     return {"status": "healthy", "timestamp": datetime.now(timezone.utc).isoformat()}
 
 # --- GEOCODING PROXY ---
+from starlette.concurrency import run_in_threadpool
+
+GEOCODE_CACHE = {}
+
 @app.get("/api/geocoding/reverse")
 async def reverse_geocode(lat: float, lon: float):
     """
     Proxy for Nominatim reverse geocoding to bypass CORS and 429 errors.
     Uses a server-side User-Agent to comply with Nominatim's policy.
+    Uses an in-memory cache and runs in threadpool to prevent event-loop blockages.
     """
+    cache_key = (round(lat, 4), round(lon, 4))
+    if cache_key in GEOCODE_CACHE:
+        return GEOCODE_CACHE[cache_key]
+
     try:
         url = f"https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat={lat}&lon={lon}"
         headers = {
             "User-Agent": "LogDayAttendanceApp/1.0 (contact: roboaiapaths99@gmail.com)"
         }
-        response = requests.get(url, headers=headers, timeout=10)
+        # Run blocking requests.get in threadpool to keep event loop unblocked
+        response = await run_in_threadpool(
+            requests.get, url, headers=headers, timeout=5
+        )
         response.raise_for_status()
-        return response.json()
+        data = response.json()
+        GEOCODE_CACHE[cache_key] = data
+        return data
     except Exception as e:
         logger.error(f"Geocoding proxy error: {str(e)}")
-        # Fail gracefully with coordinatess if geocoding fails
+        # Fail gracefully with coordinates if geocoding fails
         return {"display_name": f"{lat:.4f}, {lon:.4f}", "address": {}}
 
 # --- API PREFIX MIDDLEWARE ---
@@ -731,6 +765,14 @@ async def login(req: LoginRequest, request: Request):
     
     logger.info(f"User identified. Stored Org ID: {user.get('organization_id')}, Is Admin: {is_admin_login}")
     
+    if not is_admin_login:
+        if user.get("status") == "Inactive" or user.get("is_active") is False:
+            logger.warning(f"Login blocked: Employee account is deactivated for '{clean_email}'.")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Your account has been deactivated. Access denied."
+            )
+
     # Password check
     stored_hash = user.get("hashed_password")
     is_valid = False
@@ -819,6 +861,35 @@ async def login(req: LoginRequest, request: Request):
             
     # Auto-register WFH device in wfh_device_info_collection for all WFH logins
     emp_type_val = user.get("employee_type", "")
+    
+    # WFH Desktop Authorization Gate: If request comes from WFH desktop app, check permission
+    client_type = getattr(req, "client_type", None)
+    if client_type in ["wfh_desktop", "desktop"] and not is_admin_login and not is_superadmin:
+        is_allowed_wfh = emp_type_val in ["wfh", "hybrid", EmployeeType.WFH, EmployeeType.HYBRID]
+        if not is_allowed_wfh:
+            # Check if they have an approved WFH request for today
+            tz_offset_mins = 330  # default IST
+            try:
+                org_settings = await settings_collection.find_one({"organization_id": user.get("organization_id")})
+                if org_settings:
+                    tz_offset_mins = org_settings.get("timezone_offset", 330)
+            except Exception:
+                pass
+            local_now = datetime.now(timezone.utc) + timedelta(minutes=tz_offset_mins)
+            today_str = local_now.strftime("%Y-%m-%d")
+            
+            wfh_approved = await wfh_requests_collection.find_one({
+                "employee_email": clean_email,
+                "date": today_str,
+                "status": "approved"
+            })
+            if not wfh_approved:
+                logger.warning(f"Login blocked: Office employee '{clean_email}' has no approved WFH request for today.")
+                raise HTTPException(
+                    status_code=403,
+                    detail="Access denied. You do not have an approved Work From Home (WFH) request for today, and your policy is set to Office-only."
+                )
+
     if not is_admin_login and emp_type_val in ["wfh", EmployeeType.WFH] and req.device_id:
         # Check if exists to avoid duplicates
         exists = await wfh_device_info_collection.find_one({"employee_id": str(user["_id"]), "device_id": req.device_id})
@@ -1188,7 +1259,7 @@ async def smart_attendance(req: VerifyPresenceRequest, background_tasks: Backgro
                 trigger_alert, "Territory", user.get("email"), user.get("organization_id"), 
                 "Mock Location detected during attendance.", "high", {"lat": req.lat, "long": req.long}
             )
-            raise HTTPException(status_code=403, detail="Security violation: Mock location detected. Attendance rejected.")
+            raise HTTPException(status_code=403, detail="Security violation: Location spoofing/virtualization detected. Attendance rejected.")
 
         # Device Binding Check (Bypass for Superadmin)
         if user.get("device_id") and req.device_id and user["device_id"] != req.device_id:
@@ -1214,7 +1285,6 @@ async def smart_attendance(req: VerifyPresenceRequest, background_tasks: Backgro
                     f"Face verification failed with confidence distance {distance:.3f}", "medium"
                 )
                 raise HTTPException(status_code=400, detail="Face verification failed. Please ensure your face is clearly visible.")
-
         # 3. Geofence/Territory Logic
         check_in_method = CheckInMethod.GPS_TERRITORY
         is_at_office = False
@@ -1224,17 +1294,39 @@ async def smart_attendance(req: VerifyPresenceRequest, background_tasks: Backgro
             if office_dist <= float(radius):
                 is_at_office = True
 
-        # GEOFENCE BYPASS for Superadmin
-        if is_superadmin:
-            logger.info("Superadmin bypass: Geofence and Territory checks skipped.")
+        # Check if employee has approved WFH for today
+        now_utc = datetime.now(timezone.utc)
+        local_now = now_utc + timedelta(minutes=tz_offset)
+        today_str = local_now.strftime("%Y-%m-%d")
+
+        wfh_approved = False
+        wfh_req = await db["wfh_requests"].find_one({
+            "employee_email": clean_email,
+            "date": today_str,
+            "status": "approved"
+        })
+        if wfh_req:
+            wfh_approved = True
+
+        is_wfh_or_hybrid = role in ["wfh", "hybrid", EmployeeType.WFH, EmployeeType.HYBRID]
+
+        # GEOFENCE BYPASS for Superadmin or approved WFH or permanent WFH/hybrid
+        if is_superadmin or wfh_approved or is_wfh_or_hybrid:
+            logger.info(f"Geofence bypass: superadmin={is_superadmin}, wfh_approved={wfh_approved}, is_wfh_or_hybrid={is_wfh_or_hybrid}")
             wifi_pct = 100
-            check_in_method = CheckInMethod.WIFI_GEOFENCE
+            check_in_method = CheckInMethod.GPS_TERRITORY
+            # Check WFH device status if permanent WFH or hybrid and device_id is provided
+            if (role in ["wfh", "hybrid", EmployeeType.WFH, EmployeeType.HYBRID]) and req.device_id and not is_superadmin:
+                try:
+                    await verify_wfh_device(str(user["_id"]), str(org_id), req.device_id)
+                except Exception as e:
+                    logger.warning(f"WFH device verification failed: {e}")
         else:
             if role == "desk" or role == EmployeeType.DESK:
                 if not is_at_office:
                      raise HTTPException(
-                         status_code=403, 
-                         detail=f"Location error. You are {office_dist:.1f}m away from office (Limit: {radius}m)."
+                          status_code=403, 
+                          detail=f"Location error. You are {office_dist:.1f}m away from office (Limit: {radius}m)."
                      )
                 
                 is_wifi_ok = True
@@ -1245,18 +1337,6 @@ async def smart_attendance(req: VerifyPresenceRequest, background_tasks: Backgro
                 
                 wifi_pct = 100 if is_wifi_ok else 0
                 check_in_method = CheckInMethod.WIFI_GEOFENCE
-            elif role == "wfh" or role == EmployeeType.WFH:
-                # WFH Logic: Allow check-in from anywhere, bypass geofence/territory checks.
-                logger.info(f"WFH Employee {user['email']} check-in/out: bypassing geofence and territory checks.")
-                wifi_pct = 100
-                check_in_method = CheckInMethod.GPS_TERRITORY
-                
-                # Check WFH device status
-                if req.device_id and not is_superadmin:
-                    try:
-                        await verify_wfh_device(str(user["_id"]), str(org_id), req.device_id)
-                    except HTTPException as e:
-                        raise e
             else:
                 # Field Logic
                 if is_at_office:
@@ -1351,18 +1431,18 @@ async def smart_attendance(req: VerifyPresenceRequest, background_tasks: Backgro
 
         # Determine unified attendance type
         att_type_val = AttendanceType.REMOTE_FIELD
-        if role == EmployeeType.DESK or role == "desk":
-            att_type_val = AttendanceType.OFFICE
-        elif role == EmployeeType.WFH or role == "wfh":
+        if wfh_approved or role == EmployeeType.WFH or role == "wfh":
             att_type_val = AttendanceType.WFH
+        elif role == EmployeeType.DESK or role == "desk":
+            att_type_val = AttendanceType.OFFICE
 
         # Location name default
-        loc_name_val = req.address or ("Office Zone" if role == EmployeeType.DESK else "Field Location")
-        if role == EmployeeType.WFH or role == "wfh":
+        loc_name_val = req.address or ("Office Zone" if role == EmployeeType.DESK and not wfh_approved else "Field Location")
+        if wfh_approved or role == EmployeeType.WFH or role == "wfh":
             loc_name_val = req.address or "Remote Workspace"
 
         wfh_session_id = None
-        if role == EmployeeType.WFH or role == "wfh":
+        if wfh_approved or role == EmployeeType.WFH or role == "wfh":
             if attendance_type == "check-in":
                 # Ensure a WFH session is started
                 active_session = await wfh_sessions_collection.find_one({
@@ -2249,14 +2329,18 @@ async def delete_sub_admin(email: str, current_admin: Admin = Depends(get_curren
     if email == current_admin.email:
         raise HTTPException(status_code=400, detail="You cannot delete yourself.")
         
-    # Security: Ensure we only delete admins from the same organization and who are NOT owners
-    delete_query = {"email": email, "role": "admin"}
-    if not _is_superadmin(current_admin):
-        delete_query["organization_id"] = current_admin.organization_id
-    result = await admins_collection.delete_one(delete_query)
-    
-    if result.deleted_count == 0:
-        raise HTTPException(status_code=404, detail="Sub-admin not found, or you don't have permission to delete this account.")
+    # Security: Ensure we only delete admins from the same organization and who are NOT owners/superadmins
+    target_admin = await admins_collection.find_one({"email": email})
+    if not target_admin:
+        raise HTTPException(status_code=404, detail="Sub-admin not found.")
+        
+    if not _is_superadmin(current_admin) and target_admin.get("organization_id") != current_admin.organization_id:
+        raise HTTPException(status_code=403, detail="You do not have permission to delete this account.")
+        
+    if target_admin.get("role") in ["owner", "superadmin"]:
+        raise HTTPException(status_code=403, detail="You cannot delete an owner or superadmin account.")
+        
+    await admins_collection.delete_one({"_id": target_admin["_id"]})
         
     return {"message": f"Admin {email} removed successfully."}
 
@@ -2342,7 +2426,36 @@ async def admin_update_employee(email: str, req: EmployeeUpdate, current_admin: 
     return {"message": "Employee updated successfully"}
 
 
+@app.get("/admin/hrms/stats")
+async def get_hrms_stats(current_admin: Admin = Depends(get_current_admin)):
+    org_id = current_admin.organization_id
+    org_filter = {"organization_id": org_id} if (org_id and not _is_superadmin(current_admin)) else {}
+    
+    current_month = datetime.now(timezone.utc).strftime("%Y-%m")
+    
+    onboarding_active = await onboardings_collection.count_documents({
+        **org_filter,
+        "status": {"$in": ["pending", "in_progress"]}
+    })
+    payroll_pending = await payrolls_collection.count_documents({
+        **org_filter,
+        "status": "draft",
+        "payroll_month": current_month
+    })
+    exits_active = await exit_managements_collection.count_documents({
+        **org_filter,
+        "status": {"$in": ["pending", "in_progress"]}
+    })
+    
+    return {
+        "onboarding_active": onboarding_active,
+        "payroll_pending": payroll_pending,
+        "exits_active": exits_active
+    }
+
+
 @app.post("/admin/employees/bulk-update-type")
+
 async def admin_bulk_update_employee_type(req: dict, current_admin: Admin = Depends(get_current_admin)):
     """Bulk update employee work type (desk/field/office)"""
     emails = [e.lower().strip() for e in req.get("employee_emails", [])]
@@ -2470,6 +2583,7 @@ async def admin_create_employee(req: RegisterRequest, current_admin: Admin = Dep
         "employee_type": req.employee_type,
         "organization_id": req.organization_id if (req.organization_id and _is_superadmin(current_admin)) else current_admin.organization_id,  # Superadmin can target any org
         "force_password_change": True,  # Employee must set their own password on first desk login
+        "status": "Active"
     }
 
     await employees_collection.insert_one(employee_dict)
@@ -3025,7 +3139,7 @@ async def visit_check_in(req: dict, employee=Depends(get_current_employee)):
                  "high",
                  {"lat": agent_lat, "lng": agent_lng, "place": req.get("place_name")}
              )
-             raise HTTPException(status_code=403, detail="Security Violation: Mock Location detected. Check-in rejected.")
+             raise HTTPException(status_code=403, detail="Security Violation: GPS virtualization/spoofing detected. Check-in rejected.")
 
         # --- GEOFENCE VALIDATION (200m radius) ---
         stop_id = req.get("stop_id")
@@ -3440,13 +3554,16 @@ async def admin_list_km_claims(status: Optional[str] = "pending", admin=Depends(
         query["status"] = status
         
     claims = await km_reimbursements_collection.find(query).sort("created_at", -1).to_list(length=200)
+    
+    emp_emails = list({c["employee_id"] for c in claims if c.get("employee_id")})
+    employees = await employees_collection.find({"email": {"$in": emp_emails}}, {"email": 1, "full_name": 1}).to_list(length=len(emp_emails))
+    emp_map = {e["email"]: e["full_name"] for e in employees}
+
     for c in claims:
         c["_id"] = str(c["_id"])
         if isinstance(c.get("created_at"), datetime):
             c["created_at"] = c["created_at"].isoformat()
-        # Enrich with employee name
-        emp = await employees_collection.find_one({"email": c["employee_id"]})
-        c["full_name"] = emp["full_name"] if emp else "Unknown"
+        c["full_name"] = emp_map.get(c.get("employee_id"), "Unknown")
         
     return claims
 
@@ -3608,11 +3725,14 @@ async def get_plans_for_approval(status: str = "submitted", admin=Depends(get_cu
     plans = await visit_plans_collection.find({"status": status}).to_list(length=100)
     
     # Enrichment: Add employee names
+    emp_ids = list({p["employee_id"] for p in plans if p.get("employee_id")})
+    employees = await employees_collection.find({"employee_id": {"$in": emp_ids}}, {"employee_id": 1, "full_name": 1}).to_list(length=len(emp_ids))
+    emp_map = {e["employee_id"]: e["full_name"] for e in employees}
+
     enriched_plans = []
     for plan in plans:
-        emp = await employees_collection.find_one({"employee_id": plan["employee_id"]})
         plan["_id"] = str(plan["_id"])
-        plan["full_name"] = emp["full_name"] if emp else "Unknown"
+        plan["full_name"] = emp_map.get(plan["employee_id"], "Unknown")
         enriched_plans.append(plan)
         
     return enriched_plans
@@ -3990,16 +4110,16 @@ async def admin_get_leave_requests(status: Optional[str] = None, admin: dict = D
         leave_query["status"] = status
         
     requests = await leave_requests_collection.find(leave_query).sort("created_at", -1).to_list(length=100)
+    
+    emp_emails = list({r.get("employee_id") for r in requests if r.get("employee_id")})
+    employees = await employees_collection.find({"email": {"$in": emp_emails}}, {"email": 1, "full_name": 1, "name": 1}).to_list(length=len(emp_emails))
+    emp_map = {e["email"]: e.get("full_name", e.get("name", "Unknown")) for e in employees}
+
     enriched = []
     for r in requests:
         r["_id"] = str(r["_id"])
         emp_id = r.get("employee_id")
-        if emp_id:
-            emp = await employees_collection.find_one({"email": emp_id})
-            r["full_name"] = emp.get("full_name", emp.get("name", "Unknown")) if emp else "Unknown"
-        else:
-            r["full_name"] = "Unknown"
-            
+        r["full_name"] = emp_map.get(emp_id, "Unknown")
         if isinstance(r.get("created_at"), datetime):
             r["created_at"] = r["created_at"].isoformat()
         enriched.append(r)
@@ -4384,15 +4504,18 @@ async def admin_list_expenses(status: Optional[str] = None, admin=Depends(get_cu
         query["status"] = status
     
     claims = await expense_claims_collection.find(query).sort("created_at", -1).to_list(length=200)
+    
+    emp_emails = list({c.get("employee_id") for c in claims if c.get("employee_id")})
+    employees = await employees_collection.find({"email": {"$in": emp_emails}}, {"email": 1, "full_name": 1}).to_list(length=len(emp_emails))
+    emp_map = {e["email"]: e["full_name"] for e in employees}
+
     for c in claims:
         c["_id"] = str(c["_id"])
         if isinstance(c.get("created_at"), datetime):
             c["created_at"] = c["created_at"].isoformat()
         if isinstance(c.get("resolved_at"), datetime):
             c["resolved_at"] = c["resolved_at"].isoformat()
-        # Enrich with employee name
-        emp = await employees_collection.find_one({"email": c.get("employee_id")})
-        c["employee_name"] = emp["full_name"] if emp else c.get("employee_id", "Unknown")
+        c["employee_name"] = emp_map.get(c.get("employee_id"), c.get("employee_id", "Unknown"))
     return claims
 
 
@@ -4450,11 +4573,13 @@ async def get_alerts(
 
     alerts = await alerts_collection.find(query).sort("timestamp", -1).to_list(length=100)
     
+    emp_emails = list({a["employee_id"] for a in alerts if a.get("employee_id")})
+    employees = await employees_collection.find({"email": {"$in": emp_emails}}, {"email": 1, "full_name": 1}).to_list(length=len(emp_emails))
+    emp_map = {e["email"]: e["full_name"] for e in employees}
+
     for a in alerts:
         a["_id"] = str(a["_id"])
-        # Enrich with employee name
-        emp = await employees_collection.find_one({"email": a["employee_id"]})
-        a["employee_name"] = emp["full_name"] if emp else a["employee_id"]
+        a["employee_name"] = emp_map.get(a.get("employee_id"), a.get("employee_id"))
         if isinstance(a.get("timestamp"), datetime):
             a["timestamp"] = a["timestamp"].isoformat()
             
@@ -4577,11 +4702,17 @@ async def attendance_report(
     
     logs = await attendance_logs_collection.find(query).sort("timestamp", -1).to_list(length=1000)
     
+    from bson import ObjectId
+    emp_ids = list({ObjectId(log["user_id"]) for log in logs if log.get("user_id") and ObjectId.is_valid(str(log["user_id"]))})
+    employees = await employees_collection.find({"_id": {"$in": emp_ids}}, {"_id": 1, "full_name": 1, "employee_type": 1, "email": 1}).to_list(length=len(emp_ids))
+    emp_map = {str(e["_id"]): e for e in employees}
+
     summary = {"total_records": len(logs), "check_ins": 0, "check_outs": 0, "unique_employees": set()}
     enriched = []
     
     for log in logs:
-        emp = await employees_collection.find_one({"_id": ObjectId(log["user_id"])})
+        emp_id_str = str(log.get("user_id", ""))
+        emp = emp_map.get(emp_id_str)
         if employee_type and emp and emp.get("employee_type", "desk") != employee_type:
             continue
         
@@ -4595,7 +4726,7 @@ async def attendance_report(
             summary["check_ins"] += 1
         else:
             summary["check_outs"] += 1
-        summary["unique_employees"].add(log.get("email", ""))
+        summary["unique_employees"].add(emp.get("email", "") if emp else "")
         enriched.append(log)
     
     summary["unique_employees"] = len(summary["unique_employees"])
@@ -8183,17 +8314,18 @@ async def get_wfh_reports_screenshots(
     cursor = wfh_screenshots_collection.find(query).sort("timestamp", -1)
     screenshots = await cursor.to_list(length=1000)
     
+    # Batch-fetch all employee records
+    from bson import ObjectId
+    emp_ids = list({ObjectId(s["employee_id"]) for s in screenshots if s.get("employee_id") and ObjectId.is_valid(str(s["employee_id"]))})
+    employees = await employees_collection.find({"_id": {"$in": emp_ids}}, {"_id": 1, "email": 1, "full_name": 1}).to_list(length=len(emp_ids))
+    emp_map = {str(e["_id"]): e for e in employees}
+
     report_data = []
     for s in screenshots:
-        emp_email = ""
-        emp_name = ""
-        try:
-            emp = await employees_collection.find_one({"_id": ObjectId(s["employee_id"])})
-            if emp:
-                emp_email = emp.get("email", "")
-                emp_name = emp.get("full_name", "")
-        except Exception:
-            pass
+        emp_id_str = str(s.get("employee_id", ""))
+        emp = emp_map.get(emp_id_str)
+        emp_email = emp.get("email", "") if emp else ""
+        emp_name = emp.get("full_name", "") if emp else ""
             
         report_data.append({
             "employee_email": emp_email,

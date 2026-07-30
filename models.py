@@ -9,6 +9,51 @@ class EmployeeType(str, Enum):
     FIELD = "field"
     OFFICE = "office"
     WFH = "wfh"
+    HYBRID = "hybrid"
+
+
+class AdminFeature(str, Enum):
+    DASHBOARD = "dashboard"
+    ATTENDANCE = "attendance"
+    EMPLOYEES = "employees"
+    LEAVES = "leaves"
+    REPORTS = "reports"
+    ANNOUNCEMENTS = "announcements"
+    EXPENSES = "expenses"
+    WAR_ROOM = "war_room"
+    TERRITORY = "territory"
+    NUDGE = "nudge"
+    LEADERBOARD = "leaderboard"
+    ONBOARDING = "onboarding"
+    EXIT_MANAGEMENT = "exit_management"
+    PAYROLL = "payroll"
+    DOCUMENT_VERIFICATION = "document_verification"
+    WFH_MANAGEMENT = "wfh_management"
+    WFH_MONITORING = "wfh_monitoring"
+    SETTINGS = "settings"
+    SUB_ADMINS = "sub_admins"
+
+
+class WFHStatus(str, Enum):
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    CANCELLED = "cancelled"
+
+
+class WFHRequest(BaseModel):
+    employee_id: str
+    employee_email: str
+    employee_name: str
+    organization_id: str
+    date: str  # YYYY-MM-DD (single day)
+    reason: str
+    status: WFHStatus = WFHStatus.PENDING
+    approved_by: Optional[str] = None
+    approved_at: Optional[datetime] = None
+    rejection_reason: Optional[str] = None
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
 
 
 class TerritoryType(str, Enum):
@@ -94,6 +139,23 @@ class AlertStatus(str, Enum):
     DISMISSED = "dismissed"
 
 
+class SalaryStructure(BaseModel):
+    """Per-employee salary breakdown — stored in employees collection"""
+    ctc: float = 0.0                    # Annual CTC
+    basic_salary: float = 0.0           # Monthly basic (typically 40-50% of CTC/12)
+    hra: float = 0.0                    # House Rent Allowance
+    special_allowance: float = 0.0      # Special / Flexible allowance
+    other_allowances: float = 0.0       # Conveyance, medical, etc.
+    pf_enabled: bool = True             # PF deduction enabled
+    esi_enabled: bool = False           # ESI deduction enabled (only if gross <= 21000)
+    professional_tax_enabled: bool = True
+    bank_name: Optional[str] = None
+    bank_account: Optional[str] = None
+    bank_ifsc: Optional[str] = None
+    pan_number: Optional[str] = None
+    effective_from: Optional[str] = None  # YYYY-MM-DD
+
+
 class EmployeeBase(BaseModel):
     full_name: str
     email: str
@@ -104,6 +166,8 @@ class EmployeeBase(BaseModel):
     employee_type: EmployeeType = EmployeeType.DESK
     manager_id: Optional[str] = None
     beat_zone_name: Optional[str] = None
+    salary_structure: Optional[SalaryStructure] = None
+
 
 
 class EmployeeCreate(EmployeeBase):
@@ -198,6 +262,7 @@ class LoginRequest(BaseModel):
     password: str
     device_id: Optional[str] = None
     organization_id: Optional[str] = None
+    client_type: Optional[str] = None
 
 
 class VerifyPresenceRequest(BaseModel):
@@ -290,6 +355,8 @@ class EmployeeUpdate(BaseModel):
     territory_center_lng: Optional[float] = None
     territory_radius_meters: Optional[float] = None
     territory_polygon: Optional[List[dict]] = None
+    salary_structure: Optional[SalaryStructure] = None
+
 
 
 class SystemSettings(BaseModel):
