@@ -1300,7 +1300,7 @@ async def smart_attendance(req: VerifyPresenceRequest, background_tasks: Backgro
         today_str = local_now.strftime("%Y-%m-%d")
 
         wfh_approved = False
-        wfh_req = await db["wfh_requests"].find_one({
+        wfh_req = await wfh_requests_collection.find_one({
             "employee_email": clean_email,
             "date": today_str,
             "status": "approved"
