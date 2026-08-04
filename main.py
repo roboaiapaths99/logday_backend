@@ -1,13 +1,24 @@
 from fastapi import FastAPI, HTTPException, File, Depends, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.concurrency import run_in_threadpool
+from starlette.responses import StreamingResponse
+from starlette import status
 import uvicorn
 import asyncio
 from datetime import datetime, timezone, timedelta
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import os
 import math
-import pandas as pd
+import re
 import io
+import time
+import random
+import traceback
+import zipfile
+import tempfile
+import urllib.request
+from urllib.parse import unquote
+import pandas as pd
 from bson import ObjectId
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from reportlab.lib.pagesizes import letter, landscape
@@ -21,6 +32,10 @@ import base64
 import uuid
 from fastapi.staticfiles import StaticFiles
 import requests
+try:
+    from PIL import Image as PILImage  # type: ignore[import-not-found]  # optional: Pillow
+except ImportError:
+    PILImage = None  # type: ignore[assignment,misc]
 
 # Configure Logging
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -79,10 +94,8 @@ from auth import (
     get_current_admin, get_current_employee, admin_oauth2_scheme, employee_oauth2_scheme,
     SECRET_KEY, ALGORITHM
 )
-import uuid
 from face_utils import get_face_embedding, verify_face, compare_faces
 from sheets_sync import sync_to_google_sheets, sync_visit_to_google_sheets
-from fastapi import BackgroundTasks
 
 APP_ENV = os.getenv("APP_ENV", "development")
 
@@ -156,7 +169,6 @@ async def health_check():
     return {"status": "healthy", "timestamp": datetime.now(timezone.utc).isoformat()}
 
 # --- GEOCODING PROXY ---
-from starlette.concurrency import run_in_threadpool
 
 GEOCODE_CACHE = {}
 
@@ -1212,15 +1224,16 @@ async def smart_attendance(req: VerifyPresenceRequest, background_tasks: Backgro
         if org_settings:
             tz_offset = org_settings.get("timezone_offset", 330)
         today_start_utc = get_today_start(tz_offset)
-        
-        last_log = await attendance_logs_collection.find_one(
+
+        # --- Query 1: All-time last log (used ONLY for auto-closing stale sessions) ---
+        alltime_last_log = await attendance_logs_collection.find_one(
             {"user_id": str(user["_id"])},
             sort=[("timestamp", -1)]
         )
 
-        # AUTO-CLOSE STALE SESSIONS
-        if last_log and last_log.get("type") == "check-in":
-            last_ts = last_log.get("timestamp")
+        # AUTO-CLOSE STALE SESSIONS (uses all-time log to detect yesterday's open session)
+        if alltime_last_log and alltime_last_log.get("type") == "check-in":
+            last_ts = alltime_last_log.get("timestamp")
             if last_ts and last_ts.tzinfo is None:
                 last_ts = last_ts.replace(tzinfo=timezone.utc)
             if last_ts and last_ts < today_start_utc:
@@ -1234,8 +1247,8 @@ async def smart_attendance(req: VerifyPresenceRequest, background_tasks: Backgro
                     "user_id": str(user["_id"]),
                     "type": "check-out",
                     "timestamp": auto_checkout_time,
-                    "lat": last_log.get("lat", 0),
-                    "long": last_log.get("long", 0),
+                    "lat": alltime_last_log.get("lat", 0),
+                    "long": alltime_last_log.get("long", 0),
                     "location_name": "Auto-closed (missed checkout)",
                     "wifi_bssid": "",
                     "wifi_ssid": "",
@@ -1243,9 +1256,20 @@ async def smart_attendance(req: VerifyPresenceRequest, background_tasks: Backgro
                     "organization_id": str(org_id) if org_id else None,
                 }
                 await attendance_logs_collection.insert_one(auto_checkout_log)
-                last_log = auto_checkout_log
+                logger.info(f"[AutoClose] Stale session closed for {user['email']}")
 
-        # State Machine Validation
+        # --- Query 2: Today-only last log (used for state machine validation) ---
+        # This is SEPARATE from the all-time query above so that yesterday's logs
+        # never cause a false "already checked in" error today.
+        last_log = await attendance_logs_collection.find_one(
+            {
+                "user_id": str(user["_id"]),
+                "timestamp": {"$gte": today_start_utc}
+            },
+            sort=[("timestamp", -1)]
+        )
+
+        # State Machine Validation (only uses today's logs)
         if attendance_type == "check-in":
             if last_log and last_log.get("type") == "check-in":
                 raise HTTPException(status_code=400, detail="You are already checked in. Please check out first.")
@@ -1752,11 +1776,9 @@ async def get_my_analytics(current_user: dict = Depends(get_current_employee)):
                     current_status = "check-in"
             else:
                 current_status = "check-out"
-            org_settings = await settings_collection.find_one({"organization_id": str(org_id) if ObjectId.is_valid(str(org_id)) else org_id})
-            if org_settings:
-                tz_offset = org_settings.get("timezone_offset", 330)
+            # NOTE: Do NOT re-fetch org_settings or recompute today_start here —
+            # that was a bug causing date-boundary inconsistency. Use already-computed values.
 
-        today_start = get_today_start(tz_offset)
         week_start = today_start - timedelta(days=today_start.weekday())
         month_start = today_start.replace(day=1)
 
@@ -1838,26 +1860,25 @@ async def get_my_analytics(current_user: dict = Depends(get_current_employee)):
             if "timestamp" in h and isinstance(h["timestamp"], datetime):
                 h["timestamp"] = h["timestamp"].isoformat()
 
-        # Absolute Status Sync
-        latest_log = await attendance_logs_collection.find_one(
-            {"user_id": str(user["_id"])},
-            sort=[("timestamp", -1)]
-        )
+        # NOTE: current_status was already determined by the first latest_log query above.
+        # The previous "Absolute Status Sync" block here was a redundant duplicate DB query
+        # that re-fetched latest_log and overwrote current_status — removed to save one DB round-trip.
         
-        current_status = "check-out"
-        if latest_log:
-            log_type = latest_log.get("type", "check-out")
-            if log_type == "check-in":
-                l_ts = latest_log["timestamp"]
-                if l_ts.tzinfo is None: l_ts = l_ts.replace(tzinfo=timezone.utc)
-                if l_ts < today_start:
-                    current_status = "check-out" # Stale
-                    logger.info(f"[Analytics] Stale session auto-closed for {user['email']}")
-                else:
-                    current_status = "check-in"
-            else:
-                current_status = log_type
-        
+
+        # Resolve per-org WiFi SSID from DB (fallback to global env var)
+        # Bug fix: was always returning global OFFICE_WIFI_SSID env var, ignoring per-org DB value
+        org_wifi_ssid = os.getenv("OFFICE_WIFI_SSID", "")
+        if org_id:
+            try:
+                _wifi_settings = await settings_collection.find_one(
+                    {"organization_id": str(org_id) if ObjectId.is_valid(str(org_id)) else org_id},
+                    {"office_wifi_ssid": 1}
+                )
+                if _wifi_settings and _wifi_settings.get("office_wifi_ssid"):
+                    org_wifi_ssid = str(_wifi_settings["office_wifi_ssid"]).strip()
+            except Exception:
+                pass  # Fallback to env var is fine
+
         return {
             "email": user["email"],
             "today_hours": today_hours,
@@ -1866,7 +1887,7 @@ async def get_my_analytics(current_user: dict = Depends(get_current_employee)):
             "on_time_count": on_time_count,
             "current_status": current_status,
             "history": history,
-            "office_wifi_ssid": os.getenv("OFFICE_WIFI_SSID", "")
+            "office_wifi_ssid": org_wifi_ssid
         }
     except Exception as e:
         logger.error(f"Analytics Error: {str(e)}", exc_info=True)
@@ -6413,9 +6434,10 @@ async def scan_screenshot_ocr_threats(screenshot_id: str, image_path: str, emplo
             return
             
         try:
-            import pytesseract
+            import pytesseract  # type: ignore[import-not-found]  # optional dependency
+            from PIL import Image  # type: ignore[import-not-found]
             img = Image.open(resolved_path)
-            text = pytesseract.image_to_string(img)
+            text = pytesseract.image_to_string(img)  # type: ignore[union-attr]
         except ImportError:
             logger.warning("pytesseract or PIL is not installed. Falling back to active window text threat check.")
             # Graceful fallback: scan the active window title instead for simple keywords
