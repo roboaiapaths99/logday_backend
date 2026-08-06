@@ -94,7 +94,7 @@ from auth import (
     get_current_admin, get_current_employee, admin_oauth2_scheme, employee_oauth2_scheme,
     SECRET_KEY, ALGORITHM
 )
-from face_utils import get_face_embedding, verify_face, compare_faces
+from face_utils import get_face_embedding, verify_face, compare_faces, is_dummy_embedding
 from sheets_sync import sync_to_google_sheets, sync_visit_to_google_sheets
 
 APP_ENV = os.getenv("APP_ENV", "development")
