@@ -5580,10 +5580,32 @@ async def get_employee_monthly_summary(
     absent_days = 0
     leaves_count = 0
     
-    # We must loop through local days, so start with the local month boundary
-    # Assuming IST (330 offset) if org missing settings -> fallback 330
-    tz_offset = 330 # Should fetch from settings ideally
-    
+    # Fetch org settings for timezone and shift times
+    org_id = employee.get("organization_id")
+    tz_offset = 330
+    office_end_time_str = "18:00"
+    office_start_time_str = "10:00"
+    late_threshold_mins = 15
+
+    if org_id:
+        try:
+            org_doc = await settings_collection.find_one({"organization_id": str(org_id) if ObjectId.is_valid(str(org_id)) else org_id})
+            if org_doc:
+                tz_offset = org_doc.get("timezone_offset", 330)
+                if employee.get("employee_type") == "field":
+                    office_end_time_str = org_doc.get("field_office_end_time", "18:00")
+                    office_start_time_str = org_doc.get("field_office_start_time", "10:00")
+                    late_threshold_mins = org_doc.get("field_late_threshold_mins", 30)
+                else:
+                    office_end_time_str = org_doc.get("office_end_time", "18:00")
+                    office_start_time_str = org_doc.get("office_start_time", "10:00")
+                    late_threshold_mins = org_doc.get("late_threshold_mins", 15)
+        except Exception:
+            pass
+
+    start_h, start_m = map(int, office_start_time_str.split(":"))
+    end_h, end_m = map(int, office_end_time_str.split(":"))
+
     local_start_of_month = start_date + timedelta(minutes=tz_offset)
     local_month_end = end_date + timedelta(minutes=tz_offset)
     local_now = datetime.now(timezone.utc) + timedelta(minutes=tz_offset)
@@ -5642,43 +5664,41 @@ async def get_employee_monthly_summary(
             
             day_info["first_in"] = day_logs[0]["timestamp"].replace(tzinfo=timezone.utc).isoformat()
             
-            # Calculate duration: simplify by taking last check-out - first check-in
-            # Better: sum durations between paired IN and OUT
             day_duration_ms = 0
             last_in_time = None
             
             for log in day_logs:
-                # Dynamically calculate is_late to override buggy legacy historical DB states
-                is_late = log.get("is_late", False)
-                if log["type"] == "check-in":
-                    # strictly check if time is past 10:15 local time
-                    local_time = log["timestamp"].replace(tzinfo=timezone.utc) + timedelta(minutes=tz_offset)
-                    if local_time.hour > 10 or (local_time.hour == 10 and local_time.minute > 15):
-                        is_late = True
-                    else:
-                        is_late = False
+                log_ts = log["timestamp"]
+                if log_ts.tzinfo is None:
+                    log_ts = log_ts.replace(tzinfo=timezone.utc)
+                local_log_time = log_ts + timedelta(minutes=tz_offset)
+                
+                log_type = log.get("type", "")
+                log_status = "Present"
+                
+                if log_type == "check-in":
+                    limit_time = local_log_time.replace(hour=start_h, minute=start_m, second=0, microsecond=0) + timedelta(minutes=late_threshold_mins)
+                    if local_log_time > limit_time:
+                        log_status = "Late"
+                elif log_type == "check-out":
+                    early_limit = local_log_time.replace(hour=end_h, minute=end_m, second=0, microsecond=0) - timedelta(minutes=10)
+                    if local_log_time < early_limit:
+                        log_status = "Early Leave"
 
                 # Basic representation for frontend
                 day_info["logs"].append({
-                    "time": log["timestamp"].replace(tzinfo=timezone.utc).isoformat(),
-                    "type": log["type"],
-                    "status": "Late" if is_late else "Early Leave" if log.get("is_early_leave") else "Present",
+                    "time": log_ts.isoformat(),
+                    "type": log_type,
+                    "status": log_status,
                     "method": log.get("check_in_method", "N/A"),
                     "location": log.get("location"),
                     "selfie": log.get("selfie_url"),
                     "wifi_confidence": log.get("wifi_confidence", 0)
                 })
 
-                if log["type"] == "check-in":
-                    last_in_time = log["timestamp"]
-                    if last_in_time.tzinfo is None:
-                        last_in_time = last_in_time.replace(tzinfo=timezone.utc)
-                elif log["type"] == "check-out" and last_in_time:
-                    # Ensure log timestamp is aware
-                    log_ts = log["timestamp"]
-                    if log_ts.tzinfo is None:
-                        log_ts = log_ts.replace(tzinfo=timezone.utc)
-                    
+                if log_type == "check-in":
+                    last_in_time = log_ts
+                elif log_type == "check-out" and last_in_time:
                     delta = log_ts - last_in_time
                     day_duration_ms += delta.total_seconds() * 1000
                     last_in_time = None
@@ -5687,20 +5707,36 @@ async def get_employee_monthly_summary(
             day_info["duration_hours"] = round(day_duration_ms / (1000 * 3600), 2)
             total_working_ms += day_duration_ms
 
-            # Set status to Early Leave if the last check-out on this day was flagged
-            if any(l.get("type") == "check-out" and l.get("is_early_leave") for l in day_logs):
-                 day_info["status"] = "Early Leave"
+            # Evaluate day overall status based on FIRST check-in and LAST check-out of the day
+            checkout_logs = [l for l in day_logs if l.get("type") == "check-out"]
+            first_checkin = [l for l in day_logs if l.get("type") == "check-in"]
+
+            is_last_out_early = False
+            if checkout_logs:
+                last_out_log = checkout_logs[-1] # Always evaluate the LAST check-out of the day!
+                last_ts = last_out_log["timestamp"]
+                if last_ts.tzinfo is None:
+                    last_ts = last_ts.replace(tzinfo=timezone.utc)
+                local_last_out = last_ts + timedelta(minutes=tz_offset)
+                early_limit = local_last_out.replace(hour=end_h, minute=end_m, second=0, microsecond=0) - timedelta(minutes=10)
+                if local_last_out < early_limit:
+                    is_last_out_early = True
+
+            if is_last_out_early:
+                day_info["status"] = "Early Leave"
+            elif first_checkin:
+                first_ts = first_checkin[0]["timestamp"]
+                if first_ts.tzinfo is None:
+                    first_ts = first_ts.replace(tzinfo=timezone.utc)
+                local_first_in = first_ts + timedelta(minutes=tz_offset)
+                limit_time = local_first_in.replace(hour=start_h, minute=start_m, second=0, microsecond=0) + timedelta(minutes=late_threshold_mins)
+                if local_first_in > limit_time:
+                    day_info["status"] = "Late"
+                else:
+                    day_info["status"] = "Present"
             else:
-                 # Check if the very first check-in log is dynamically evaluated as late
-                 first_checkin = [l for l in day_logs if l["type"] == "check-in"]
-                 if first_checkin:
-                     loc_time = first_checkin[0]["timestamp"].replace(tzinfo=timezone.utc) + timedelta(minutes=tz_offset)
-                     if loc_time.hour > 10 or (loc_time.hour == 10 and loc_time.minute > 15):
-                         day_info["status"] = "Late"
-                     else:
-                         day_info["status"] = "Present"
-                 else:
-                     day_info["status"] = "Present"
+                day_info["status"] = "Present"
+
         else:
             # Not present and not weekend and not leave -> Absent
             if day_info["status"] == "Absent":
