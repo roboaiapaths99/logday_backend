@@ -6243,7 +6243,8 @@ async def wfh_checkout(req: dict, employee=Depends(get_current_employee)):
     if not org_id:
         raise HTTPException(status_code=400, detail="Employee organization_id missing")
 
-    await verify_wfh_device(employee_id, org_id, device_id)
+    # Don't block checkout on device verification — the session was already
+    # validated at check-in. Blocking here traps users in permanent active sessions.
 
     query = {
         "employee_id": employee_id,
@@ -6485,7 +6486,17 @@ async def get_active_wfh_session(employee=Depends(get_current_employee)):
 
     if session:
         # If the session is from a previous day, auto-close it as stale!
-        if session.get("date") != today_str:
+        # But add a grace period: only close if the session is >20 hours old
+        # to prevent midnight-boundary race conditions (check-in at 23:59,
+        # session/active polled at 00:00 → wrongly killed as stale).
+        session_date = session.get("date", "")
+        stale_check_in_time = session.get("check_in_time")
+        session_age_hours = 0
+        if stale_check_in_time:
+            if stale_check_in_time.tzinfo is None:
+                stale_check_in_time = stale_check_in_time.replace(tzinfo=timezone.utc)
+            session_age_hours = (datetime.now(timezone.utc) - stale_check_in_time).total_seconds() / 3600
+        if session_date != today_str and session_age_hours > 20:
             now_utc = datetime.now(timezone.utc)
             check_in_time = session.get("check_in_time")
             total_seconds = 0
