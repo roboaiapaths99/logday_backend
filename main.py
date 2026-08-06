@@ -971,7 +971,7 @@ async def auth_check(employee=Depends(get_current_employee)):
     if not emp:
         raise HTTPException(status_code=404, detail="Employee not found")
         
-    # Check if there is an active WFH session
+    # 1. Check active WFH session
     active_session = await wfh_sessions_collection.find_one({
         "employee_id": str(emp["_id"]),
         "status": "active"
@@ -983,12 +983,46 @@ async def auth_check(employee=Depends(get_current_employee)):
     if active_session:
         checked_in = True
         session_id = str(active_session["_id"])
+
+    # 2. Check today's attendance logs (Desk / Field / General check-in)
+    org_id = emp.get("organization_id")
+    tz_offset = 330
+    if org_id:
+        try:
+            org_settings = await settings_collection.find_one({"organization_id": str(org_id) if ObjectId.is_valid(str(org_id)) else org_id})
+            if org_settings:
+                tz_offset = org_settings.get("timezone_offset", 330)
+        except Exception:
+            pass
+
+    today_start_utc = get_today_start(tz_offset)
+    user_id_str = str(emp["_id"])
+    emp_email = emp.get("email", "")
+
+    latest_log = await attendance_logs_collection.find_one(
+        {
+            "$or": [
+                {"user_id": user_id_str},
+                {"user_id": emp_email},
+                {"email": emp_email}
+            ],
+            "timestamp": {"$gte": today_start_utc}
+        },
+        sort=[("timestamp", -1)]
+    )
+
+    if latest_log:
+        if latest_log.get("type") == "check-in":
+            checked_in = True
+        elif latest_log.get("type") == "check-out":
+            checked_in = False
         
     return {
         "status": "success",
         "checked_in": checked_in,
         "session_id": session_id
     }
+
 
 
 @app.get("/me", response_model=EmployeeProfile)
@@ -1103,23 +1137,34 @@ async def verify_presence(req: VerifyPresenceRequest):
         )
 
     if emp_type != "field":
-        if target_ssid and req.wifi_ssid and req.wifi_ssid.strip().lower() != target_ssid.strip().lower():
+        clean_req_ssid = req.wifi_ssid.strip().strip('"').strip("'").lower() if req.wifi_ssid else ""
+        clean_target_ssid = target_ssid.strip().strip('"').strip("'").lower() if target_ssid else ""
+        if clean_target_ssid and clean_req_ssid and clean_req_ssid != clean_target_ssid:
              raise HTTPException(status_code=403, detail=f"Must be connected to Office WiFi: {target_ssid}")
         if target_bssid and req.wifi_bssid and req.wifi_bssid.strip().lower() != target_bssid.strip().lower():
              raise HTTPException(status_code=403, detail="Must be connected to Office WiFi Access Point (BSSID mismatch).")
 
     # 5. Determine check-in or check-out (Localized)
     today_start_utc = get_today_start(tz_offset)
+    user_id_str = str(user["_id"])
+    emp_email = user.get("email", req.email)
     last_log = await attendance_logs_collection.find_one(
-        {"user_id": str(user["_id"]), "timestamp": {"$gte": today_start_utc}},
+        {
+            "$or": [
+                {"user_id": user_id_str},
+                {"user_id": emp_email},
+                {"email": emp_email}
+            ],
+            "timestamp": {"$gte": today_start_utc}
+        },
         sort=[("timestamp", -1)]
     )
     attendance_type = "check-out" if (last_log and last_log.get("type") == "check-in") else "check-in"
 
     # 6. Log Attendance
     log = {
-        "user_id": str(user["_id"]),
-        "email": req.email,
+        "user_id": user_id_str,
+        "email": emp_email,
         "timestamp": datetime.now(timezone.utc),
         "type": attendance_type,
         "status": "SUCCESS",
@@ -1131,6 +1176,14 @@ async def verify_presence(req: VerifyPresenceRequest):
         "device_id": req.device_id
     }
     await attendance_logs_collection.insert_one(log)
+    await employees_collection.update_one(
+        {"_id": user["_id"]},
+        {"$set": {
+            "checked_in": (attendance_type == "check-in"),
+            "last_attendance_type": attendance_type,
+            "last_attendance_time": log["timestamp"]
+        }}
+    )
 
     return {
         "status": "success",
@@ -1160,21 +1213,26 @@ async def smart_attendance(req: VerifyPresenceRequest, background_tasks: Backgro
         office_wifi_ssid = None
         
         # 1. Identity & Role Fetch
-        clean_email = req.email.strip().lower()
-        user = await employees_collection.find_one({"email": clean_email})
+        clean_email = req.email.strip().lower() if req.email else ""
+        user = await employees_collection.find_one({"email": clean_email}) if clean_email else None
         is_admin_user = False
         
         if not user:
-             # Try 1:N face search if email is unknown/auto
-            new_embedding = get_face_embedding(req.image)
-            if new_embedding is not None:
-                employees = await employees_collection.find({}, {"_id": 1, "face_embedding": 1, "email": 1, "employee_type": 1, "organization_id": 1}).to_list(length=5000)
-                for emp in employees:
-                    if emp.get("face_embedding") and compare_faces(new_embedding, emp["face_embedding"]):
-                        user = emp
-                        break
+            # Try 1:N face search ONLY if email is blank/generic AND embedding is non-dummy
+            if not clean_email or clean_email in ["unknown", "auto", ""]:
+                new_embedding = get_face_embedding(req.image)
+                if new_embedding is not None and not is_dummy_embedding(new_embedding):
+                    emp_query = {"face_embedding": {"$ne": None}}
+                    if req.organization_id:
+                        emp_query["organization_id"] = req.organization_id
+                    employees = await employees_collection.find(emp_query, {"_id": 1, "face_embedding": 1, "email": 1, "employee_type": 1, "organization_id": 1}).to_list(length=5000)
+                    for emp in employees:
+                        if emp.get("face_embedding") and not is_dummy_embedding(emp["face_embedding"]) and compare_faces(new_embedding, emp["face_embedding"]):
+                            user = emp
+                            clean_email = emp.get("email", "")
+                            break
             
-            if not user:
+            if not user and clean_email:
                 # Try Admin collection (Admins might be marking attendance for themselves)
                 user = await admins_collection.find_one({"email": clean_email})
                 if user:
@@ -1182,6 +1240,9 @@ async def smart_attendance(req: VerifyPresenceRequest, background_tasks: Backgro
                     logger.info(f"Admin '{clean_email}' found in admins collection for attendance.")
                 else:
                     raise HTTPException(status_code=404, detail="Identity not recognized. Please sign in or register.")
+
+            if not user:
+                raise HTTPException(status_code=404, detail="Identity not recognized. Please sign in or register.")
 
         # Identity identified.
         is_reviewer = (clean_email == "google.review@logday.app")
@@ -1224,10 +1285,18 @@ async def smart_attendance(req: VerifyPresenceRequest, background_tasks: Backgro
         if org_settings:
             tz_offset = org_settings.get("timezone_offset", 330)
         today_start_utc = get_today_start(tz_offset)
+        user_id_str = str(user["_id"])
+        emp_email = user.get("email", clean_email)
 
         # --- Query 1: All-time last log (used ONLY for auto-closing stale sessions) ---
         alltime_last_log = await attendance_logs_collection.find_one(
-            {"user_id": str(user["_id"])},
+            {
+                "$or": [
+                    {"user_id": user_id_str},
+                    {"user_id": emp_email},
+                    {"email": emp_email}
+                ]
+            },
             sort=[("timestamp", -1)]
         )
 
@@ -1244,7 +1313,8 @@ async def smart_attendance(req: VerifyPresenceRequest, background_tasks: Backgro
                 else:
                     auto_checkout_time = last_ts + timedelta(seconds=1)
                 auto_checkout_log = {
-                    "user_id": str(user["_id"]),
+                    "user_id": user_id_str,
+                    "email": emp_email,
                     "type": "check-out",
                     "timestamp": auto_checkout_time,
                     "lat": alltime_last_log.get("lat", 0),
@@ -1263,7 +1333,11 @@ async def smart_attendance(req: VerifyPresenceRequest, background_tasks: Backgro
         # never cause a false "already checked in" error today.
         last_log = await attendance_logs_collection.find_one(
             {
-                "user_id": str(user["_id"]),
+                "$or": [
+                    {"user_id": user_id_str},
+                    {"user_id": emp_email},
+                    {"email": emp_email}
+                ],
                 "timestamp": {"$gte": today_start_utc}
             },
             sort=[("timestamp", -1)]
@@ -1354,7 +1428,9 @@ async def smart_attendance(req: VerifyPresenceRequest, background_tasks: Backgro
                      )
                 
                 is_wifi_ok = True
-                if office_wifi_ssid and (not req.wifi_ssid or req.wifi_ssid.strip().lower() != office_wifi_ssid.strip().lower()):
+                clean_req_ssid = req.wifi_ssid.strip().strip('"').strip("'").lower() if req.wifi_ssid else ""
+                clean_office_ssid = office_wifi_ssid.strip().strip('"').strip("'").lower() if office_wifi_ssid else ""
+                if clean_office_ssid and (not clean_req_ssid or clean_req_ssid != clean_office_ssid):
                     is_wifi_ok = False
                 if office_wifi_bssid and (not req.wifi_bssid or req.wifi_bssid.strip().lower() != office_wifi_bssid.strip().lower()):
                     is_wifi_ok = False
@@ -1552,6 +1628,15 @@ async def smart_attendance(req: VerifyPresenceRequest, background_tasks: Backgro
             log["wfh_session_id"] = wfh_session_id
         
         await attendance_logs_collection.insert_one(log)
+        await employees_collection.update_one(
+            {"_id": user["_id"]},
+            {"$set": {
+                "checked_in": (attendance_type == "check-in"),
+                "last_attendance_type": attendance_type,
+                "last_attendance_time": log["timestamp"]
+            }}
+        )
+
         
         # Trigger Background Sync to Google Sheets
         background_tasks.add_task(sync_to_google_sheets, log)
@@ -1654,7 +1739,14 @@ async def get_logs(email: str, page: int = 1, limit: int = 50, start_date: Optio
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    query = {"user_id": str(user["_id"])}
+    user_id_str = str(user["_id"])
+    query = {
+        "$or": [
+            {"user_id": user_id_str},
+            {"user_id": email},
+            {"email": email}
+        ]
+    }
     
     if start_date or end_date:
         time_filter = {}
@@ -1711,9 +1803,16 @@ async def get_employee_profile(current_user: dict = Depends(get_current_employee
             tz_offset = org_settings.get("timezone_offset", 330)
 
     today_start_utc = get_today_start(tz_offset)
+    user_id_str = str(user["_id"])
+    emp_email = user.get("email", "")
+
     last_log = await attendance_logs_collection.find_one(
         {
-            "user_id": str(user["_id"]),
+            "$or": [
+                {"user_id": user_id_str},
+                {"user_id": emp_email},
+                {"email": emp_email}
+            ],
             "timestamp": {"$gte": today_start_utc}
         },
         sort=[("timestamp", -1)]
@@ -1761,7 +1860,13 @@ async def get_my_analytics(current_user: dict = Depends(get_current_employee)):
 
         # 1. Determine Status FIRST (Highest Priority for UI Sync)
         latest_log = await attendance_logs_collection.find_one(
-            {"user_id": user_id_str},
+            {
+                "$or": [
+                    {"user_id": user_id_str},
+                    {"user_id": user_email},
+                    {"email": user_email}
+                ]
+            },
             sort=[("timestamp", -1)]
         )
         
@@ -1776,15 +1881,17 @@ async def get_my_analytics(current_user: dict = Depends(get_current_employee)):
                     current_status = "check-in"
             else:
                 current_status = "check-out"
-            # NOTE: Do NOT re-fetch org_settings or recompute today_start here —
-            # that was a bug causing date-boundary inconsistency. Use already-computed values.
 
         week_start = today_start - timedelta(days=today_start.weekday())
         month_start = today_start.replace(day=1)
 
         # Get logs for calculation
         all_logs = await attendance_logs_collection.find({
-            "user_id": str(user["_id"]),
+            "$or": [
+                {"user_id": user_id_str},
+                {"user_id": user_email},
+                {"email": user_email}
+            ],
             "timestamp": {"$gte": week_start}
         }).sort("timestamp", 1).to_list(length=1000)
 
@@ -1824,7 +1931,11 @@ async def get_my_analytics(current_user: dict = Depends(get_current_employee)):
         
         # Month hours (Separate query for performance)
         month_logs = await attendance_logs_collection.find({
-            "user_id": str(user["_id"]),
+            "$or": [
+                {"user_id": user_id_str},
+                {"user_id": user_email},
+                {"email": user_email}
+            ],
             "timestamp": {"$gte": month_start}
         }).to_list(length=2000)
         month_hours = await calculate_hours(month_logs)
@@ -1852,13 +1963,20 @@ async def get_my_analytics(current_user: dict = Depends(get_current_employee)):
 
         # Latest history
         history_cursor = attendance_logs_collection.find(
-            {"user_id": str(user["_id"])}
+            {
+                "$or": [
+                    {"user_id": user_id_str},
+                    {"user_id": user_email},
+                    {"email": user_email}
+                ]
+            }
         ).sort("timestamp", -1).limit(5)
         history = await history_cursor.to_list(length=5)
         for h in history:
             h["_id"] = str(h["_id"])
             if "timestamp" in h and isinstance(h["timestamp"], datetime):
                 h["timestamp"] = h["timestamp"].isoformat()
+
 
         # NOTE: current_status was already determined by the first latest_log query above.
         # The previous "Absolute Status Sync" block here was a redundant duplicate DB query
@@ -3253,6 +3371,10 @@ async def visit_check_in(req: dict, employee=Depends(get_current_employee)):
         }
         
         result = await visit_logs_collection.insert_one(log)
+        await employees_collection.update_one(
+            {"email": employee["email"]},
+            {"$set": {"checked_in": True, "last_attendance_type": "visit_check_in", "last_attendance_time": log["check_in_time"]}}
+        )
         return {"status": "success", "visit_id": str(result.inserted_id), "geofence_validated": geofence_validated, "distance_meters": geofence_distance}
     except HTTPException:
         raise
@@ -3337,6 +3459,11 @@ async def visit_check_out(req: dict, background_tasks: BackgroundTasks, employee
             {"_id": ObjectId(req["visit_id"])},
             {"$set": update_data}
         )
+        await employees_collection.update_one(
+            {"email": employee["email"]},
+            {"$set": {"checked_in": False, "last_attendance_type": "visit_check_out", "last_attendance_time": update_data["check_out_time"]}}
+        )
+
 
         # Trigger Background Sync to Google Sheets for Visit Data
         background_tasks.add_task(sync_visit_to_google_sheets, {**visit, **update_data})
@@ -6031,6 +6158,11 @@ async def wfh_checkin(req: dict, employee=Depends(get_current_employee)):
     }
 
     await attendance_logs_collection.insert_one(attendance_doc)
+    await employees_collection.update_one(
+        {"_id": employee["_id"]},
+        {"$set": {"checked_in": True, "last_attendance_type": "wfh_checkin", "last_attendance_time": now}}
+    )
+
 
     policy = None
     try:
@@ -6279,6 +6411,11 @@ async def wfh_checkout(req: dict, employee=Depends(get_current_employee)):
     }
 
     await attendance_logs_collection.insert_one(attendance_doc)
+    await employees_collection.update_one(
+        {"_id": employee["_id"]},
+        {"$set": {"checked_in": False, "last_attendance_type": "wfh_checkout", "last_attendance_time": now}}
+    )
+
 
     return {
         "status": "success",
