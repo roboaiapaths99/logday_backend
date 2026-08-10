@@ -121,35 +121,10 @@ app.include_router(employee_router)
 app.include_router(wfh_router)
 
 
-# Configure CORS
-_raw_origins = os.getenv("ALLOWED_ORIGINS", "")
-if not _raw_origins:
-    # Default to development origins
-    _allowed_origins = [
-        "http://localhost:5173",
-        "http://localhost:5174",
-        "http://localhost:5180",
-        "http://127.0.0.1:5173",
-        "http://127.0.0.1:5174",
-        "http://127.0.0.1:5180",
-        "http://192.168.1.6:5173",
-        "http://192.168.1.6:5174",
-        "http://localhost:3000",
-        "https://attendence-inofice-admin-desk-bza5cuwtz.vercel.app",
-        "https://attendence-inofice-admin-desk.vercel.app",
-    ]
-elif _raw_origins == "*":
-    _allowed_origins = ["*"]
-else:
-    _allowed_origins = [o.strip() for o in _raw_origins.split(",") if o.strip()]
-
+# Configure CORS - Allow all origins dynamically with regex for Electron & web clients
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_allowed_origins + [
-        "http://localhost",
-        "http://10.0.2.2", # Android emulator
-    ],
-    # allow_origin_regex=r"https?://.*", # Very permissive for debugging, will narrow later
+    allow_origin_regex=r".*",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -222,9 +197,10 @@ async def api_prefix_handler(request: Request, call_next):
 
 # --- GLOBAL EXCEPTION HANDLERS ---
 @app.exception_handler(HTTPException)
-async def http_exception_handler(request, exc):
-    """Standardize HTTP exception responses for frontend mapping."""
-    return JSONResponse(
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """Standardize HTTP exception responses for frontend mapping with CORS headers."""
+    origin = request.headers.get("origin")
+    response = JSONResponse(
         status_code=exc.status_code,
         content={
             "status": "error",
@@ -233,12 +209,21 @@ async def http_exception_handler(request, exc):
             "type": "standard_error"
         },
     )
+    if origin and origin != "*":
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+    else:
+        response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Headers"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "*"
+    return response
 
 @app.exception_handler(Exception)
-async def general_exception_handler(request, exc):
-    """Catch-all for internal server errors to avoid leaking tracebacks in production."""
+async def general_exception_handler(request: Request, exc: Exception):
+    """Catch-all for internal server errors to avoid leaking tracebacks in production with CORS headers."""
     logger.exception(f"Unhandled error: {str(exc)}")
-    return JSONResponse(
+    origin = request.headers.get("origin")
+    response = JSONResponse(
         status_code=500,
         content={
             "status": "error",
@@ -247,6 +232,14 @@ async def general_exception_handler(request, exc):
             "type": "system_error"
         },
     )
+    if origin and origin != "*":
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+    else:
+        response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Headers"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "*"
+    return response
 
 # --- STARTUP EVENT ---
 @app.on_event("startup")
