@@ -3006,26 +3006,24 @@ async def get_public_settings(request: Request):
 async def search_organizations(q: str = None):
     """Public search for organizations by name or slug with improved error handling."""
     try:
-        # Validate input
-        if not q or q.strip() == "" or len(q.strip()) < 2:
-            logger.info(f"[SEARCH] Query too short or empty: '{q}' (length: {len(q.strip()) if q else 0})")
-            return {"results": [], "total": 0, "query": q}
+        search_query = q.strip() if q else ""
+        logger.info(f"[SEARCH] Query received: '{search_query}'")
         
-        search_query = q.strip()
-        logger.info(f"[SEARCH] Query received: '{search_query}' - Searching by name and slug")
-        
-        # Case-insensitive partial match on both name and slug
-        regex_pattern = {"$regex": search_query, "$options": "i"}
-        mongo_query = {
-            "$or": [
-                {"name": regex_pattern},
-                {"slug": regex_pattern}
-            ]
-        }
-        
-        # Execute search
-        cursor = organizations_collection.find(mongo_query).limit(10)
-        orgs = await cursor.to_list(length=10)
+        if not search_query or len(search_query) < 2:
+            # Return top organizations if query is empty or 1 character
+            cursor = organizations_collection.find({}).limit(20)
+            orgs = await cursor.to_list(length=20)
+        else:
+            # Case-insensitive partial match on both name and slug
+            regex_pattern = {"$regex": re.escape(search_query), "$options": "i"}
+            mongo_query = {
+                "$or": [
+                    {"name": regex_pattern},
+                    {"slug": regex_pattern}
+                ]
+            }
+            cursor = organizations_collection.find(mongo_query).limit(15)
+            orgs = await cursor.to_list(length=15)
         
         # Log results
         logger.info(f"[SEARCH] Found {len(orgs)} organizations for query: '{search_query}'")
