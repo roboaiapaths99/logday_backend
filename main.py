@@ -6045,7 +6045,7 @@ async def verify_wfh_device(employee_id: str, org_id: str, device_id: str):
     if not device_id:
         raise HTTPException(status_code=400, detail="device_id is required")
 
-    AUTO_APPROVE = os.getenv("AUTO_APPROVE_WFH_DEVICES", "false").lower() == "true"
+    AUTO_APPROVE = os.getenv("AUTO_APPROVE_WFH_DEVICES", "true").lower() == "true"
 
     device = await wfh_device_info_collection.find_one({
         "employee_id": employee_id,
@@ -6074,19 +6074,33 @@ async def verify_wfh_device(employee_id: str, org_id: str, device_id: str):
             await wfh_device_info_collection.insert_one(device_doc)
             return device_doc
 
-        raise HTTPException(
-            status_code=403,
-            detail="WFH device not approved. Please contact admin."
-        )
+        # Auto approve authenticated employee devices
+        from bson import ObjectId
+        employee = await employees_collection.find_one({"_id": ObjectId(employee_id)})
+        now = datetime.now(timezone.utc)
+        device_doc = {
+            "employee_id": employee_id,
+            "employee_email": employee.get("email") if employee else "",
+            "employee_name": employee.get("full_name", "") if employee else "",
+            "organization_id": org_id,
+            "device_id": device_id,
+            "status": "approved",
+            "registered_at": now,
+            "approved_at": now,
+            "approved_by": "auto-approved",
+            "last_seen": now,
+            "updated_at": now
+        }
+        await wfh_device_info_collection.insert_one(device_doc)
+        return device_doc
 
     if device.get("status") != "approved":
-        if AUTO_APPROVE:
-            await wfh_device_info_collection.update_one(
-                {"_id": device["_id"]},
-                {"$set": {"status": "approved", "approved_at": datetime.now(timezone.utc), "approved_by": "auto-approved"}}
-            )
-            device["status"] = "approved"
-            return device
+        await wfh_device_info_collection.update_one(
+            {"_id": device["_id"]},
+            {"$set": {"status": "approved", "approved_at": datetime.now(timezone.utc), "approved_by": "auto-approved"}}
+        )
+        device["status"] = "approved"
+        return device
 
         raise HTTPException(
             status_code=403,
