@@ -7166,9 +7166,13 @@ async def admin_wfh_stats(current_admin: Admin = Depends(get_current_admin)):
             "status": "pending",
             "timestamp": {"$gte": today_start}
         })
+        emp_type_filter = ["wfh", "desk", "office", "all", None]
         wfh_employees_task = employees_collection.count_documents({
             **query,
-            "employee_type": "wfh"
+            "$or": [
+                {"employee_type": {"$in": emp_type_filter}},
+                {"employee_type": {"$exists": False}}
+            ]
         })
         productivity_task = wfh_productivity_collection.find({
             **query,
@@ -7228,7 +7232,31 @@ async def admin_wfh_live_view(request: Request, current_admin: Admin = Depends(g
     org_id = current_admin.organization_id
 
     try:
-        query = {"employee_type": "wfh"}
+        from bson import ObjectId
+
+        # 1. Fetch active sessions in bulk for this org
+        session_query = {"status": "active"}
+        if org_id and org_id != "system_org":
+            session_query["organization_id"] = org_id
+        active_sessions_list = await wfh_sessions_collection.find(session_query).to_list(length=500)
+        active_emp_ids = [s.get("employee_id") for s in (active_sessions_list or []) if s.get("employee_id")]
+
+        active_obj_ids = []
+        for eid in active_emp_ids:
+            try:
+                active_obj_ids.append(ObjectId(eid))
+            except Exception:
+                pass
+
+        # 2. Match employees who are WFH, desk, office, or currently checked-in
+        query_conditions = [
+            {"employee_type": {"$in": ["wfh", "desk", "office", "all", None]}},
+            {"employee_type": {"$exists": False}}
+        ]
+        if active_obj_ids:
+            query_conditions.append({"_id": {"$in": active_obj_ids}})
+
+        query = {"$or": query_conditions}
         if org_id and org_id != "system_org":
             query["organization_id"] = org_id
 
@@ -7238,11 +7266,6 @@ async def admin_wfh_live_view(request: Request, current_admin: Admin = Depends(g
             return []
 
         employee_ids = [str(emp["_id"]) for emp in employees]
-
-        # Fetch active sessions in bulk
-        active_sessions_list = await wfh_sessions_collection.find(
-            {"employee_id": {"$in": employee_ids}, "status": "active"}
-        ).to_list(length=500)
 
         # Fetch latest screenshot and activity per employee using fast indexed find_one
         screenshots_by_emp = {}
