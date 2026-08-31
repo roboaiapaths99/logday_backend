@@ -569,33 +569,25 @@ async def auto_verify_document_file(filepath: str, doc_type: str, employee: dict
     message = "Auto-verification failed: Document details could not be matched."
     extracted_details = {}
     
-    # Run validations
+    # Run validations on real extracted text
     if doc_type == "pan_card":
-        # Search for PAN pattern
+        # Search for PAN pattern (5 uppercase letters, 4 digits, 1 uppercase letter)
         pan_match = re.search(r"[A-Z]{5}[0-9]{4}[A-Z]{1}", extracted_text.upper())
-        if not pan_match and not extracted_text:
-            # Fallback mock check
-            pan_match = re.match(r"^.*$", "ABCDE1234F")
-            extracted_text = f"INCOME TAX DEPARTMENT GOVT OF INDIA\nNAME: {emp_name.upper()}\nPAN: ABCDE1234F"
-            
         if pan_match:
             pan_num = pan_match.group(0)
             name_matched = any(part in extracted_text.lower() for part in name_parts) if name_parts else True
-            if name_matched or not extracted_text:
+            if name_matched:
                 is_verified = True
                 message = f"Auto-verified: PAN Card verified successfully. PAN: {pan_num}"
                 extracted_details = {"pan_number": pan_num, "name_on_card": emp_name.title()}
             else:
                 message = f"Auto-verification failed: Name on PAN Card does not match employee name '{emp_name.title()}'."
+        else:
+            message = "Auto-verification failed: Valid PAN pattern (e.g. ABCDE1234F) not detected in document. Flagged for manual review."
                 
     elif doc_type == "aadhaar":
         # Search for Aadhaar pattern (12 digits, optional spaces)
         aadhaar_match = re.search(r"\b[0-9]{4}\s?[0-9]{4}\s?[0-9]{4}\b", extracted_text)
-        if not aadhaar_match and not extracted_text:
-            # Fallback mock check
-            aadhaar_match = re.match(r"^.*$", "1234 5678 9012")
-            extracted_text = f"GOVERNMENT OF INDIA\n{emp_name.upper()}\nAadhaar Number: 1234 5678 9012"
-            
         if aadhaar_match:
             aadhaar_num = aadhaar_match.group(0)
             name_matched = any(part in extracted_text.lower() for part in name_parts) if name_parts else True
@@ -605,23 +597,21 @@ async def auto_verify_document_file(filepath: str, doc_type: str, employee: dict
                 extracted_details = {"aadhaar_number": aadhaar_num, "name_on_card": emp_name.title()}
             else:
                 message = f"Auto-verification failed: Name on Aadhaar Card does not match employee name '{emp_name.title()}'."
+        else:
+            message = "Auto-verification failed: 12-digit Aadhaar number not detected in document. Flagged for manual review."
                 
     elif doc_type == "bank_details":
         # Search for IFSC pattern (4 letters, 0, 6 alpha-numeric)
         ifsc_match = re.search(r"\b[A-Z]{4}0[A-Z0-9]{6}\b", extracted_text.upper())
-        if not ifsc_match and not extracted_text:
-            ifsc_match = re.match(r"^.*$", "HDFC0001234")
-            extracted_text = f"HDFC BANK LTD\nIFSC: HDFC0001234\nACCOUNT NO: 1234567890\nNAME: {emp_name.upper()}"
-            
         if ifsc_match:
             ifsc_code = ifsc_match.group(0)
+            acc_match = re.search(r"\b[0-9]{9,18}\b", extracted_text)
+            acc_num = acc_match.group(0) if acc_match else "Extracted"
             is_verified = True
             message = f"Auto-verified: Bank details verified. IFSC: {ifsc_code}"
-            acc_match = re.search(r"\b[0-9]{9,18}\b", extracted_text)
-            acc_num = acc_match.group(0) if acc_match else "1234567890"
             extracted_details = {"ifsc_code": ifsc_code, "account_number": acc_num}
         else:
-            message = "Auto-verification failed: Could not find valid Bank IFSC code."
+            message = "Auto-verification failed: Valid IFSC code not detected in bank document. Flagged for manual review."
             
     elif doc_type == "offer_letter":
         if any(w in extracted_text.lower() for w in ["offer", "appointment", "employment", "joining"]) or not extracted_text:
