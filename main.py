@@ -4450,11 +4450,40 @@ async def handle_leave_request(request_id: str, action: str, admin: dict = Depen
 # HOLIDAY & LEAVE POLICY SYSTEM
 # -----------------------------------------------------------------------------
 
-def count_days_between(start_date_str: str, end_date_str: str) -> int:
-    """Inclusive calendar days between two YYYY-MM-DD dates."""
+def normalize_date_str(d_str: str) -> Optional[str]:
+    """Normalize any date format (DD/MM/YYYY, YYYY-MM-DD, ISO) into standard YYYY-MM-DD."""
+    if not d_str:
+        return None
     try:
-        d1 = datetime.strptime(str(start_date_str)[:10], "%Y-%m-%d")
-        d2 = datetime.strptime(str(end_date_str)[:10], "%Y-%m-%d")
+        s = str(d_str).strip()
+        if "T" in s:
+            s = s.split("T")[0]
+        if "/" in s:
+            parts = s.split("/")
+            if len(parts) == 3:
+                if len(parts[2]) == 4:  # DD/MM/YYYY
+                    return f"{int(parts[2]):04d}-{int(parts[1]):02d}-{int(parts[0]):02d}"
+                elif len(parts[0]) == 4:  # YYYY/MM/DD
+                    return f"{int(parts[0]):04d}-{int(parts[1]):02d}-{int(parts[2]):02d}"
+        elif "-" in s:
+            parts = s.split("-")
+            if len(parts) == 3:
+                if len(parts[0]) == 4:  # YYYY-MM-DD
+                    return f"{int(parts[0]):04d}-{int(parts[1]):02d}-{int(parts[2]):02d}"
+                elif len(parts[2]) == 4:  # DD-MM-YYYY
+                    return f"{int(parts[2]):04d}-{int(parts[1]):02d}-{int(parts[0]):02d}"
+        return s[:10]
+    except Exception:
+        return str(d_str)[:10]
+
+
+def count_days_between(start_date_str: str, end_date_str: str) -> int:
+    """Inclusive calendar days between two dates in any standard format."""
+    try:
+        norm_start = normalize_date_str(start_date_str)
+        norm_end = normalize_date_str(end_date_str)
+        d1 = datetime.strptime(norm_start, "%Y-%m-%d")
+        d2 = datetime.strptime(norm_end, "%Y-%m-%d")
         if d2 < d1:
             return 1
         return (d2 - d1).days + 1
@@ -4573,20 +4602,13 @@ async def calculate_leave_balance(
     except Exception:
         pass
 
-    # Build date query filter based on allocation cycle
-    if allocation_cycle == "monthly":
-        date_filter = {"$regex": f"^{month}"}
-    else:
-        date_filter = {"$regex": f"^{year}"}
-
     leaves = await leave_requests_collection.find({
         "$or": [
             {"employee_id": {"$in": emp_identifiers}},
             {"email": {"$in": emp_identifiers}}
         ],
-        "status": {"$regex": "^approved$", "$options": "i"},
-        "start_date": date_filter
-    }).to_list(length=1000)
+        "status": {"$regex": "^approved$", "$options": "i"}
+    }).to_list(length=200)
 
     used_sick = 0.0
     used_casual = 0.0
@@ -4594,13 +4616,26 @@ async def calculate_leave_balance(
     used_other = 0.0
 
     for l in leaves:
+        norm_start = normalize_date_str(l.get("start_date", ""))
+        norm_end = normalize_date_str(l.get("end_date", ""))
+        if not norm_start:
+            continue
+        
+        # Check if overlaps with target period
+        if allocation_cycle == "monthly":
+            if not norm_start.startswith(month) and not (norm_end and norm_end.startswith(month)):
+                continue
+        else:
+            if not norm_start.startswith(str(year)) and not (norm_end and norm_end.startswith(str(year))):
+                continue
+
         l_type = str(l.get("leave_type", "other")).lower()
-        days = float(count_days_between(l.get("start_date", ""), l.get("end_date", "")))
+        days = float(count_days_between(norm_start, norm_end or norm_start))
         if "sick" in l_type:
             used_sick += days
         elif "casual" in l_type:
             used_casual += days
-        elif "duty" in l_type or "od" in l_type:
+        elif "on_duty" in l_type or "duty" in l_type:
             used_on_duty += days
         else:
             used_other += days
@@ -6107,18 +6142,22 @@ async def get_employee_monthly_summary(
     if "employee_id" in employee and employee["employee_id"]:
         emp_identifiers.append(str(employee["employee_id"]).strip())
 
-    month_start_str = month + "-01"
-    month_end_str = next_month.strftime("%Y-%m-%d")
-    
-    leaves = await leave_requests_collection.find({
+    raw_leaves = await leave_requests_collection.find({
         "$or": [
             {"employee_id": {"$in": emp_identifiers}},
             {"email": {"$in": emp_identifiers}}
         ],
-        "status": {"$regex": "^approved$", "$options": "i"},
-        "start_date": {"$lt": month_end_str},
-        "end_date": {"$gte": month_start_str}
+        "status": {"$regex": "^approved$", "$options": "i"}
     }).to_list(length=100)
+
+    leaves = []
+    for rl in raw_leaves:
+        norm_s = normalize_date_str(rl.get("start_date", ""))
+        norm_e = normalize_date_str(rl.get("end_date", ""))
+        if norm_s:
+            rl["start_date"] = norm_s
+            rl["end_date"] = norm_e or norm_s
+            leaves.append(rl)
 
     # 4. Process Data Day by Day
     daily_breakdown = []
