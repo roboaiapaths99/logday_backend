@@ -58,6 +58,7 @@ payrolls_collection = db["payrolls"]
 exit_managements_collection = db["exit_managements"]
 salary_structures_collection = db["salary_structures"]
 holidays_collection = db["holidays"]
+leave_policies_collection = db["leave_policies"]
 
 
 # Ensure indexes for employee check-in status and session tracking

@@ -8,6 +8,7 @@ import asyncio
 from datetime import datetime, timezone, timedelta
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import os
+import calendar
 import math
 import re
 import io
@@ -81,13 +82,16 @@ from database import (
     onboardings_collection,
     payrolls_collection,
     exit_managements_collection,
-    salary_structures_collection
+    salary_structures_collection,
+    holidays_collection,
+    leave_policies_collection
 )
 from models import (
     RegisterRequest, LoginRequest, VerifyPresenceRequest, Token, LoginResponse, EmployeeProfile, UpdateFaceRequest,
     AdminLoginRequest, EmployeeUpdate, SystemSettings, Admin, AdminRole, Organization, OrganizationRegisterRequest, SubAdminCreate,
     EmployeeType, TerritoryType, AttendanceType, CheckInMethod, PlanStatus, VisitPlan, Visit, LocationPing, ExpenseClaim,
-    LeaveType, LeaveStatus, DiscussionMessage, LeaveRequest, SyncBatchRequest, ChangePasswordRequest, SalaryStructure
+    LeaveType, LeaveStatus, DiscussionMessage, LeaveRequest, SyncBatchRequest, ChangePasswordRequest, SalaryStructure,
+    HolidayCreateRequest, HolidayBulkCreateRequest, LeavePolicyUpdateRequest, EmployeeLeaveQuotaUpdateRequest
 )
 from auth import (
     get_password_hash, verify_password, create_access_token, 
@@ -1189,7 +1193,7 @@ async def verify_presence(req: VerifyPresenceRequest):
 
 
 @app.post("/smart-attendance")
-async def smart_attendance(req: VerifyPresenceRequest, background_tasks: BackgroundTasks):
+async def smart_attendance(req: VerifyPresenceRequest, request: Request, background_tasks: BackgroundTasks):
     """
     Unified endpoint for Enterprise Smart Attendance:
     - DESK: Strict WiFi (80%) + Office Geofence (4m).
@@ -1231,8 +1235,27 @@ async def smart_attendance(req: VerifyPresenceRequest, background_tasks: Backgro
                 if user:
                     is_admin_user = True
                     logger.info(f"Admin '{clean_email}' found in admins collection for attendance.")
-                else:
-                    raise HTTPException(status_code=404, detail="Identity not recognized. Please sign in or register.")
+
+            # JWT Bearer Token Fallback: If user still not resolved (blank/generic email from app cold-start),
+            # extract identity from the Authorization header that the mobile app's Axios interceptor always attaches.
+            if not user:
+                auth_header = request.headers.get("authorization", "")
+                if auth_header.startswith("Bearer "):
+                    try:
+                        token = auth_header.split(" ", 1)[1]
+                        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+                        token_email = payload.get("sub", "").strip().lower()
+                        if token_email:
+                            logger.info(f"JWT fallback: Resolved email '{token_email}' from Bearer token (original email was '{clean_email}')")
+                            user = await employees_collection.find_one({"email": token_email})
+                            if not user:
+                                user = await admins_collection.find_one({"email": token_email})
+                                if user:
+                                    is_admin_user = True
+                            if user:
+                                clean_email = token_email
+                    except Exception as jwt_err:
+                        logger.warning(f"JWT fallback failed: {jwt_err}")
 
             if not user:
                 raise HTTPException(status_code=404, detail="Identity not recognized. Please sign in or register.")
@@ -1990,6 +2013,23 @@ async def get_my_analytics(current_user: dict = Depends(get_current_employee)):
             except Exception:
                 pass  # Fallback to env var is fine
 
+        # Upcoming Holidays
+        today_str = (datetime.now(timezone.utc) + timedelta(minutes=tz_offset)).strftime("%Y-%m-%d")
+        holiday_cursor = holidays_collection.find({
+            "$or": [
+                {"organization_id": org_id, "date": {"$gte": today_str}},
+                {"organization_id": "system_org", "date": {"$gte": today_str}}
+            ]
+        }).sort("date", 1).limit(5)
+        upcoming_holidays_raw = await holiday_cursor.to_list(length=5)
+        upcoming_holidays = [
+            {"date": h.get("date"), "name": h.get("name"), "type": h.get("holiday_type", "festival")}
+            for h in upcoming_holidays_raw
+        ]
+
+        # Leave balance
+        leave_balance = await calculate_leave_balance(user_email, org_id or "system_org")
+
         return {
             "email": user["email"],
             "today_hours": today_hours,
@@ -1998,7 +2038,9 @@ async def get_my_analytics(current_user: dict = Depends(get_current_employee)):
             "on_time_count": on_time_count,
             "current_status": current_status,
             "history": history,
-            "office_wifi_ssid": org_wifi_ssid
+            "office_wifi_ssid": org_wifi_ssid,
+            "upcoming_holidays": upcoming_holidays,
+            "leave_balance": leave_balance
         }
     except Exception as e:
         logger.error(f"Analytics Error: {str(e)}", exc_info=True)
@@ -3990,9 +4032,22 @@ async def get_admin_stats(admin: dict = Depends(get_current_admin)):
 
     on_leave_count = await leave_requests_collection.count_documents(leave_query)
 
+    # Check if today is a configured holiday
+    today_holiday = await holidays_collection.find_one({
+        "$or": [
+            {"organization_id": admin.organization_id, "date": today_str},
+            {"organization_id": "system_org", "date": today_str}
+        ]
+    })
+    is_today_holiday = bool(today_holiday)
+    holiday_name = today_holiday.get("name", "Holiday") if today_holiday else None
+
     # Calculate Absent count (Total - ClockedIn - OnLeave)
-    # This is a simplified dashboard metric
-    absent_count = max(0, total_employees - clocked_in_today - on_leave_count)
+    # If today is a holiday or weekend (Sunday), employees are not absent
+    if is_today_holiday or local_now.weekday() == 6:
+        absent_count = 0
+    else:
+        absent_count = max(0, total_employees - clocked_in_today - on_leave_count)
 
     return {
         "total_employees": total_employees,
@@ -4000,6 +4055,8 @@ async def get_admin_stats(admin: dict = Depends(get_current_admin)):
         "late_arrivals_today": total_alerts_today, 
         "on_leave": on_leave_count,
         "absent_today": absent_count,
+        "is_holiday_today": is_today_holiday,
+        "holiday_name": holiday_name,
         "avg_hours": 8.5,
         "alerts_today": total_alerts_today,
         "critical_alerts": critical_alerts_today,
@@ -4387,6 +4444,438 @@ async def handle_leave_request(request_id: str, action: str, admin: dict = Depen
     )
         
     return {"status": "success"}
+
+
+# -----------------------------------------------------------------------------
+# HOLIDAY & LEAVE POLICY SYSTEM
+# -----------------------------------------------------------------------------
+
+def count_days_between(start_date_str: str, end_date_str: str) -> int:
+    """Inclusive calendar days between two YYYY-MM-DD dates."""
+    try:
+        d1 = datetime.strptime(str(start_date_str)[:10], "%Y-%m-%d")
+        d2 = datetime.strptime(str(end_date_str)[:10], "%Y-%m-%d")
+        if d2 < d1:
+            return 1
+        return (d2 - d1).days + 1
+    except Exception:
+        return 1
+
+
+async def sync_holiday_days_off(org_id: str, payroll_month: str):
+    """Synchronize days_off in holidays collection for HRMS payroll integration."""
+    try:
+        # Find all named holidays for this month
+        month_holidays = await holidays_collection.find({
+            "$or": [
+                {"organization_id": org_id, "payroll_month": payroll_month, "date": {"$exists": True}},
+                {"organization_id": "system_org", "payroll_month": payroll_month, "date": {"$exists": True}}
+            ]
+        }).to_list(length=100)
+
+        holiday_days = set()
+        for h in month_holidays:
+            if "day" in h:
+                holiday_days.add(int(h["day"]))
+            elif "date" in h:
+                try:
+                    holiday_days.add(int(str(h["date"]).split("-")[2]))
+                except Exception:
+                    pass
+
+        # Update the payroll days_off doc for this month
+        payroll_doc = await holidays_collection.find_one({
+            "organization_id": org_id,
+            "payroll_month": payroll_month,
+            "days_off": {"$exists": True}
+        })
+
+        if payroll_doc:
+            current_days_off = set(payroll_doc.get("days_off", []))
+            merged = list(current_days_off.union(holiday_days))
+            await holidays_collection.update_one(
+                {"_id": payroll_doc["_id"]},
+                {"$set": {"days_off": merged, "updated_at": datetime.now(timezone.utc)}}
+            )
+        else:
+            # Create default days_off doc with Sundays + holidays
+            try:
+                y, m = map(int, payroll_month.split("-"))
+                num_days = calendar.monthrange(y, m)[1]
+                sundays = []
+                for d in range(1, num_days + 1):
+                    if datetime(y, m, d).weekday() == 6:
+                        sundays.append(d)
+                initial_days_off = sorted(list(set(sundays).union(holiday_days)))
+                await holidays_collection.insert_one({
+                    "organization_id": org_id,
+                    "payroll_month": payroll_month,
+                    "days_off": initial_days_off,
+                    "created_at": datetime.now(timezone.utc)
+                })
+            except Exception as cr_err:
+                logger.warning(f"Could not initialize days_off doc: {cr_err}")
+    except Exception as e:
+        logger.error(f"sync_holiday_days_off error: {e}")
+
+
+async def calculate_leave_balance(email: str, org_id: str, year: Optional[int] = None) -> dict:
+    """Calculate SL, CL, and Total Leaves remaining for an employee."""
+    if not year:
+        year = datetime.now(timezone.utc).year
+
+    # 1. Fetch Leave Policy
+    policy = await leave_policies_collection.find_one({
+        "$or": [
+            {"organization_id": org_id, "year": year},
+            {"organization_id": "system_org", "year": year},
+            {"organization_id": org_id},
+            {"organization_id": "system_org"}
+        ]
+    })
+
+    defaults = {"sick_leave": 12, "casual_leave": 12, "total_leave": 30}
+    overrides = {}
+    if policy:
+        defaults = policy.get("defaults", defaults)
+        overrides = policy.get("overrides", {})
+
+    emp_quota = overrides.get(email, defaults)
+    sick_total = int(emp_quota.get("sick_leave", 12))
+    casual_total = int(emp_quota.get("casual_leave", 12))
+    total_total = int(emp_quota.get("total_leave", 30))
+
+    # 2. Sum approved leaves for this employee in the given year
+    year_prefix = f"{year}"
+    leaves = await leave_requests_collection.find({
+        "employee_id": email,
+        "status": "approved",
+        "start_date": {"$regex": f"^{year_prefix}"}
+    }).to_list(length=1000)
+
+    used_sick = 0
+    used_casual = 0
+    used_on_duty = 0
+    used_other = 0
+
+    for l in leaves:
+        l_type = str(l.get("leave_type", "other")).lower()
+        days = count_days_between(l.get("start_date", ""), l.get("end_date", ""))
+        if "sick" in l_type:
+            used_sick += days
+        elif "casual" in l_type:
+            used_casual += days
+        elif "duty" in l_type or "od" in l_type:
+            used_on_duty += days
+        else:
+            used_other += days
+
+    total_used = used_sick + used_casual + used_other
+
+    return {
+        "year": year,
+        "sick_leave": {
+            "total": sick_total,
+            "used": used_sick,
+            "remaining": max(0, sick_total - used_sick)
+        },
+        "casual_leave": {
+            "total": casual_total,
+            "used": used_casual,
+            "remaining": max(0, casual_total - used_casual)
+        },
+        "total_leave": {
+            "total": total_total,
+            "used": total_used,
+            "remaining": max(0, total_total - total_used)
+        },
+        "on_duty": {
+            "used": used_on_duty
+        },
+        "other": {
+            "used": used_other
+        }
+    }
+
+
+# --- HOLIDAY ENDPOINTS ---
+
+@app.post("/admin/holidays")
+async def admin_create_holiday(req: HolidayCreateRequest, admin: dict = Depends(get_current_admin)):
+    """Create or update a named holiday for the organization."""
+    org_id = admin.organization_id or "system_org"
+    date_str = req.date.strip()
+    try:
+        dt = datetime.strptime(date_str, "%Y-%m-%d")
+        payroll_month = date_str[:7]
+        day_num = dt.day
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
+
+    holiday_doc = {
+        "organization_id": org_id,
+        "date": date_str,
+        "payroll_month": payroll_month,
+        "day": day_num,
+        "name": req.name.strip(),
+        "holiday_type": req.holiday_type or "festival",
+        "description": req.description or "",
+        "created_by": admin.email,
+        "updated_at": datetime.now(timezone.utc)
+    }
+
+    result = await holidays_collection.update_one(
+        {"organization_id": org_id, "date": date_str},
+        {"$set": holiday_doc},
+        upsert=True
+    )
+
+    # Sync with HRMS payroll days_off
+    await sync_holiday_days_off(org_id, payroll_month)
+
+    return {"status": "success", "message": f"Holiday '{req.name}' set for {date_str}", "date": date_str}
+
+
+@app.post("/admin/holidays/bulk")
+async def admin_bulk_create_holidays(req: HolidayBulkCreateRequest, admin: dict = Depends(get_current_admin)):
+    """Bulk create holidays for the organization."""
+    org_id = admin.organization_id or "system_org"
+    created_count = 0
+    months_to_sync = set()
+
+    for h in req.holidays:
+        date_str = h.date.strip()
+        try:
+            dt = datetime.strptime(date_str, "%Y-%m-%d")
+            payroll_month = date_str[:7]
+            day_num = dt.day
+            months_to_sync.add(payroll_month)
+
+            holiday_doc = {
+                "organization_id": org_id,
+                "date": date_str,
+                "payroll_month": payroll_month,
+                "day": day_num,
+                "name": h.name.strip(),
+                "holiday_type": h.holiday_type or "festival",
+                "description": h.description or "",
+                "created_by": admin.email,
+                "updated_at": datetime.now(timezone.utc)
+            }
+
+            await holidays_collection.update_one(
+                {"organization_id": org_id, "date": date_str},
+                {"$set": holiday_doc},
+                upsert=True
+            )
+            created_count += 1
+        except Exception as err:
+            logger.warning(f"Skipping holiday {h}: {err}")
+
+    for m in months_to_sync:
+        await sync_holiday_days_off(org_id, m)
+
+    return {"status": "success", "count": created_count, "message": f"Successfully added {created_count} holidays"}
+
+
+@app.get("/admin/holidays")
+async def admin_get_holidays(year: Optional[int] = None, month: Optional[str] = None, admin: dict = Depends(get_current_admin)):
+    """List all configured holidays for the admin's organization."""
+    org_id = admin.organization_id or "system_org"
+    query = {
+        "$or": [
+            {"organization_id": org_id, "date": {"$exists": True}},
+            {"organization_id": "system_org", "date": {"$exists": True}}
+        ]
+    }
+
+    if month:
+        query["payroll_month"] = month
+    elif year:
+        query["date"] = {"$regex": f"^{year}"}
+
+    cursor = holidays_collection.find(query).sort("date", 1)
+    holidays = await cursor.to_list(length=500)
+
+    results = []
+    for h in holidays:
+        h["_id"] = str(h["_id"])
+        results.append(h)
+    return results
+
+
+@app.delete("/admin/holidays/{holiday_id_or_date}")
+async def admin_delete_holiday(holiday_id_or_date: str, admin: dict = Depends(get_current_admin)):
+    """Delete a holiday by its ID or YYYY-MM-DD date."""
+    org_id = admin.organization_id or "system_org"
+    query = {}
+    if ObjectId.is_valid(holiday_id_or_date):
+        query = {"_id": ObjectId(holiday_id_or_date)}
+    else:
+        query = {
+            "$or": [
+                {"organization_id": org_id, "date": holiday_id_or_date},
+                {"organization_id": "system_org", "date": holiday_id_or_date}
+            ]
+        }
+
+    holiday_to_delete = await holidays_collection.find_one(query)
+    if not holiday_to_delete:
+        raise HTTPException(status_code=404, detail="Holiday not found")
+
+    payroll_month = holiday_to_delete.get("payroll_month", "")
+    day_num = holiday_to_delete.get("day")
+
+    await holidays_collection.delete_one({"_id": holiday_to_delete["_id"]})
+
+    # Also remove from days_off array in payroll doc if needed
+    if payroll_month and day_num:
+        await holidays_collection.update_one(
+            {"organization_id": org_id, "payroll_month": payroll_month, "days_off": {"$exists": True}},
+            {"$pull": {"days_off": day_num}}
+        )
+
+    return {"status": "success", "message": "Holiday deleted successfully"}
+
+
+@app.get("/api/holidays")
+async def employee_get_holidays(year: Optional[int] = None, employee: dict = Depends(get_current_employee)):
+    """Fetch holidays visible to the current employee."""
+    org_id = employee.get("organization_id", "system_org")
+    if not year:
+        year = datetime.now(timezone.utc).year
+
+    query = {
+        "$or": [
+            {"organization_id": org_id, "date": {"$regex": f"^{year}"}},
+            {"organization_id": "system_org", "date": {"$regex": f"^{year}"}}
+        ]
+    }
+
+    cursor = holidays_collection.find(query).sort("date", 1)
+    holidays = await cursor.to_list(length=200)
+
+    results = []
+    for h in holidays:
+        h["_id"] = str(h["_id"])
+        results.append({
+            "id": h["_id"],
+            "date": h.get("date"),
+            "name": h.get("name"),
+            "holiday_type": h.get("holiday_type", "festival"),
+            "description": h.get("description", "")
+        })
+    return results
+
+
+# --- LEAVE POLICY ENDPOINTS ---
+
+@app.get("/admin/leave-policy")
+async def admin_get_leave_policy(year: Optional[int] = None, admin: dict = Depends(get_current_admin)):
+    """Fetch org-wide leave policy and quotas."""
+    org_id = admin.organization_id or "system_org"
+    if not year:
+        year = datetime.now(timezone.utc).year
+
+    policy = await leave_policies_collection.find_one({
+        "$or": [
+            {"organization_id": org_id, "year": year},
+            {"organization_id": "system_org", "year": year}
+        ]
+    })
+
+    defaults = {"sick_leave": 12, "casual_leave": 12, "total_leave": 30}
+    overrides = {}
+    if policy:
+        defaults = policy.get("defaults", defaults)
+        overrides = policy.get("overrides", {})
+
+    return {
+        "organization_id": org_id,
+        "year": year,
+        "defaults": defaults,
+        "overrides": overrides
+    }
+
+
+@app.put("/admin/leave-policy")
+async def admin_update_leave_policy(req: LeavePolicyUpdateRequest, admin: dict = Depends(get_current_admin)):
+    """Set organization-wide default leave quotas (SL, CL, TL)."""
+    org_id = admin.organization_id or "system_org"
+    year = req.year or datetime.now(timezone.utc).year
+
+    defaults = {
+        "sick_leave": req.sick_leave,
+        "casual_leave": req.casual_leave,
+        "total_leave": req.total_leave
+    }
+
+    await leave_policies_collection.update_one(
+        {"organization_id": org_id, "year": year},
+        {
+            "$set": {
+                "organization_id": org_id,
+                "year": year,
+                "defaults": defaults,
+                "updated_by": admin.email,
+                "updated_at": datetime.now(timezone.utc)
+            }
+        },
+        upsert=True
+    )
+
+    return {"status": "success", "message": f"Leave policy updated for {year}", "defaults": defaults}
+
+
+@app.put("/admin/leave-policy/employee/{email}")
+async def admin_update_employee_leave_quota(
+    email: str,
+    req: EmployeeLeaveQuotaUpdateRequest,
+    admin: dict = Depends(get_current_admin)
+):
+    """Set custom leave quota override for a specific employee."""
+    org_id = admin.organization_id or "system_org"
+    clean_email = email.strip().lower()
+    year = req.year or datetime.now(timezone.utc).year
+
+    override = {
+        "sick_leave": req.sick_leave,
+        "casual_leave": req.casual_leave,
+        "total_leave": req.total_leave
+    }
+
+    await leave_policies_collection.update_one(
+        {"organization_id": org_id, "year": year},
+        {
+            "$set": {
+                f"overrides.{clean_email}": override,
+                "updated_by": admin.email,
+                "updated_at": datetime.now(timezone.utc)
+            }
+        },
+        upsert=True
+    )
+
+    balance = await calculate_leave_balance(clean_email, org_id, year)
+    return {"status": "success", "message": f"Custom quota set for {clean_email}", "balance": balance}
+
+
+@app.get("/admin/leave-policy/employee/{email}/balance")
+async def admin_get_employee_leave_balance(email: str, year: Optional[int] = None, admin: dict = Depends(get_current_admin)):
+    """Fetch live calculated leave balance for an employee."""
+    org_id = admin.organization_id or "system_org"
+    clean_email = email.strip().lower()
+    balance = await calculate_leave_balance(clean_email, org_id, year)
+    return balance
+
+
+@app.get("/api/leave/balance")
+async def employee_get_leave_balance(year: Optional[int] = None, employee: dict = Depends(get_current_employee)):
+    """Fetch live calculated leave balance for the logged-in employee."""
+    org_id = employee.get("organization_id", "system_org")
+    clean_email = employee["email"]
+    balance = await calculate_leave_balance(clean_email, org_id, year)
+    return balance
 
 
 
@@ -5594,6 +6083,27 @@ async def get_employee_monthly_summary(
         except Exception:
             pass
 
+    # Fetch configured days off / holidays for this organization and month
+    days_off_set = set()
+    holiday_names = {}
+    if org_id:
+        try:
+            h_doc = await holidays_collection.find_one({
+                "organization_id": str(org_id),
+                "payroll_month": month
+            })
+            if not h_doc:
+                # Fallback to system_org if not explicitly defined
+                h_doc = await holidays_collection.find_one({
+                    "organization_id": "system_org",
+                    "payroll_month": month
+                })
+            if h_doc:
+                days_off_set = set(h_doc.get("days_off", []))
+                holiday_names = h_doc.get("holiday_names", {})
+        except Exception as e:
+            logger.warning(f"Failed to fetch holidays in monthly summary: {e}")
+
     start_h, start_m = map(int, office_start_time_str.split(":"))
     end_h, end_m = map(int, office_end_time_str.split(":"))
 
@@ -5636,8 +6146,15 @@ async def get_employee_monthly_summary(
             "logs": []
         }
 
-        # Check for Weekend (Saturday=5, Sunday=6)
-        if current_day_local.weekday() >= 5:
+        # Check for Configured Holidays / Days Off
+        day_num = current_day_local.day
+        if day_num in days_off_set:
+            if current_day_local.weekday() >= 5:
+                day_info["status"] = "Weekend"
+            else:
+                day_info["status"] = holiday_names.get(str(day_num), "Holiday")
+        elif current_day_local.weekday() >= 5:
+            # Check for Weekend (Saturday=5, Sunday=6)
             day_info["status"] = "Weekend"
 
         # Check for Leave
@@ -5736,7 +6253,12 @@ async def get_employee_monthly_summary(
         daily_breakdown.append(day_info)
         current_day_local = next_day_local
 
-    # 5. Summary Metrics
+    # Calculate holiday count from breakdown
+    holiday_days_count = sum(1 for d in daily_breakdown if d.get("status") not in ["Present", "Late", "Early Leave", "Absent", "Weekend"] and not str(d.get("status", "")).startswith("Leave"))
+    
+    # Live leave balance for this year
+    leave_balance = await calculate_leave_balance(email, org_id or "system_org", year)
+
     total_hours = round(total_working_ms / (1000 * 3600), 2)
     avg_hours = round(total_hours / present_days, 2) if present_days > 0 else 0
 
@@ -5753,7 +6275,10 @@ async def get_employee_monthly_summary(
             "average_daily_hours": avg_hours,
             "present_days": present_days,
             "leaves_taken": len(leaves),
-            "absent_days": absent_days
+            "absent_days": absent_days,
+            "holiday_days": holiday_days_count,
+            "total_days_evaluated": len(daily_breakdown),
+            "leave_balance": leave_balance
         },
         "daily_breakdown": daily_breakdown
     }
@@ -7171,7 +7696,7 @@ async def admin_wfh_stats(current_admin: Admin = Depends(get_current_admin)):
             "status": "pending",
             "timestamp": {"$gte": today_start}
         })
-        emp_type_filter = ["wfh", "desk", "office", "all", None]
+        emp_type_filter = ["wfh", "desk", "office", "hybrid", "all", None]
         wfh_employees_task = employees_collection.count_documents({
             **query,
             "$or": [
@@ -7253,9 +7778,9 @@ async def admin_wfh_live_view(request: Request, current_admin: Admin = Depends(g
             except Exception:
                 pass
 
-        # 2. Match employees who are WFH, desk, office, or currently checked-in
+        # 2. Match employees who are WFH, desk, office, hybrid, or currently checked-in
         query_conditions = [
-            {"employee_type": {"$in": ["wfh", "desk", "office", "all", None]}},
+            {"employee_type": {"$in": ["wfh", "desk", "office", "hybrid", "all", None]}},
             {"employee_type": {"$exists": False}}
         ]
         if active_obj_ids:

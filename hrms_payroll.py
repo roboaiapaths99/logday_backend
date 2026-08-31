@@ -202,8 +202,15 @@ async def fetch_attendance_data(employee_email: str, org_id: str, payroll_month:
     # Fetch configured days off (holidays/weekends)
     days_off_doc = await holidays_collection.find_one({
         "organization_id": org_id,
-        "payroll_month": payroll_month
+        "payroll_month": payroll_month,
+        "days_off": {"$exists": True}
     })
+    if not days_off_doc:
+        days_off_doc = await holidays_collection.find_one({
+            "organization_id": "system_org",
+            "payroll_month": payroll_month,
+            "days_off": {"$exists": True}
+        })
     
     if days_off_doc:
         days_off = days_off_doc.get("days_off", [])

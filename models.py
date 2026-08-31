@@ -636,3 +636,28 @@ class WFHMeeting(BaseModel):
     end_time: Optional[datetime] = None
     duration_minutes: Optional[int] = None
     date: str
+
+
+class HolidayCreateRequest(BaseModel):
+    date: str  # YYYY-MM-DD
+    name: str
+    holiday_type: Optional[str] = "festival"  # national, festival, company, custom
+    description: Optional[str] = None
+
+
+class HolidayBulkCreateRequest(BaseModel):
+    holidays: List[HolidayCreateRequest]
+
+
+class LeavePolicyUpdateRequest(BaseModel):
+    year: Optional[int] = None
+    sick_leave: int = 12
+    casual_leave: int = 12
+    total_leave: int = 30
+
+
+class EmployeeLeaveQuotaUpdateRequest(BaseModel):
+    year: Optional[int] = None
+    sick_leave: int
+    casual_leave: int
+    total_leave: int
