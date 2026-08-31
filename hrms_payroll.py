@@ -243,11 +243,17 @@ async def fetch_attendance_data(employee_email: str, org_id: str, payroll_month:
         ist_ts = ts + timedelta(hours=5, minutes=30)
         present_dates.add(ist_ts.day)
 
-    # 3. Approved leave days overlapping this month
+    # 3. Approved leave days overlapping this month (flexible identifier matching)
+    emp_identifiers = [employee_email.strip().lower(), employee_email.strip(), emp_id]
+    if "employee_id" in emp and emp["employee_id"]:
+        emp_identifiers.append(str(emp["employee_id"]).strip())
+
     cursor_leaves = leave_requests_collection.find({
-        "employee_id": employee_email,
-        "organization_id": org_id,
-        "status": "approved"
+        "$or": [
+            {"employee_id": {"$in": emp_identifiers}},
+            {"email": {"$in": emp_identifiers}}
+        ],
+        "status": {"$regex": "^approved$", "$options": "i"}
     })
     leaves = await cursor_leaves.to_list(length=100)
     

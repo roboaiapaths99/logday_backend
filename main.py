@@ -4519,10 +4519,18 @@ async def sync_holiday_days_off(org_id: str, payroll_month: str):
         logger.error(f"sync_holiday_days_off error: {e}")
 
 
-async def calculate_leave_balance(email: str, org_id: str, year: Optional[int] = None) -> dict:
-    """Calculate SL, CL, and Total Leaves remaining for an employee."""
+async def calculate_leave_balance(
+    email: str,
+    org_id: str,
+    year: Optional[int] = None,
+    month: Optional[str] = None
+) -> dict:
+    """Calculate SL, CL, and Total Leaves remaining for an employee (supports annual & monthly allocation)."""
+    now = datetime.now(timezone.utc)
     if not year:
-        year = datetime.now(timezone.utc).year
+        year = now.year
+    if not month:
+        month = f"{year}-{now.month:02d}"
 
     # 1. Fetch Leave Policy
     policy = await leave_policies_collection.find_one({
@@ -4534,33 +4542,60 @@ async def calculate_leave_balance(email: str, org_id: str, year: Optional[int] =
         ]
     })
 
-    defaults = {"sick_leave": 12, "casual_leave": 12, "total_leave": 30}
+    allocation_cycle = "annual"
+    defaults = {"sick_leave": 12.0, "casual_leave": 12.0, "total_leave": 30.0}
     overrides = {}
     if policy:
+        allocation_cycle = policy.get("allocation_cycle", "annual")
         defaults = policy.get("defaults", defaults)
         overrides = policy.get("overrides", {})
 
-    emp_quota = overrides.get(email, defaults)
-    sick_total = int(emp_quota.get("sick_leave", 12))
-    casual_total = int(emp_quota.get("casual_leave", 12))
-    total_total = int(emp_quota.get("total_leave", 30))
+    clean_email = email.strip().lower()
+    emp_quota = overrides.get(clean_email) or overrides.get(email) or defaults
+    
+    default_sl = 12.0 if allocation_cycle == "annual" else 1.0
+    default_cl = 12.0 if allocation_cycle == "annual" else 1.0
+    default_tl = 30.0 if allocation_cycle == "annual" else 2.0
 
-    # 2. Sum approved leaves for this employee in the given year
-    year_prefix = f"{year}"
+    sick_total = float(emp_quota.get("sick_leave", default_sl))
+    casual_total = float(emp_quota.get("casual_leave", default_cl))
+    total_total = float(emp_quota.get("total_leave", default_tl))
+
+    # Identify all possible identifier variants for this employee
+    emp_identifiers = [clean_email, email.strip()]
+    try:
+        emp_doc = await employees_collection.find_one({"email": clean_email})
+        if emp_doc:
+            if "_id" in emp_doc:
+                emp_identifiers.append(str(emp_doc["_id"]))
+            if "employee_id" in emp_doc and emp_doc["employee_id"]:
+                emp_identifiers.append(str(emp_doc["employee_id"]).strip())
+    except Exception:
+        pass
+
+    # Build date query filter based on allocation cycle
+    if allocation_cycle == "monthly":
+        date_filter = {"$regex": f"^{month}"}
+    else:
+        date_filter = {"$regex": f"^{year}"}
+
     leaves = await leave_requests_collection.find({
-        "employee_id": email,
-        "status": "approved",
-        "start_date": {"$regex": f"^{year_prefix}"}
+        "$or": [
+            {"employee_id": {"$in": emp_identifiers}},
+            {"email": {"$in": emp_identifiers}}
+        ],
+        "status": {"$regex": "^approved$", "$options": "i"},
+        "start_date": date_filter
     }).to_list(length=1000)
 
-    used_sick = 0
-    used_casual = 0
-    used_on_duty = 0
-    used_other = 0
+    used_sick = 0.0
+    used_casual = 0.0
+    used_on_duty = 0.0
+    used_other = 0.0
 
     for l in leaves:
         l_type = str(l.get("leave_type", "other")).lower()
-        days = count_days_between(l.get("start_date", ""), l.get("end_date", ""))
+        days = float(count_days_between(l.get("start_date", ""), l.get("end_date", "")))
         if "sick" in l_type:
             used_sick += days
         elif "casual" in l_type:
@@ -4574,26 +4609,28 @@ async def calculate_leave_balance(email: str, org_id: str, year: Optional[int] =
 
     return {
         "year": year,
+        "month": month,
+        "allocation_cycle": allocation_cycle,
         "sick_leave": {
-            "total": sick_total,
-            "used": used_sick,
-            "remaining": max(0, sick_total - used_sick)
+            "total": round(sick_total, 1),
+            "used": round(used_sick, 1),
+            "remaining": round(max(0.0, sick_total - used_sick), 1)
         },
         "casual_leave": {
-            "total": casual_total,
-            "used": used_casual,
-            "remaining": max(0, casual_total - used_casual)
+            "total": round(casual_total, 1),
+            "used": round(used_casual, 1),
+            "remaining": round(max(0.0, casual_total - used_casual), 1)
         },
         "total_leave": {
-            "total": total_total,
-            "used": total_used,
-            "remaining": max(0, total_total - total_used)
+            "total": round(total_total, 1),
+            "used": round(total_used, 1),
+            "remaining": round(max(0.0, total_total - total_used), 1)
         },
         "on_duty": {
-            "used": used_on_duty
+            "used": round(used_on_duty, 1)
         },
         "other": {
-            "used": used_other
+            "used": round(used_other, 1)
         }
     }
 
@@ -4780,19 +4817,24 @@ async def admin_get_leave_policy(year: Optional[int] = None, admin: dict = Depen
     policy = await leave_policies_collection.find_one({
         "$or": [
             {"organization_id": org_id, "year": year},
-            {"organization_id": "system_org", "year": year}
+            {"organization_id": "system_org", "year": year},
+            {"organization_id": org_id},
+            {"organization_id": "system_org"}
         ]
     })
 
-    defaults = {"sick_leave": 12, "casual_leave": 12, "total_leave": 30}
+    allocation_cycle = "annual"
+    defaults = {"sick_leave": 12.0, "casual_leave": 12.0, "total_leave": 30.0}
     overrides = {}
     if policy:
+        allocation_cycle = policy.get("allocation_cycle", "annual")
         defaults = policy.get("defaults", defaults)
         overrides = policy.get("overrides", {})
 
     return {
         "organization_id": org_id,
         "year": year,
+        "allocation_cycle": allocation_cycle,
         "defaults": defaults,
         "overrides": overrides
     }
@@ -4800,14 +4842,15 @@ async def admin_get_leave_policy(year: Optional[int] = None, admin: dict = Depen
 
 @app.put("/admin/leave-policy")
 async def admin_update_leave_policy(req: LeavePolicyUpdateRequest, admin: dict = Depends(get_current_admin)):
-    """Set organization-wide default leave quotas (SL, CL, TL)."""
+    """Set organization-wide default leave quotas (SL, CL, TL) and allocation cycle."""
     org_id = admin.organization_id or "system_org"
     year = req.year or datetime.now(timezone.utc).year
+    allocation_cycle = (req.allocation_cycle or "annual").strip().lower()
 
     defaults = {
-        "sick_leave": req.sick_leave,
-        "casual_leave": req.casual_leave,
-        "total_leave": req.total_leave
+        "sick_leave": float(req.sick_leave),
+        "casual_leave": float(req.casual_leave),
+        "total_leave": float(req.total_leave)
     }
 
     await leave_policies_collection.update_one(
@@ -4816,6 +4859,7 @@ async def admin_update_leave_policy(req: LeavePolicyUpdateRequest, admin: dict =
             "$set": {
                 "organization_id": org_id,
                 "year": year,
+                "allocation_cycle": allocation_cycle,
                 "defaults": defaults,
                 "updated_by": admin.email,
                 "updated_at": datetime.now(timezone.utc)
@@ -4824,7 +4868,12 @@ async def admin_update_leave_policy(req: LeavePolicyUpdateRequest, admin: dict =
         upsert=True
     )
 
-    return {"status": "success", "message": f"Leave policy updated for {year}", "defaults": defaults}
+    return {
+        "status": "success",
+        "message": f"Leave policy updated for {year}",
+        "allocation_cycle": allocation_cycle,
+        "defaults": defaults
+    }
 
 
 @app.put("/admin/leave-policy/employee/{email}")
@@ -4839,9 +4888,9 @@ async def admin_update_employee_leave_quota(
     year = req.year or datetime.now(timezone.utc).year
 
     override = {
-        "sick_leave": req.sick_leave,
-        "casual_leave": req.casual_leave,
-        "total_leave": req.total_leave
+        "sick_leave": float(req.sick_leave),
+        "casual_leave": float(req.casual_leave),
+        "total_leave": float(req.total_leave)
     }
 
     await leave_policies_collection.update_one(
@@ -4861,20 +4910,29 @@ async def admin_update_employee_leave_quota(
 
 
 @app.get("/admin/leave-policy/employee/{email}/balance")
-async def admin_get_employee_leave_balance(email: str, year: Optional[int] = None, admin: dict = Depends(get_current_admin)):
+async def admin_get_employee_leave_balance(
+    email: str,
+    year: Optional[int] = None,
+    month: Optional[str] = None,
+    admin: dict = Depends(get_current_admin)
+):
     """Fetch live calculated leave balance for an employee."""
     org_id = admin.organization_id or "system_org"
     clean_email = email.strip().lower()
-    balance = await calculate_leave_balance(clean_email, org_id, year)
+    balance = await calculate_leave_balance(clean_email, org_id, year, month)
     return balance
 
 
 @app.get("/api/leave/balance")
-async def employee_get_leave_balance(year: Optional[int] = None, employee: dict = Depends(get_current_employee)):
+async def employee_get_leave_balance(
+    year: Optional[int] = None,
+    month: Optional[str] = None,
+    employee: dict = Depends(get_current_employee)
+):
     """Fetch live calculated leave balance for the logged-in employee."""
     org_id = employee.get("organization_id", "system_org")
     clean_email = employee["email"]
-    balance = await calculate_leave_balance(clean_email, org_id, year)
+    balance = await calculate_leave_balance(clean_email, org_id, year, month)
     return balance
 
 
@@ -6041,17 +6099,26 @@ async def get_employee_monthly_summary(
         "timestamp": {"$gte": start_date, "$lt": end_date}
     }).sort("timestamp", 1).to_list(length=1000)
 
-    # 3. Fetch Approved Leaves for the month
-    # Fix: Correct overlap logic and case-insensitivity for status
+    # 3. Fetch Approved Leaves for the month (flexible identifier matching)
+    clean_email = email.strip().lower()
+    emp_identifiers = [clean_email, email.strip()]
+    if "_id" in employee:
+        emp_identifiers.append(str(employee["_id"]))
+    if "employee_id" in employee and employee["employee_id"]:
+        emp_identifiers.append(str(employee["employee_id"]).strip())
+
     month_start_str = month + "-01"
     month_end_str = next_month.strftime("%Y-%m-%d")
     
     leaves = await leave_requests_collection.find({
-        "employee_id": email,
+        "$or": [
+            {"employee_id": {"$in": emp_identifiers}},
+            {"email": {"$in": emp_identifiers}}
+        ],
         "status": {"$regex": "^approved$", "$options": "i"},
         "start_date": {"$lt": month_end_str},
         "end_date": {"$gte": month_start_str}
-    }).to_list(length=50)
+    }).to_list(length=100)
 
     # 4. Process Data Day by Day
     daily_breakdown = []
@@ -6146,9 +6213,24 @@ async def get_employee_monthly_summary(
             "logs": []
         }
 
-        # Check for Configured Holidays / Days Off
+        # 1. Check for Approved Leave on this day
+        is_on_leave = False
+        leave_label = None
+        for leave in leaves:
+            s_date = str(leave.get("start_date", ""))[:10]
+            e_date = str(leave.get("end_date", ""))[:10]
+            if s_date and e_date and (s_date <= day_str <= e_date):
+                l_type = leave.get("leave_type", "General")
+                leave_label = f"Leave ({l_type})"
+                is_on_leave = True
+                leaves_count += 1
+                break
+
+        # 2. Check for Configured Holidays / Days Off / Weekend
         day_num = current_day_local.day
-        if day_num in days_off_set:
+        if is_on_leave:
+            day_info["status"] = leave_label
+        elif day_num in days_off_set:
             if current_day_local.weekday() >= 5:
                 day_info["status"] = "Weekend"
             else:
@@ -6156,15 +6238,6 @@ async def get_employee_monthly_summary(
         elif current_day_local.weekday() >= 5:
             # Check for Weekend (Saturday=5, Sunday=6)
             day_info["status"] = "Weekend"
-
-        # Check for Leave
-        is_on_leave = False
-        for leave in leaves:
-            if leave["start_date"] <= day_str <= leave["end_date"]:
-                day_info["status"] = f"Leave ({leave.get('leave_type', 'General')})"
-                is_on_leave = True
-                leaves_count += 1
-                break
 
         if day_logs:
             day_logs.sort(key=lambda x: x["timestamp"])
@@ -6246,7 +6319,7 @@ async def get_employee_monthly_summary(
                 day_info["status"] = "Present"
 
         else:
-            # Not present and not weekend and not leave -> Absent
+            # Not present: only increment absent if status is actually Absent (not leave, not weekend, not holiday)
             if day_info["status"] == "Absent":
                 absent_days += 1
 
@@ -6256,8 +6329,8 @@ async def get_employee_monthly_summary(
     # Calculate holiday count from breakdown
     holiday_days_count = sum(1 for d in daily_breakdown if d.get("status") not in ["Present", "Late", "Early Leave", "Absent", "Weekend"] and not str(d.get("status", "")).startswith("Leave"))
     
-    # Live leave balance for this year
-    leave_balance = await calculate_leave_balance(email, org_id or "system_org", year)
+    # Live leave balance for this year and month
+    leave_balance = await calculate_leave_balance(email, org_id or "system_org", year, month)
 
     total_hours = round(total_working_ms / (1000 * 3600), 2)
     avg_hours = round(total_hours / present_days, 2) if present_days > 0 else 0

@@ -651,13 +651,15 @@ class HolidayBulkCreateRequest(BaseModel):
 
 class LeavePolicyUpdateRequest(BaseModel):
     year: Optional[int] = None
-    sick_leave: int = 12
-    casual_leave: int = 12
-    total_leave: int = 30
+    allocation_cycle: Optional[str] = "annual"  # "annual" (yearly quota) or "monthly" (monthly quota)
+    sick_leave: float = 12.0
+    casual_leave: float = 12.0
+    total_leave: float = 30.0
 
 
 class EmployeeLeaveQuotaUpdateRequest(BaseModel):
     year: Optional[int] = None
-    sick_leave: int
-    casual_leave: int
-    total_leave: int
+    allocation_cycle: Optional[str] = "annual"  # "annual" or "monthly"
+    sick_leave: float
+    casual_leave: float
+    total_leave: float
