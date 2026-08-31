@@ -652,6 +652,8 @@ class HolidayBulkCreateRequest(BaseModel):
 class LeavePolicyUpdateRequest(BaseModel):
     year: Optional[int] = None
     allocation_cycle: Optional[str] = "annual"  # "annual" (yearly quota) or "monthly" (monthly quota)
+    carry_forward: Optional[bool] = True  # Carry forward unused monthly leaves to next month
+    start_month: Optional[str] = "2026-08"  # Base month to start monthly accrual (e.g. 2026-08)
     sick_leave: float = 12.0
     casual_leave: float = 12.0
     total_leave: float = 30.0
@@ -660,6 +662,7 @@ class LeavePolicyUpdateRequest(BaseModel):
 class EmployeeLeaveQuotaUpdateRequest(BaseModel):
     year: Optional[int] = None
     allocation_cycle: Optional[str] = "annual"  # "annual" or "monthly"
+    carry_forward: Optional[bool] = True
     sick_leave: float
     casual_leave: float
     total_leave: float

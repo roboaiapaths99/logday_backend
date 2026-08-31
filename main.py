@@ -4554,7 +4554,7 @@ async def calculate_leave_balance(
     year: Optional[int] = None,
     month: Optional[str] = None
 ) -> dict:
-    """Calculate SL, CL, and Total Leaves remaining for an employee (supports annual & monthly allocation)."""
+    """Calculate SL, CL, and Total Leaves remaining for an employee (supports annual & monthly allocation with carry-forward)."""
     now = datetime.now(timezone.utc)
     if not year:
         year = now.year
@@ -4572,23 +4572,27 @@ async def calculate_leave_balance(
     })
 
     allocation_cycle = "annual"
+    carry_forward = True
+    start_month = "2026-08"
     defaults = {"sick_leave": 12.0, "casual_leave": 12.0, "total_leave": 30.0}
     overrides = {}
     if policy:
         allocation_cycle = policy.get("allocation_cycle", "annual")
+        carry_forward = policy.get("carry_forward", True)
+        start_month = policy.get("start_month", "2026-08")
         defaults = policy.get("defaults", defaults)
         overrides = policy.get("overrides", {})
 
     clean_email = email.strip().lower()
     emp_quota = overrides.get(clean_email) or overrides.get(email) or defaults
     
-    default_sl = 12.0 if allocation_cycle == "annual" else 1.0
-    default_cl = 12.0 if allocation_cycle == "annual" else 1.0
-    default_tl = 30.0 if allocation_cycle == "annual" else 2.0
+    default_sl = 12.0 if allocation_cycle == "annual" else 0.0
+    default_cl = 12.0 if allocation_cycle == "annual" else 0.0
+    default_tl = 30.0 if allocation_cycle == "annual" else 1.5
 
-    sick_total = float(emp_quota.get("sick_leave", default_sl))
-    casual_total = float(emp_quota.get("casual_leave", default_cl))
-    total_total = float(emp_quota.get("total_leave", default_tl))
+    base_sl = float(emp_quota.get("sick_leave", default_sl))
+    base_cl = float(emp_quota.get("casual_leave", default_cl))
+    base_tl = float(emp_quota.get("total_leave", default_tl))
 
     # Identify all possible identifier variants for this employee
     emp_identifiers = [clean_email, email.strip()]
@@ -4610,64 +4614,148 @@ async def calculate_leave_balance(
         "status": {"$regex": "^approved$", "$options": "i"}
     }).to_list(length=200)
 
-    used_sick = 0.0
-    used_casual = 0.0
-    used_on_duty = 0.0
-    used_other = 0.0
+    # Calculate month accrual elapsed count
+    if allocation_cycle == "monthly":
+        # Calculate months elapsed from start_month to target month (e.g. 2026-08 -> 1 month)
+        try:
+            s_yr, s_mo = map(int, start_month.split("-"))
+            t_yr, t_mo = map(int, month.split("-"))
+            months_elapsed = max(1, (t_yr - s_yr) * 12 + (t_mo - s_mo) + 1)
+        except Exception:
+            months_elapsed = 1
 
-    for l in leaves:
-        norm_start = normalize_date_str(l.get("start_date", ""))
-        norm_end = normalize_date_str(l.get("end_date", ""))
-        if not norm_start:
-            continue
-        
-        # Check if overlaps with target period
-        if allocation_cycle == "monthly":
-            if not norm_start.startswith(month) and not (norm_end and norm_end.startswith(month)):
-                continue
+        if carry_forward:
+            effective_sl = base_sl * months_elapsed
+            effective_cl = base_cl * months_elapsed
+            effective_tl = base_tl * months_elapsed
+            carried_forward_tl = max(0.0, base_tl * (months_elapsed - 1))
         else:
+            effective_sl = base_sl
+            effective_cl = base_cl
+            effective_tl = base_tl
+            carried_forward_tl = 0.0
+
+        used_sick = 0.0
+        used_casual = 0.0
+        used_on_duty = 0.0
+        used_other = 0.0
+
+        for l in leaves:
+            norm_start = normalize_date_str(l.get("start_date", ""))
+            norm_end = normalize_date_str(l.get("end_date", ""))
+            if not norm_start:
+                continue
+
+            # In monthly carry-forward, count all approved leaves from start_month through target month
+            if carry_forward:
+                if norm_start < start_month or norm_start > f"{month}-31":
+                    continue
+            else:
+                if not norm_start.startswith(month) and not (norm_end and norm_end.startswith(month)):
+                    continue
+
+            l_type = str(l.get("leave_type", "other")).lower()
+            days = float(count_days_between(norm_start, norm_end or norm_start))
+            if "sick" in l_type:
+                used_sick += days
+            elif "casual" in l_type:
+                used_casual += days
+            elif "on_duty" in l_type or "duty" in l_type:
+                used_on_duty += days
+            else:
+                used_other += days
+
+        total_used = used_sick + used_casual + used_other
+        remaining_sl = max(0.0, effective_sl - used_sick)
+        remaining_cl = max(0.0, effective_cl - used_casual)
+        remaining_tl = max(0.0, effective_tl - total_used)
+
+        return {
+            "year": year,
+            "month": month,
+            "allocation_cycle": "monthly",
+            "carry_forward": carry_forward,
+            "sick_leave": {
+                "monthly_quota": round(base_sl, 2),
+                "total": round(effective_sl, 2),
+                "used": round(used_sick, 2),
+                "remaining": round(remaining_sl, 2)
+            },
+            "casual_leave": {
+                "monthly_quota": round(base_cl, 2),
+                "total": round(effective_cl, 2),
+                "used": round(used_casual, 2),
+                "remaining": round(remaining_cl, 2)
+            },
+            "total_leave": {
+                "monthly_quota": round(base_tl, 2),
+                "carried_forward": round(carried_forward_tl, 2),
+                "total": round(effective_tl, 2),
+                "used": round(total_used, 2),
+                "remaining": round(remaining_tl, 2)
+            },
+            "on_duty": {
+                "used": round(used_on_duty, 2)
+            },
+            "other": {
+                "used": round(used_other, 2)
+            }
+        }
+
+    else:
+        # Annual cycle
+        used_sick = 0.0
+        used_casual = 0.0
+        used_on_duty = 0.0
+        used_other = 0.0
+
+        for l in leaves:
+            norm_start = normalize_date_str(l.get("start_date", ""))
+            norm_end = normalize_date_str(l.get("end_date", ""))
+            if not norm_start:
+                continue
+
             if not norm_start.startswith(str(year)) and not (norm_end and norm_end.startswith(str(year))):
                 continue
 
-        l_type = str(l.get("leave_type", "other")).lower()
-        days = float(count_days_between(norm_start, norm_end or norm_start))
-        if "sick" in l_type:
-            used_sick += days
-        elif "casual" in l_type:
-            used_casual += days
-        elif "on_duty" in l_type or "duty" in l_type:
-            used_on_duty += days
-        else:
-            used_other += days
+            l_type = str(l.get("leave_type", "other")).lower()
+            days = float(count_days_between(norm_start, norm_end or norm_start))
+            if "sick" in l_type:
+                used_sick += days
+            elif "casual" in l_type:
+                used_casual += days
+            elif "on_duty" in l_type or "duty" in l_type:
+                used_on_duty += days
+            else:
+                used_other += days
 
-    total_used = used_sick + used_casual + used_other
-
-    return {
-        "year": year,
-        "month": month,
-        "allocation_cycle": allocation_cycle,
-        "sick_leave": {
-            "total": round(sick_total, 1),
-            "used": round(used_sick, 1),
-            "remaining": round(max(0.0, sick_total - used_sick), 1)
-        },
-        "casual_leave": {
-            "total": round(casual_total, 1),
-            "used": round(used_casual, 1),
-            "remaining": round(max(0.0, casual_total - used_casual), 1)
-        },
-        "total_leave": {
-            "total": round(total_total, 1),
-            "used": round(total_used, 1),
-            "remaining": round(max(0.0, total_total - total_used), 1)
-        },
-        "on_duty": {
-            "used": round(used_on_duty, 1)
-        },
-        "other": {
-            "used": round(used_other, 1)
+        total_used = used_sick + used_casual + used_other
+        return {
+            "year": year,
+            "month": month,
+            "allocation_cycle": "annual",
+            "sick_leave": {
+                "total": round(base_sl, 2),
+                "used": round(used_sick, 2),
+                "remaining": round(max(0.0, base_sl - used_sick), 2)
+            },
+            "casual_leave": {
+                "total": round(base_cl, 2),
+                "used": round(used_casual, 2),
+                "remaining": round(max(0.0, base_cl - used_casual), 2)
+            },
+            "total_leave": {
+                "total": round(base_tl, 2),
+                "used": round(total_used, 2),
+                "remaining": round(max(0.0, base_tl - total_used), 2)
+            },
+            "on_duty": {
+                "used": round(used_on_duty, 2)
+            },
+            "other": {
+                "used": round(used_other, 2)
+            }
         }
-    }
 
 
 # --- HOLIDAY ENDPOINTS ---
@@ -4859,10 +4947,14 @@ async def admin_get_leave_policy(year: Optional[int] = None, admin: dict = Depen
     })
 
     allocation_cycle = "annual"
+    carry_forward = True
+    start_month = "2026-08"
     defaults = {"sick_leave": 12.0, "casual_leave": 12.0, "total_leave": 30.0}
     overrides = {}
     if policy:
         allocation_cycle = policy.get("allocation_cycle", "annual")
+        carry_forward = policy.get("carry_forward", True)
+        start_month = policy.get("start_month", "2026-08")
         defaults = policy.get("defaults", defaults)
         overrides = policy.get("overrides", {})
 
@@ -4870,6 +4962,8 @@ async def admin_get_leave_policy(year: Optional[int] = None, admin: dict = Depen
         "organization_id": org_id,
         "year": year,
         "allocation_cycle": allocation_cycle,
+        "carry_forward": carry_forward,
+        "start_month": start_month,
         "defaults": defaults,
         "overrides": overrides
     }
@@ -4877,10 +4971,12 @@ async def admin_get_leave_policy(year: Optional[int] = None, admin: dict = Depen
 
 @app.put("/admin/leave-policy")
 async def admin_update_leave_policy(req: LeavePolicyUpdateRequest, admin: dict = Depends(get_current_admin)):
-    """Set organization-wide default leave quotas (SL, CL, TL) and allocation cycle."""
+    """Set organization-wide default leave quotas (SL, CL, TL), allocation cycle, and carry forward."""
     org_id = admin.organization_id or "system_org"
     year = req.year or datetime.now(timezone.utc).year
     allocation_cycle = (req.allocation_cycle or "annual").strip().lower()
+    carry_forward = bool(req.carry_forward if req.carry_forward is not None else True)
+    start_month = req.start_month or "2026-08"
 
     defaults = {
         "sick_leave": float(req.sick_leave),
@@ -4895,6 +4991,8 @@ async def admin_update_leave_policy(req: LeavePolicyUpdateRequest, admin: dict =
                 "organization_id": org_id,
                 "year": year,
                 "allocation_cycle": allocation_cycle,
+                "carry_forward": carry_forward,
+                "start_month": start_month,
                 "defaults": defaults,
                 "updated_by": admin.email,
                 "updated_at": datetime.now(timezone.utc)
@@ -4907,6 +5005,8 @@ async def admin_update_leave_policy(req: LeavePolicyUpdateRequest, admin: dict =
         "status": "success",
         "message": f"Leave policy updated for {year}",
         "allocation_cycle": allocation_cycle,
+        "carry_forward": carry_forward,
+        "start_month": start_month,
         "defaults": defaults
     }
 
@@ -6159,6 +6259,23 @@ async def get_employee_monthly_summary(
             rl["end_date"] = norm_e or norm_s
             leaves.append(rl)
 
+    raw_pending = await leave_requests_collection.find({
+        "$or": [
+            {"employee_id": {"$in": emp_identifiers}},
+            {"email": {"$in": emp_identifiers}}
+        ],
+        "status": {"$regex": "^pending$", "$options": "i"}
+    }).to_list(length=100)
+
+    pending_leaves = []
+    for rp in raw_pending:
+        norm_s = normalize_date_str(rp.get("start_date", ""))
+        norm_e = normalize_date_str(rp.get("end_date", ""))
+        if norm_s:
+            rp["start_date"] = norm_s
+            rp["end_date"] = norm_e or norm_s
+            pending_leaves.append(rp)
+
     # 4. Process Data Day by Day
     daily_breakdown = []
     total_working_ms = 0
@@ -6265,10 +6382,25 @@ async def get_employee_monthly_summary(
                 leaves_count += 1
                 break
 
-        # 2. Check for Configured Holidays / Days Off / Weekend
+        # 2. Check for Pending Leave on this day
+        is_pending_leave = False
+        pending_label = None
+        if not is_on_leave:
+            for pl in pending_leaves:
+                s_date = str(pl.get("start_date", ""))[:10]
+                e_date = str(pl.get("end_date", ""))[:10]
+                if s_date and e_date and (s_date <= day_str <= e_date):
+                    l_type = pl.get("leave_type", "General")
+                    pending_label = f"Pending Leave ({l_type})"
+                    is_pending_leave = True
+                    break
+
+        # 3. Check for Configured Holidays / Days Off / Weekend
         day_num = current_day_local.day
         if is_on_leave:
             day_info["status"] = leave_label
+        elif is_pending_leave and not day_logs:
+            day_info["status"] = pending_label
         elif day_num in days_off_set:
             if current_day_local.weekday() >= 5:
                 day_info["status"] = "Weekend"
@@ -6358,7 +6490,7 @@ async def get_employee_monthly_summary(
                 day_info["status"] = "Present"
 
         else:
-            # Not present: only increment absent if status is actually Absent (not leave, not weekend, not holiday)
+            # Not present: only increment absent if status is actually Absent (not leave, not pending leave, not weekend, not holiday)
             if day_info["status"] == "Absent":
                 absent_days += 1
 
@@ -6366,7 +6498,7 @@ async def get_employee_monthly_summary(
         current_day_local = next_day_local
 
     # Calculate holiday count from breakdown
-    holiday_days_count = sum(1 for d in daily_breakdown if d.get("status") not in ["Present", "Late", "Early Leave", "Absent", "Weekend"] and not str(d.get("status", "")).startswith("Leave"))
+    holiday_days_count = sum(1 for d in daily_breakdown if d.get("status") not in ["Present", "Late", "Early Leave", "Absent", "Weekend"] and not str(d.get("status", "")).startswith("Leave") and not str(d.get("status", "")).startswith("Pending Leave"))
     
     # Live leave balance for this year and month
     leave_balance = await calculate_leave_balance(email, org_id or "system_org", year, month)
@@ -6386,7 +6518,7 @@ async def get_employee_monthly_summary(
             "total_working_hours": total_hours,
             "average_daily_hours": avg_hours,
             "present_days": present_days,
-            "leaves_taken": len(leaves),
+            "leaves_taken": leaves_count,
             "absent_days": absent_days,
             "holiday_days": holiday_days_count,
             "total_days_evaluated": len(daily_breakdown),
