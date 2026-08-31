@@ -4552,9 +4552,10 @@ async def calculate_leave_balance(
     email: str,
     org_id: str,
     year: Optional[int] = None,
-    month: Optional[str] = None
+    month: Optional[str] = None,
+    absent_days: float = 0.0
 ) -> dict:
-    """Calculate SL, CL, and Total Leaves remaining for an employee (supports annual & monthly allocation with carry-forward)."""
+    """Calculate SL, CL, and Total Leaves remaining for an employee (supports annual & monthly allocation with carry-forward and absent deductions)."""
     now = datetime.now(timezone.utc)
     if not year:
         year = now.year
@@ -4665,7 +4666,7 @@ async def calculate_leave_balance(
             else:
                 used_other += days
 
-        total_used = used_sick + used_casual + used_other
+        total_used = used_sick + used_casual + used_other + float(absent_days)
         remaining_sl = max(0.0, effective_sl - used_sick)
         remaining_cl = max(0.0, effective_cl - used_casual)
         remaining_tl = max(0.0, effective_tl - total_used)
@@ -4729,7 +4730,7 @@ async def calculate_leave_balance(
             else:
                 used_other += days
 
-        total_used = used_sick + used_casual + used_other
+        total_used = used_sick + used_casual + used_other + float(absent_days)
         return {
             "year": year,
             "month": month,
@@ -6500,8 +6501,8 @@ async def get_employee_monthly_summary(
     # Calculate holiday count from breakdown
     holiday_days_count = sum(1 for d in daily_breakdown if d.get("status") not in ["Present", "Late", "Early Leave", "Absent", "Weekend"] and not str(d.get("status", "")).startswith("Leave") and not str(d.get("status", "")).startswith("Pending Leave"))
     
-    # Live leave balance for this year and month
-    leave_balance = await calculate_leave_balance(email, org_id or "system_org", year, month)
+    # Live leave balance for this year and month (including unexcused absent days in total deduction)
+    leave_balance = await calculate_leave_balance(email, org_id or "system_org", year, month, absent_days=absent_days)
 
     total_hours = round(total_working_ms / (1000 * 3600), 2)
     avg_hours = round(total_hours / present_days, 2) if present_days > 0 else 0
