@@ -8,7 +8,7 @@ from database import (
     payrolls_collection, employees_collection,
     attendance_logs_collection, leave_requests_collection,
     km_reimbursements_collection, expense_claims_collection,
-    holidays_collection
+    holidays_collection, leave_policies_collection
 )
 from models import Admin
 from auth import get_current_admin
@@ -68,21 +68,23 @@ def count_working_days(year: int, month: int) -> int:
             working_days += 1
     return working_days
 
-def calculate_payslip_fields(ctc: float, working_days: int, present_days: int, leave_days: int, 
+def calculate_payslip_fields(ctc: float, working_days: int, present_days: float,
+                             paid_leave_days: float = 0.0, unpaid_leave_days: float = 0.0,
+                             short_leave_penalty_days: float = 0.0, leave_days: Optional[float] = None,
                              overtime_hours: float = 0.0, bonus: float = 0.0, other_earnings: float = 0.0,
                              reimbursements: float = 0.0,
                              loan_deductions: float = 0.0, advance_deductions: float = 0.0, other_deductions: float = 0.0,
                              salary_structure: dict = None):
-    """Core salary engine."""
+    """Core enterprise salary engine with Loss of Pay (LOP) integration."""
     monthly_salary = ctc / 12.0
     
     if salary_structure and salary_structure.get("basic_salary"):
-        basic_salary = salary_structure["basic_salary"]
+        basic_salary = float(salary_structure["basic_salary"])
     else:
         basic_salary = monthly_salary * 0.40  # Default 40%
         
     if salary_structure and salary_structure.get("hra"):
-        hra = salary_structure["hra"]
+        hra = float(salary_structure["hra"])
     else:
         hra = basic_salary * 0.50  # Default 50% of basic
         
@@ -90,17 +92,21 @@ def calculate_payslip_fields(ctc: float, working_days: int, present_days: int, l
     if special_allowance < 0:
         special_allowance = 0.0
         
-    # Calculate absent days
-    absent_days = max(0, working_days - present_days - leave_days)
+    if leave_days is not None and paid_leave_days == 0.0 and unpaid_leave_days == 0.0:
+        paid_leave_days = float(leave_days)
+
+    # Calculate unexcused absent days
+    absent_days = max(0.0, float(working_days) - float(present_days) - float(paid_leave_days) - float(unpaid_leave_days))
+    
+    # Total Loss of Pay (LOP) Days = Unexcused Absents + Unpaid Leaves + Short Leave penalties
+    lop_days = round(absent_days + float(unpaid_leave_days) + float(short_leave_penalty_days), 2)
     
     # Loss of Pay deduction
     daily_wage = monthly_salary / max(1, working_days)
-    lop_deduction = daily_wage * absent_days
+    lop_deduction = daily_wage * lop_days
     
     # Net attendance salary
-    attendance_salary = monthly_salary - lop_deduction
-    if attendance_salary < 0:
-        attendance_salary = 0.0
+    attendance_salary = max(0.0, monthly_salary - lop_deduction)
         
     # Overtime (hourly rate x 1.5)
     hourly_rate = daily_wage / 8.0
@@ -160,9 +166,7 @@ def calculate_payslip_fields(ctc: float, working_days: int, present_days: int, l
     monthly_tds = annual_tax / 12.0
     
     total_deductions = pf_employee + esi_employee + professional_tax + monthly_tds + loan_deductions + advance_deductions + other_deductions
-    net_salary = gross_salary - total_deductions + reimbursements
-    if net_salary < 0:
-        net_salary = 0.0
+    net_salary = max(0.0, gross_salary - total_deductions + reimbursements)
         
     return {
         "ctc": ctc,
@@ -171,7 +175,11 @@ def calculate_payslip_fields(ctc: float, working_days: int, present_days: int, l
         "hra": round(hra, 2),
         "special_allowance": round(special_allowance, 2),
         "daily_wage": round(daily_wage, 2),
-        "absent_days": absent_days,
+        "absent_days": round(absent_days, 2),
+        "paid_leave_days": round(float(paid_leave_days), 2),
+        "unpaid_leave_days": round(float(unpaid_leave_days), 2),
+        "short_leave_penalty_days": round(float(short_leave_penalty_days), 2),
+        "lop_days": round(lop_days, 2),
         "lop_deduction": round(lop_deduction, 2),
         "attendance_salary": round(attendance_salary, 2),
         "overtime_amount": round(overtime_amount, 2),
@@ -187,10 +195,10 @@ def calculate_payslip_fields(ctc: float, working_days: int, present_days: int, l
     }
 
 async def fetch_attendance_data(employee_email: str, org_id: str, payroll_month: str):
-    """Fetch working days, present days, and leave days for the month, accounting for paid days off."""
+    """Fetch working days, present days, paid leaves, unpaid leaves (LOP), and short-leave penalties for the month."""
     emp = await employees_collection.find_one({"email": employee_email, "organization_id": org_id})
     if not emp:
-        return 0, 0, 0, 0
+        return 0, 0.0, 0.0, 0.0, 0.0, 0.0
         
     emp_id = str(emp["_id"])
     year, month = map(int, payroll_month.split("-"))
@@ -213,15 +221,14 @@ async def fetch_attendance_data(employee_email: str, org_id: str, payroll_month:
         })
     
     if days_off_doc:
-        days_off = days_off_doc.get("days_off", [])
+        days_off = set(days_off_doc.get("days_off", []))
     else:
-        # Default: Sundays are off
-        days_off = []
+        days_off = set()
         for day in range(1, num_days + 1):
             dt = datetime(year, month, day)
-            if dt.weekday() == 6: # Sunday
-                days_off.append(day)
-                
+            if dt.weekday() == 6:  # Sunday
+                days_off.add(day)
+
     # Dates for querying logs (UTC boundaries)
     start_dt = datetime(year, month, 1, tzinfo=timezone.utc)
     if month == 12:
@@ -229,21 +236,75 @@ async def fetch_attendance_data(employee_email: str, org_id: str, payroll_month:
     else:
         end_dt = datetime(year, month + 1, 1, tzinfo=timezone.utc)
 
-    # 2. Present days count on actual work days
-    cursor = attendance_logs_collection.find({
-        "user_id": emp_id,
-        "type": "check-in",
-        "timestamp": {"$gte": start_dt, "$lt": end_dt}
+    # Fetch Leave Policy
+    policy = await leave_policies_collection.find_one({
+        "$or": [
+            {"organization_id": org_id, "year": year},
+            {"organization_id": "system_org", "year": year},
+            {"organization_id": org_id},
+            {"organization_id": "system_org"}
+        ]
     })
-    logs = await cursor.to_list(length=100)
-    
-    present_dates = set()
+    paid_leave_types = ["sick", "casual", "on_duty", "duty"]
+    half_day_min_hours = 4.0
+    full_day_min_hours = 8.0
+    short_leave_monthly_limit = 2
+    if policy:
+        paid_leave_types = policy.get("paid_leave_types", paid_leave_types)
+        half_day_min_hours = float(policy.get("half_day_min_hours", 4.0))
+        full_day_min_hours = float(policy.get("full_day_min_hours", 8.0))
+        short_leave_monthly_limit = int(policy.get("short_leave_monthly_limit", 2))
+
+    # 2. Fetch Attendance Logs to evaluate daily hours and presence
+    cursor_logs = attendance_logs_collection.find({
+        "user_id": emp_id,
+        "timestamp": {"$gte": start_dt, "$lt": end_dt}
+    }).sort("timestamp", 1)
+    logs = await cursor_logs.to_list(length=500)
+
+    daily_logs = {}
     for log in logs:
         ts = log["timestamp"]
         ist_ts = ts + timedelta(hours=5, minutes=30)
-        present_dates.add(ist_ts.day)
+        d_num = ist_ts.day
+        if d_num not in daily_logs:
+            daily_logs[d_num] = []
+        daily_logs[d_num].append(log)
 
-    # 3. Approved leave days overlapping this month (flexible identifier matching)
+    check_ins_presence = 0.0
+    early_leaves_count = 0
+
+    for d_num, d_logs in daily_logs.items():
+        if d_num in days_off:
+            continue
+        
+        checkins = [l for l in d_logs if l.get("type") == "check-in"]
+        checkouts = [l for l in d_logs if l.get("type") == "check-out"]
+        
+        if not checkins:
+            continue
+            
+        first_in = checkins[0]["timestamp"]
+        last_out = checkouts[-1]["timestamp"] if checkouts else first_in
+        duration_hours = max(0.0, (last_out - first_in).total_seconds() / 3600.0)
+        
+        if duration_hours >= full_day_min_hours:
+            check_ins_presence += 1.0
+        elif duration_hours >= half_day_min_hours:
+            check_ins_presence += 0.5
+        elif len(checkins) > 0:
+            check_ins_presence += 0.5
+        else:
+            check_ins_presence += 1.0
+
+        if checkouts:
+            last_ts = checkouts[-1]["timestamp"] + timedelta(hours=5, minutes=30)
+            if last_ts.hour < 17:
+                early_leaves_count += 1
+
+    present_days = check_ins_presence + len(days_off)
+
+    # 3. Approved leave days (with duration and paid status)
     emp_identifiers = [employee_email.strip().lower(), employee_email.strip(), emp_id]
     if "employee_id" in emp and emp["employee_id"]:
         emp_identifiers.append(str(emp["employee_id"]).strip())
@@ -255,37 +316,57 @@ async def fetch_attendance_data(employee_email: str, org_id: str, payroll_month:
         ],
         "status": {"$regex": "^approved$", "$options": "i"}
     })
-    leaves = await cursor_leaves.to_list(length=100)
-    
-    leave_dates = set()
+    leaves = await cursor_leaves.to_list(length=200)
+
+    paid_leave_days = 0.0
+    unpaid_leave_days = 0.0
     start_month_str = start_dt.strftime("%Y-%m-%d")
     end_month_str = (end_dt - timedelta(days=1)).strftime("%Y-%m-%d")
-    
+
     for l in leaves:
-        l_start = l["start_date"]
-        l_end = l["end_date"]
-        overlap_start = max(start_month_str, l_start)
-        overlap_end = min(end_month_str, l_end)
-        
-        if overlap_start <= overlap_end:
-            cur_dt = datetime.strptime(overlap_start, "%Y-%m-%d")
-            end_dt_loop = datetime.strptime(overlap_end, "%Y-%m-%d")
-            while cur_dt <= end_dt_loop:
-                leave_dates.add(cur_dt.day)
-                cur_dt += timedelta(days=1)
-                
-    # Present days = check-ins on working days + days off (paid)
-    check_ins_on_work_days = sum(1 for d in present_dates if d not in days_off)
-    present_days = check_ins_on_work_days + len(days_off)
-    
-    # Leave days = approved leaves on working days
-    leave_days = sum(1 for d in leave_dates if d not in days_off)
-    
-    # Absent days = actual working days where employee did not check in and had no leave
+        l_start = str(l.get("start_date", ""))
+        l_end = str(l.get("end_date", l_start))
+        if not l_start:
+            continue
+            
+        if l_start <= end_month_str and l_end >= start_month_str:
+            dur_type = str(l.get("duration_type", "")).lower().strip()
+            if l.get("duration") is not None:
+                dur = float(l["duration"])
+            elif dur_type in ["first_half", "second_half", "half_day"]:
+                dur = 0.5
+            elif dur_type == "short_leave":
+                dur = 0.0
+                early_leaves_count += 1
+            else:
+                cur_dt = max(datetime.strptime(l_start[:10], "%Y-%m-%d"), datetime.strptime(start_month_str, "%Y-%m-%d"))
+                end_dt_loop = min(datetime.strptime(l_end[:10], "%Y-%m-%d"), datetime.strptime(end_month_str, "%Y-%m-%d"))
+                dur = 0.0
+                while cur_dt <= end_dt_loop:
+                    if cur_dt.day not in days_off:
+                        dur += 1.0
+                    cur_dt += timedelta(days=1)
+
+            l_type = str(l.get("leave_type", "other")).lower().strip()
+            if l.get("is_paid") is not None:
+                is_p = bool(l.get("is_paid"))
+            else:
+                is_p = any(pt in l_type for pt in paid_leave_types)
+
+            if is_p and "on_duty" not in l_type and "duty" not in l_type:
+                paid_leave_days += dur
+            elif not is_p and "on_duty" not in l_type and "duty" not in l_type:
+                unpaid_leave_days += dur
+
+    short_leave_penalty_days = 0.0
+    if early_leaves_count > short_leave_monthly_limit:
+        excess_short = early_leaves_count - short_leave_monthly_limit
+        short_leave_penalty_days = round((excess_short // 2) * 0.5, 2)
+
     actual_work_days = num_days - len(days_off)
-    absent_days = max(0, actual_work_days - check_ins_on_work_days - leave_days)
+    absent_days = max(0.0, float(actual_work_days) - float(check_ins_presence) - float(paid_leave_days) - float(unpaid_leave_days))
     
-    return working_days, present_days, leave_days, absent_days
+    return working_days, present_days, paid_leave_days, unpaid_leave_days, absent_days, short_leave_penalty_days
 
 @router.get("")
 async def list_payrolls(payroll_month: Optional[str] = None, department: Optional[str] = None, status: Optional[str] = None, current_admin: Admin = Depends(get_current_admin)):
@@ -427,12 +508,20 @@ async def calculate_employee_payroll(payload: PayrollCreate, current_admin: Admi
     w_days = payload.working_days
     p_days = payload.present_days
     l_days = payload.leave_days
+    paid_l_days = 0.0
+    unpaid_l_days = 0.0
+    short_penalty_days = 0.0
     
     if w_days is None or p_days is None or l_days is None:
-        fetched_w, fetched_p, fetched_l, fetched_a = await fetch_attendance_data(email_clean, org_id, payload.payroll_month)
+        fetched_w, fetched_p, fetched_paid_l, fetched_unpaid_l, fetched_a, fetched_short_pen = await fetch_attendance_data(email_clean, org_id, payload.payroll_month)
         w_days = w_days if w_days is not None else fetched_w
         p_days = p_days if p_days is not None else fetched_p
-        l_days = l_days if l_days is not None else fetched_l
+        paid_l_days = fetched_paid_l
+        unpaid_l_days = fetched_unpaid_l
+        short_penalty_days = fetched_short_pen
+        l_days = l_days if l_days is not None else (fetched_paid_l + fetched_unpaid_l)
+    else:
+        paid_l_days = float(l_days)
 
     # Fetch travel reimbursements and expenses
     travel_reimb, exp_claims = await fetch_approved_claims_and_reimbursements(email_clean, org_id, payload.payroll_month)
@@ -443,6 +532,9 @@ async def calculate_employee_payroll(payload: PayrollCreate, current_admin: Admi
         ctc=salary_structure.get("ctc", 0.0),
         working_days=w_days,
         present_days=p_days,
+        paid_leave_days=paid_l_days,
+        unpaid_leave_days=unpaid_l_days,
+        short_leave_penalty_days=short_penalty_days,
         leave_days=l_days,
         overtime_hours=payload.overtime_hours,
         bonus=payload.bonus,
@@ -467,7 +559,11 @@ async def calculate_employee_payroll(payload: PayrollCreate, current_admin: Admi
         "working_days": w_days,
         "present_days": p_days,
         "leave_days": l_days,
+        "paid_leave_days": results["paid_leave_days"],
+        "unpaid_leave_days": results["unpaid_leave_days"],
+        "short_leave_penalty_days": results["short_leave_penalty_days"],
         "absent_days": results["absent_days"],
+        "lop_days": results["lop_days"],
         
         "ctc": results["ctc"],
         "monthly_salary": results["monthly_salary"],
@@ -568,7 +664,7 @@ async def run_monthly_payroll(payload: PayrollRunRequest, current_admin: Admin =
             if existing and existing["status"] != PayrollStatus.DRAFT:
                 continue # Skip approved/paid records
                 
-            w_days, p_days, l_days, a_days = await fetch_attendance_data(emp["email"], emp_org_id, payload.payroll_month)
+            w_days, p_days, paid_l, unpaid_l, a_days, short_pen = await fetch_attendance_data(emp["email"], emp_org_id, payload.payroll_month)
             salary_structure = emp["salary_structure"]
             
             # Fetch travel reimbursements and expenses
@@ -579,7 +675,9 @@ async def run_monthly_payroll(payload: PayrollRunRequest, current_admin: Admin =
                 ctc=salary_structure.get("ctc", 0.0),
                 working_days=w_days,
                 present_days=p_days,
-                leave_days=l_days,
+                paid_leave_days=paid_l,
+                unpaid_leave_days=unpaid_l,
+                short_leave_penalty_days=short_pen,
                 other_earnings=0.0,
                 reimbursements=reimbursements,
                 salary_structure=salary_structure
@@ -596,8 +694,12 @@ async def run_monthly_payroll(payload: PayrollRunRequest, current_admin: Admin =
                 
                 "working_days": w_days,
                 "present_days": p_days,
-                "leave_days": l_days,
+                "leave_days": paid_l + unpaid_l,
+                "paid_leave_days": results["paid_leave_days"],
+                "unpaid_leave_days": results["unpaid_leave_days"],
+                "short_leave_penalty_days": results["short_leave_penalty_days"],
                 "absent_days": results["absent_days"],
+                "lop_days": results["lop_days"],
                 
                 "ctc": results["ctc"],
                 "monthly_salary": results["monthly_salary"],
@@ -693,7 +795,9 @@ async def edit_payroll_draft(id: str, updates: dict, current_admin: Admin = Depe
         ctc=p["ctc"],
         working_days=p["working_days"],
         present_days=p["present_days"],
-        leave_days=p["leave_days"],
+        paid_leave_days=p.get("paid_leave_days", p.get("leave_days", 0.0)),
+        unpaid_leave_days=p.get("unpaid_leave_days", 0.0),
+        short_leave_penalty_days=p.get("short_leave_penalty_days", 0.0),
         overtime_hours=overtime_hours,
         bonus=bonus,
         other_earnings=other_earnings,
@@ -718,6 +822,8 @@ async def edit_payroll_draft(id: str, updates: dict, current_admin: Admin = Depe
         "loan_deductions": loan_deductions,
         "advance_deductions": advance_deductions,
         "other_deductions": other_deductions,
+        "lop_deduction": results["lop_deduction"],
+        "attendance_salary": results["attendance_salary"],
         "gross_salary": results["gross_salary"],
         "pf_employee": results["pf_employee"],
         "pf_employer": results["pf_employer"],

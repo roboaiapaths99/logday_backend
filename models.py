@@ -495,6 +495,14 @@ class LeaveType(str, Enum):
     CASUAL = "casual"
     ON_DUTY = "on_duty"
     OTHER = "other"
+    UNPAID = "unpaid"
+
+
+class LeaveDuration(str, Enum):
+    FULL_DAY = "full_day"
+    FIRST_HALF = "first_half"
+    SECOND_HALF = "second_half"
+    SHORT_LEAVE = "short_leave"
 
 
 class LeaveStatus(str, Enum):
@@ -519,6 +527,12 @@ class LeaveRequest(BaseModel):
     start_date: str  # YYYY-MM-DD
     end_date: str    # YYYY-MM-DD
     reason: str
+    duration_type: Optional[str] = "full_day"  # full_day, first_half, second_half, short_leave
+    duration: Optional[float] = 1.0  # 1.0 for full day, 0.5 for half day, 0.0 for short leave
+    short_leave_hours: Optional[float] = None
+    is_paid: Optional[bool] = None  # None = auto-calculated, True = explicitly Paid, False = explicitly LOP
+    exceeds_quota: Optional[bool] = False
+    admin_notes: Optional[str] = None
     status: LeaveStatus = LeaveStatus.PENDING
     proof_url: Optional[str] = None
     discussion: List[DiscussionMessage] = []
@@ -657,6 +671,14 @@ class LeavePolicyUpdateRequest(BaseModel):
     sick_leave: float = 12.0
     casual_leave: float = 12.0
     total_leave: float = 30.0
+    paid_leave_types: Optional[List[str]] = ["sick", "casual", "on_duty"]
+    unpaid_leave_types: Optional[List[str]] = ["other", "unpaid"]
+    half_day_min_hours: Optional[float] = 4.0
+    full_day_min_hours: Optional[float] = 8.0
+    late_grace_mins: Optional[int] = 15
+    short_leave_monthly_limit: Optional[int] = 2
+    short_leave_max_hours: Optional[float] = 2.0
+    short_leave_penalty_rule: Optional[str] = "half_day_per_2_excess"
 
 
 class EmployeeLeaveQuotaUpdateRequest(BaseModel):
@@ -666,3 +688,5 @@ class EmployeeLeaveQuotaUpdateRequest(BaseModel):
     sick_leave: float
     casual_leave: float
     total_leave: float
+    paid_leave_types: Optional[List[str]] = None
+    unpaid_leave_types: Optional[List[str]] = None

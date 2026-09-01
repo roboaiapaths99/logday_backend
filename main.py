@@ -4142,7 +4142,7 @@ async def get_admin_live_feed(skip: int = 0, limit: int = 50, admin: dict = Depe
 
 @app.post("/api/leave/request")
 async def create_leave_request(req: dict, employee=Depends(get_current_employee)):
-    """Submit a new Leave or On-Duty (OD) request with optional proof (base64 image)."""
+    """Submit a new Leave or On-Duty (OD) request with optional duration (full_day, half_day, short_leave) and proof."""
     try:
         proof_file_url = None
         if req.get("proof_url") and req["proof_url"].startswith("data:image"):
@@ -4168,22 +4168,52 @@ async def create_leave_request(req: dict, employee=Depends(get_current_employee)
                 logger.info(f"Proof uploaded and saved to {proof_file_url}")
             except Exception as upload_err:
                 logger.error(f"Failed to process proof upload: {upload_err}")
-                # We'll continue without the proof if it fails, or we could raise an error
+                # We'll continue without the proof if it fails
         
+        start_date = normalize_date_str(req.get("start_date", ""))
+        end_date = normalize_date_str(req.get("end_date", start_date))
+        duration_type = str(req.get("duration_type", "full_day")).lower().strip()
+        
+        if duration_type in ["first_half", "second_half", "half_day"]:
+            duration = 0.5
+        elif duration_type == "short_leave":
+            duration = 0.0
+        else:
+            duration_type = "full_day"
+            duration = float(count_days_between(start_date, end_date))
+
+        # Check live quota to flag if this request exceeds current available quota
+        org_id = employee.get("organization_id", "system_org")
+        target_month = start_date[:7] if start_date else None
+        live_balance = await calculate_leave_balance(employee["email"], org_id, month=target_month)
+        rem_tl = live_balance.get("total_leave", {}).get("remaining", 0.0)
+        exceeds_quota = (duration > rem_tl) and (req.get("leave_type") not in ["on_duty", "duty"])
+
         new_request = {
             "employee_id": employee["email"],
-            "organization_id": employee.get("organization_id", "system_org"),
-            "leave_type": req["leave_type"], # sick, casual, on_duty, other
-            "start_date": req["start_date"],
-            "end_date": req["end_date"],
+            "organization_id": org_id,
+            "leave_type": req["leave_type"],  # sick, casual, on_duty, other, unpaid
+            "start_date": start_date,
+            "end_date": end_date,
+            "duration_type": duration_type,
+            "duration": duration,
+            "short_leave_hours": float(req.get("short_leave_hours", 2.0)) if duration_type == "short_leave" else None,
             "reason": req["reason"],
+            "is_paid": req.get("is_paid"),  # None = auto, True = Paid, False = LOP
+            "exceeds_quota": exceeds_quota,
             "status": "pending",
             "proof_url": proof_file_url or req.get("proof_url"),
             "discussion": [],
             "created_at": datetime.now(timezone.utc)
         }
         result = await leave_requests_collection.insert_one(new_request)
-        return {"status": "success", "request_id": str(result.inserted_id), "proof_url": proof_file_url}
+        return {
+            "status": "success",
+            "request_id": str(result.inserted_id),
+            "proof_url": proof_file_url,
+            "exceeds_quota": exceeds_quota,
+            "duration": duration
+        }
     except Exception as e:
         logger.error(f"Failed to create leave request: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to submit request")
@@ -4233,57 +4263,63 @@ async def get_team_attendance(manager=Depends(get_current_employee)):
 
 @app.get("/api/manager/pending-leaves")
 async def get_pending_leaves(manager=Depends(get_current_employee)):
-    """Fetch pending leave requests from my team members."""
-    subordinates = await employees_collection.find({"manager_id": manager["email"]}).to_list(length=100)
+    """Fetch pending leave requests for subordinates."""
+    cursor = employees_collection.find({"manager_id": manager["email"]})
+    subordinates = await cursor.to_list(length=100)
     sub_emails = [s["email"] for s in subordinates]
     
-    cursor = leave_requests_collection.find({
+    requests = await leave_requests_collection.find({
         "employee_id": {"$in": sub_emails},
         "status": "pending"
-    }).sort("created_at", -1)
+    }).sort("created_at", -1).to_list(length=100)
     
-    requests = await cursor.to_list(length=100)
-    results = []
-    for req in requests:
-        emp = next((s for s in subordinates if s["email"] == req["employee_id"]), None)
-        emp_name = emp["full_name"] if emp else req["employee_id"]
-        
-        results.append({
-            "id": str(req["_id"]),
-            "full_name": emp_name,
-            "employee_id": req["employee_id"],
-            "reason": req["reason"],
-            "start_date": req["start_date"],
-            "end_date": req["end_date"],
-            "status": req["status"],
-            "proof_url": req.get("proof_url")
-        })
-    return results
+    for r in requests:
+        r["_id"] = str(r["_id"])
+        if isinstance(r.get("created_at"), datetime):
+            r["created_at"] = r["created_at"].isoformat()
+    return requests
 
-@app.post("/api/leave/request/{request_id}/approve")
-async def manager_approve_leave(request_id: str, payload: dict, manager=Depends(get_current_employee)):
-    """Allow a manager to approve/reject leave for their team."""
-    status = payload.get("status")
-    if status not in ["approved", "rejected"]:
-        raise HTTPException(status_code=400, detail="Invalid status. Use 'approved' or 'rejected'.")
+@app.post("/api/manager/leave-decision")
+async def leave_decision(payload: dict, manager=Depends(get_current_employee)):
+    """Approve or reject a leave request (Manager level)."""
+    try:
+        req_id = payload.get("request_id")
+        action = payload.get("action") # "approve" or "reject"
+        is_paid = payload.get("is_paid")
+        admin_notes = payload.get("admin_notes")
         
-    leave_req = await leave_requests_collection.find_one({"_id": ObjectId(request_id)})
-    if not leave_req:
-        raise HTTPException(status_code=404, detail="Leave request not found")
-        
-    emp = await employees_collection.find_one({"email": leave_req["employee_id"], "manager_id": manager["email"]})
-    if not emp:
-         raise HTTPException(status_code=403, detail="Forbidden: You can only manage leaves for your direct reports.")
-         
-    await leave_requests_collection.update_one(
-        {"_id": ObjectId(request_id)},
-        {"$set": {
+        if action not in ["approve", "reject"]:
+            raise HTTPException(status_code=400, detail="Invalid action")
+            
+        obj_id = ObjectId(req_id)
+        leave_req = await leave_requests_collection.find_one({"_id": obj_id})
+        if not leave_req:
+            raise HTTPException(status_code=404, detail="Request not found")
+            
+        # Verify manager owns this subordinate
+        emp = await employees_collection.find_one({"email": leave_req["employee_id"], "manager_id": manager["email"]})
+        if not emp:
+            raise HTTPException(status_code=403, detail="Unauthorized")
+            
+        status = "approved" if action == "approve" else "rejected"
+        update_doc = {
             "status": status,
             "processed_at": datetime.now(timezone.utc),
             "processed_by": manager["email"]
-        }}
-    )
-    return {"status": "success", "new_status": status}
+        }
+        if is_paid is not None:
+            update_doc["is_paid"] = bool(is_paid)
+        if admin_notes:
+            update_doc["admin_notes"] = admin_notes
+            
+        await leave_requests_collection.update_one(
+            {"_id": obj_id},
+            {"$set": update_doc}
+        )
+        return {"status": "success", "new_status": status}
+    except Exception as e:
+        logger.error(f"Failed to process leave decision: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/admin/leave/requests")
 async def admin_get_leave_requests(status: Optional[str] = None, admin: dict = Depends(get_current_admin)):
@@ -4403,8 +4439,8 @@ async def post_leave_message(request_id: str, payload: dict, auth_data=Depends(g
     return {"status": "success"}
 
 @app.post("/admin/leave/requests/{request_id}/{action}")
-async def handle_leave_request(request_id: str, action: str, admin: dict = Depends(get_current_admin)):
-    """Handle (Approve/Reject/Cancel) a leave request (Role Scoped)."""
+async def handle_leave_request(request_id: str, action: str, req_body: Optional[dict] = None, admin: dict = Depends(get_current_admin)):
+    """Handle (Approve/Reject/Cancel) a leave request with optional is_paid flag."""
     try:
         obj_id = ObjectId(request_id)
     except Exception:
@@ -4434,16 +4470,49 @@ async def handle_leave_request(request_id: str, action: str, admin: dict = Depen
         raise HTTPException(status_code=403, detail="Access denied: This request belongs to another organization.")
 
     # 3. Update Request
-    result = await leave_requests_collection.update_one(
+    update_fields = {
+        "status": status_map[action],
+        "processed_at": datetime.now(timezone.utc),
+        "processed_by": admin.email
+    }
+    if req_body and isinstance(req_body, dict):
+        if "is_paid" in req_body and req_body["is_paid"] is not None:
+            update_fields["is_paid"] = bool(req_body["is_paid"])
+        if "admin_notes" in req_body and req_body["admin_notes"]:
+            update_fields["admin_notes"] = str(req_body["admin_notes"])
+
+    await leave_requests_collection.update_one(
         {"_id": obj_id},
-        {"$set": {
-            "status": status_map[action],
-            "processed_at": datetime.now(timezone.utc),
-            "processed_by": admin.email
-        }}
+        {"$set": update_fields}
     )
         
-    return {"status": "success"}
+    return {"status": "success", "new_status": status_map[action]}
+
+@app.put("/admin/leave/requests/{request_id}/payment-status")
+async def toggle_leave_payment_status(request_id: str, req_body: dict, admin: dict = Depends(get_current_admin)):
+    """Toggle whether an approved leave is Paid or Loss of Pay (LOP) for payroll."""
+    try:
+        obj_id = ObjectId(request_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid request ID")
+
+    leave_req = await leave_requests_collection.find_one({"_id": obj_id})
+    if not leave_req:
+        raise HTTPException(status_code=404, detail="Leave request not found")
+
+    is_paid = req_body.get("is_paid")
+    if is_paid is None:
+        raise HTTPException(status_code=400, detail="is_paid (boolean) is required")
+
+    await leave_requests_collection.update_one(
+        {"_id": obj_id},
+        {"$set": {
+            "is_paid": bool(is_paid),
+            "payment_status_updated_by": admin.email,
+            "payment_status_updated_at": datetime.now(timezone.utc)
+        }}
+    )
+    return {"status": "success", "is_paid": bool(is_paid), "message": f"Leave marked as {'Paid' if is_paid else 'Loss of Pay (LOP)'}"}
 
 
 # -----------------------------------------------------------------------------
@@ -4555,7 +4624,7 @@ async def calculate_leave_balance(
     month: Optional[str] = None,
     absent_days: float = 0.0
 ) -> dict:
-    """Calculate SL, CL, and Total Leaves remaining for an employee (supports annual & monthly allocation with carry-forward and absent deductions)."""
+    """Enterprise SL, CL, TL, and Loss of Pay (LOP) balance calculation engine with true month-by-month accrual, carry-forward, and half-day support."""
     now = datetime.now(timezone.utc)
     if not year:
         year = now.year
@@ -4574,14 +4643,32 @@ async def calculate_leave_balance(
 
     allocation_cycle = "annual"
     carry_forward = True
-    start_month = "2026-08"
+    start_month = f"{year}-01"
     defaults = {"sick_leave": 12.0, "casual_leave": 12.0, "total_leave": 30.0}
+    paid_leave_types = ["sick", "casual", "on_duty", "duty"]
+    unpaid_leave_types = ["other", "unpaid", "lop"]
+    half_day_min_hours = 4.0
+    full_day_min_hours = 8.0
+    late_grace_mins = 15
+    short_leave_monthly_limit = 2
+    short_leave_max_hours = 2.0
+    short_leave_penalty_rule = "half_day_per_2_excess"
     overrides = {}
+
     if policy:
         allocation_cycle = policy.get("allocation_cycle", "annual")
         carry_forward = policy.get("carry_forward", True)
-        start_month = policy.get("start_month", "2026-08")
+        if policy.get("start_month"):
+            start_month = policy.get("start_month")
         defaults = policy.get("defaults", defaults)
+        paid_leave_types = policy.get("paid_leave_types", paid_leave_types)
+        unpaid_leave_types = policy.get("unpaid_leave_types", unpaid_leave_types)
+        half_day_min_hours = float(policy.get("half_day_min_hours", 4.0))
+        full_day_min_hours = float(policy.get("full_day_min_hours", 8.0))
+        late_grace_mins = int(policy.get("late_grace_mins", 15))
+        short_leave_monthly_limit = int(policy.get("short_leave_monthly_limit", 2))
+        short_leave_max_hours = float(policy.get("short_leave_max_hours", 2.0))
+        short_leave_penalty_rule = policy.get("short_leave_penalty_rule", "half_day_per_2_excess")
         overrides = policy.get("overrides", {})
 
     clean_email = email.strip().lower()
@@ -4604,6 +4691,13 @@ async def calculate_leave_balance(
                 emp_identifiers.append(str(emp_doc["_id"]))
             if "employee_id" in emp_doc and emp_doc["employee_id"]:
                 emp_identifiers.append(str(emp_doc["employee_id"]).strip())
+            # Dynamically infer start_month from joining date if policy did not set a specific start_month
+            if not policy or not policy.get("start_month"):
+                j_date = emp_doc.get("date_of_joining") or emp_doc.get("joining_date")
+                if j_date:
+                    norm_j = normalize_date_str(j_date)
+                    if norm_j and norm_j.startswith(str(year)):
+                        start_month = norm_j[:7]
     except Exception:
         pass
 
@@ -4613,124 +4707,190 @@ async def calculate_leave_balance(
             {"email": {"$in": emp_identifiers}}
         ],
         "status": {"$regex": "^approved$", "$options": "i"}
-    }).to_list(length=200)
+    }).to_list(length=500)
 
-    # Calculate month accrual elapsed count
+    def eval_leave(l_doc):
+        norm_start = normalize_date_str(l_doc.get("start_date", ""))
+        norm_end = normalize_date_str(l_doc.get("end_date", norm_start))
+        if not norm_start:
+            return None, 0.0, False, "other"
+            
+        dur_type = str(l_doc.get("duration_type", "")).lower().strip()
+        if l_doc.get("duration") is not None:
+            days = float(l_doc.get("duration"))
+        elif dur_type in ["first_half", "second_half", "half_day"]:
+            days = 0.5
+        elif dur_type == "short_leave":
+            days = 0.0
+        else:
+            days = float(count_days_between(norm_start, norm_end or norm_start))
+            
+        l_type = str(l_doc.get("leave_type", "other")).lower().strip()
+        
+        # Check Paid Status: Explicit override takes priority, else check against paid_leave_types list
+        if l_doc.get("is_paid") is not None:
+            is_paid = bool(l_doc.get("is_paid"))
+        else:
+            is_paid = any(pt in l_type for pt in paid_leave_types)
+            
+        return norm_start, days, is_paid, l_type
+
     if allocation_cycle == "monthly":
-        # Calculate months elapsed from start_month to target month (e.g. 2026-08 -> 1 month)
+        # Generate ordered list of months from start_month to target month
         try:
             s_yr, s_mo = map(int, start_month.split("-"))
             t_yr, t_mo = map(int, month.split("-"))
-            months_elapsed = max(1, (t_yr - s_yr) * 12 + (t_mo - s_mo) + 1)
+            
+            # Clamp if target is before start
+            if (t_yr < s_yr) or (t_yr == s_yr and t_mo < s_mo):
+                start_month = month
+                s_yr, s_mo = t_yr, t_mo
         except Exception:
-            months_elapsed = 1
+            start_month = month
+            s_yr, s_mo = int(month.split("-")[0]), int(month.split("-")[1])
+            t_yr, t_mo = s_yr, s_mo
 
-        if carry_forward:
-            effective_sl = base_sl * months_elapsed
-            effective_cl = base_cl * months_elapsed
-            effective_tl = base_tl * months_elapsed
-            carried_forward_tl = max(0.0, base_tl * (months_elapsed - 1))
-        else:
-            effective_sl = base_sl
-            effective_cl = base_cl
-            effective_tl = base_tl
-            carried_forward_tl = 0.0
+        # Build month sequence
+        month_seq = []
+        cur_y, cur_m = s_yr, s_mo
+        while (cur_y < t_yr) or (cur_y == t_yr and cur_m <= t_mo):
+            month_seq.append(f"{cur_y:04d}-{cur_m:02d}")
+            cur_m += 1
+            if cur_m > 12:
+                cur_m = 1
+                cur_y += 1
 
-        used_sick = 0.0
-        used_casual = 0.0
-        used_on_duty = 0.0
-        used_other = 0.0
+        # Month-by-month state tracking
+        carried_sl = 0.0
+        carried_cl = 0.0
+        carried_tl = 0.0
+        
+        target_month_data = {}
 
-        for l in leaves:
-            norm_start = normalize_date_str(l.get("start_date", ""))
-            norm_end = normalize_date_str(l.get("end_date", ""))
-            if not norm_start:
-                continue
+        for m_str in month_seq:
+            # Filter approved leaves in this specific month
+            m_leaves = []
+            for l in leaves:
+                n_start, days, is_paid, l_type = eval_leave(l)
+                if n_start and n_start.startswith(m_str):
+                    m_leaves.append((n_start, days, is_paid, l_type))
 
-            # In monthly carry-forward, count all approved leaves from start_month through target month
+            # Sum usage in this month
+            used_sl_m = sum(d for _, d, _, lt in m_leaves if "sick" in lt)
+            used_cl_m = sum(d for _, d, _, lt in m_leaves if "casual" in lt)
+            used_od_m = sum(d for _, d, _, lt in m_leaves if "on_duty" in lt or "duty" in lt)
+            used_other_m = sum(d for _, d, _, lt in m_leaves if not any(k in lt for k in ["sick", "casual", "on_duty", "duty"]))
+            
+            # Paid vs Unpaid used in this month (On-duty does not deduct from quota)
+            paid_used_tl_m = sum(d for _, d, is_p, lt in m_leaves if is_p and ("on_duty" not in lt and "duty" not in lt))
+            unpaid_used_tl_m = sum(d for _, d, is_p, lt in m_leaves if not is_p and ("on_duty" not in lt and "duty" not in lt))
+
+            # Available quota in this month = monthly quota + carried forward from previous month
+            avail_sl_m = base_sl + carried_sl
+            avail_cl_m = base_cl + carried_cl
+            avail_tl_m = base_tl + carried_tl
+
+            # Remaining quota at end of this month
+            rem_sl_m = max(0.0, avail_sl_m - used_sl_m)
+            rem_cl_m = max(0.0, avail_cl_m - used_cl_m)
+            rem_tl_m = max(0.0, avail_tl_m - paid_used_tl_m)
+
+            # Excess LOP days in this month = (paid leaves taken exceeding available quota) + (unpaid leaves)
+            excess_lop_m = max(0.0, paid_used_tl_m - avail_tl_m) + unpaid_used_tl_m
+
+            # If this is our target month, record full data
+            if m_str == month:
+                prev_month_str = None
+                prev_month_label = None
+                if len(month_seq) > 1 and month_seq.index(m_str) > 0:
+                    prev_idx = month_seq.index(m_str) - 1
+                    prev_month_str = month_seq[prev_idx]
+                    try:
+                        p_dt = datetime.strptime(prev_month_str, "%Y-%m")
+                        prev_month_label = p_dt.strftime("%b %Y")
+                    except Exception:
+                        prev_month_label = prev_month_str
+
+                target_month_data = {
+                    "year": year,
+                    "month": month,
+                    "allocation_cycle": "monthly",
+                    "carry_forward": carry_forward,
+                    "start_month": start_month,
+                    "previous_month": prev_month_str,
+                    "previous_month_label": prev_month_label,
+                    "sick_leave": {
+                        "monthly_quota": round(base_sl, 2),
+                        "carried_forward": round(carried_sl, 2),
+                        "available": round(avail_sl_m, 2),
+                        "total": round(avail_sl_m, 2),
+                        "used": round(used_sl_m, 2),
+                        "remaining": round(rem_sl_m, 2)
+                    },
+                    "casual_leave": {
+                        "monthly_quota": round(base_cl, 2),
+                        "carried_forward": round(carried_cl, 2),
+                        "available": round(avail_cl_m, 2),
+                        "total": round(avail_cl_m, 2),
+                        "used": round(used_cl_m, 2),
+                        "remaining": round(rem_cl_m, 2)
+                    },
+                    "total_leave": {
+                        "monthly_quota": round(base_tl, 2),
+                        "carried_forward": round(carried_tl, 2),
+                        "available": round(avail_tl_m, 2),
+                        "total": round(avail_tl_m, 2),
+                        "used": round(paid_used_tl_m, 2),
+                        "unpaid_used": round(unpaid_used_tl_m, 2),
+                        "remaining": round(rem_tl_m, 2),
+                        "excess_lop": round(excess_lop_m, 2)
+                    },
+                    "on_duty": {
+                        "used": round(used_od_m, 2)
+                    },
+                    "other": {
+                        "used": round(used_other_m, 2)
+                    },
+                    "paid_leave_types": paid_leave_types,
+                    "unpaid_leave_types": unpaid_leave_types,
+                    "absent_days": round(float(absent_days), 2),
+                    "total_lop_days": round(excess_lop_m + float(absent_days), 2)
+                }
+
+            # Update carried forward for next month in sequence
             if carry_forward:
-                if norm_start < start_month or norm_start > f"{month}-31":
-                    continue
+                carried_sl = rem_sl_m
+                carried_cl = rem_cl_m
+                carried_tl = rem_tl_m
             else:
-                if not norm_start.startswith(month) and not (norm_end and norm_end.startswith(month)):
-                    continue
+                carried_sl = 0.0
+                carried_cl = 0.0
+                carried_tl = 0.0
 
-            l_type = str(l.get("leave_type", "other")).lower()
-            days = float(count_days_between(norm_start, norm_end or norm_start))
-            if "sick" in l_type:
-                used_sick += days
-            elif "casual" in l_type:
-                used_casual += days
-            elif "on_duty" in l_type or "duty" in l_type:
-                used_on_duty += days
-            else:
-                used_other += days
-
-        total_used = used_sick + used_casual + used_other + float(absent_days)
-        remaining_sl = max(0.0, effective_sl - used_sick)
-        remaining_cl = max(0.0, effective_cl - used_casual)
-        remaining_tl = max(0.0, effective_tl - total_used)
-
-        return {
-            "year": year,
-            "month": month,
-            "allocation_cycle": "monthly",
-            "carry_forward": carry_forward,
-            "sick_leave": {
-                "monthly_quota": round(base_sl, 2),
-                "total": round(effective_sl, 2),
-                "used": round(used_sick, 2),
-                "remaining": round(remaining_sl, 2)
-            },
-            "casual_leave": {
-                "monthly_quota": round(base_cl, 2),
-                "total": round(effective_cl, 2),
-                "used": round(used_casual, 2),
-                "remaining": round(remaining_cl, 2)
-            },
-            "total_leave": {
-                "monthly_quota": round(base_tl, 2),
-                "carried_forward": round(carried_forward_tl, 2),
-                "total": round(effective_tl, 2),
-                "used": round(total_used, 2),
-                "remaining": round(remaining_tl, 2)
-            },
-            "on_duty": {
-                "used": round(used_on_duty, 2)
-            },
-            "other": {
-                "used": round(used_other, 2)
-            }
-        }
+        return target_month_data
 
     else:
         # Annual cycle
-        used_sick = 0.0
-        used_casual = 0.0
-        used_on_duty = 0.0
-        used_other = 0.0
-
+        y_str = str(year)
+        y_leaves = []
         for l in leaves:
-            norm_start = normalize_date_str(l.get("start_date", ""))
-            norm_end = normalize_date_str(l.get("end_date", ""))
-            if not norm_start:
-                continue
+            n_start, days, is_paid, l_type = eval_leave(l)
+            if n_start and n_start.startswith(y_str):
+                y_leaves.append((n_start, days, is_paid, l_type))
 
-            if not norm_start.startswith(str(year)) and not (norm_end and norm_end.startswith(str(year))):
-                continue
+        used_sick = sum(d for _, d, _, lt in y_leaves if "sick" in lt)
+        used_casual = sum(d for _, d, _, lt in y_leaves if "casual" in lt)
+        used_on_duty = sum(d for _, d, _, lt in y_leaves if "on_duty" in lt or "duty" in lt)
+        used_other = sum(d for _, d, _, lt in y_leaves if not any(k in lt for k in ["sick", "casual", "on_duty", "duty"]))
 
-            l_type = str(l.get("leave_type", "other")).lower()
-            days = float(count_days_between(norm_start, norm_end or norm_start))
-            if "sick" in l_type:
-                used_sick += days
-            elif "casual" in l_type:
-                used_casual += days
-            elif "on_duty" in l_type or "duty" in l_type:
-                used_on_duty += days
-            else:
-                used_other += days
+        paid_used_tl = sum(d for _, d, is_p, lt in y_leaves if is_p and ("on_duty" not in lt and "duty" not in lt))
+        unpaid_used_tl = sum(d for _, d, is_p, lt in y_leaves if not is_p and ("on_duty" not in lt and "duty" not in lt))
 
-        total_used = used_sick + used_casual + used_other + float(absent_days)
+        rem_sl = max(0.0, base_sl - used_sick)
+        rem_cl = max(0.0, base_cl - used_casual)
+        rem_tl = max(0.0, base_tl - paid_used_tl)
+        excess_lop = max(0.0, paid_used_tl - base_tl) + unpaid_used_tl
+
         return {
             "year": year,
             "month": month,
@@ -4738,24 +4898,31 @@ async def calculate_leave_balance(
             "sick_leave": {
                 "total": round(base_sl, 2),
                 "used": round(used_sick, 2),
-                "remaining": round(max(0.0, base_sl - used_sick), 2)
+                "remaining": round(rem_sl, 2)
             },
             "casual_leave": {
                 "total": round(base_cl, 2),
                 "used": round(used_casual, 2),
-                "remaining": round(max(0.0, base_cl - used_casual), 2)
+                "remaining": round(rem_cl, 2)
             },
             "total_leave": {
                 "total": round(base_tl, 2),
-                "used": round(total_used, 2),
-                "remaining": round(max(0.0, base_tl - total_used), 2)
+                "available": round(base_tl, 2),
+                "used": round(paid_used_tl, 2),
+                "unpaid_used": round(unpaid_used_tl, 2),
+                "remaining": round(rem_tl, 2),
+                "excess_lop": round(excess_lop, 2)
             },
             "on_duty": {
                 "used": round(used_on_duty, 2)
             },
             "other": {
                 "used": round(used_other, 2)
-            }
+            },
+            "paid_leave_types": paid_leave_types,
+            "unpaid_leave_types": unpaid_leave_types,
+            "absent_days": round(float(absent_days), 2),
+            "total_lop_days": round(excess_lop + float(absent_days), 2)
         }
 
 
@@ -4933,7 +5100,7 @@ async def employee_get_holidays(year: Optional[int] = None, employee: dict = Dep
 
 @app.get("/admin/leave-policy")
 async def admin_get_leave_policy(year: Optional[int] = None, admin: dict = Depends(get_current_admin)):
-    """Fetch org-wide leave policy and quotas."""
+    """Fetch org-wide leave policy and quotas with enterprise attendance rules."""
     org_id = admin.organization_id or "system_org"
     if not year:
         year = datetime.now(timezone.utc).year
@@ -4951,12 +5118,29 @@ async def admin_get_leave_policy(year: Optional[int] = None, admin: dict = Depen
     carry_forward = True
     start_month = "2026-08"
     defaults = {"sick_leave": 12.0, "casual_leave": 12.0, "total_leave": 30.0}
+    paid_leave_types = ["sick", "casual", "on_duty"]
+    unpaid_leave_types = ["other", "unpaid"]
+    half_day_min_hours = 4.0
+    full_day_min_hours = 8.0
+    late_grace_mins = 15
+    short_leave_monthly_limit = 2
+    short_leave_max_hours = 2.0
+    short_leave_penalty_rule = "half_day_per_2_excess"
     overrides = {}
+
     if policy:
         allocation_cycle = policy.get("allocation_cycle", "annual")
         carry_forward = policy.get("carry_forward", True)
         start_month = policy.get("start_month", "2026-08")
         defaults = policy.get("defaults", defaults)
+        paid_leave_types = policy.get("paid_leave_types", paid_leave_types)
+        unpaid_leave_types = policy.get("unpaid_leave_types", unpaid_leave_types)
+        half_day_min_hours = float(policy.get("half_day_min_hours", 4.0))
+        full_day_min_hours = float(policy.get("full_day_min_hours", 8.0))
+        late_grace_mins = int(policy.get("late_grace_mins", 15))
+        short_leave_monthly_limit = int(policy.get("short_leave_monthly_limit", 2))
+        short_leave_max_hours = float(policy.get("short_leave_max_hours", 2.0))
+        short_leave_penalty_rule = policy.get("short_leave_penalty_rule", "half_day_per_2_excess")
         overrides = policy.get("overrides", {})
 
     return {
@@ -4966,13 +5150,21 @@ async def admin_get_leave_policy(year: Optional[int] = None, admin: dict = Depen
         "carry_forward": carry_forward,
         "start_month": start_month,
         "defaults": defaults,
+        "paid_leave_types": paid_leave_types,
+        "unpaid_leave_types": unpaid_leave_types,
+        "half_day_min_hours": half_day_min_hours,
+        "full_day_min_hours": full_day_min_hours,
+        "late_grace_mins": late_grace_mins,
+        "short_leave_monthly_limit": short_leave_monthly_limit,
+        "short_leave_max_hours": short_leave_max_hours,
+        "short_leave_penalty_rule": short_leave_penalty_rule,
         "overrides": overrides
     }
 
 
 @app.put("/admin/leave-policy")
 async def admin_update_leave_policy(req: LeavePolicyUpdateRequest, admin: dict = Depends(get_current_admin)):
-    """Set organization-wide default leave quotas (SL, CL, TL), allocation cycle, and carry forward."""
+    """Set organization-wide default leave quotas, allocation cycle, carry forward, and paid/unpaid rules."""
     org_id = admin.organization_id or "system_org"
     year = req.year or datetime.now(timezone.utc).year
     allocation_cycle = (req.allocation_cycle or "annual").strip().lower()
@@ -4984,31 +5176,38 @@ async def admin_update_leave_policy(req: LeavePolicyUpdateRequest, admin: dict =
         "casual_leave": float(req.casual_leave),
         "total_leave": float(req.total_leave)
     }
+    paid_leave_types = req.paid_leave_types if req.paid_leave_types is not None else ["sick", "casual", "on_duty"]
+    unpaid_leave_types = req.unpaid_leave_types if req.unpaid_leave_types is not None else ["other", "unpaid"]
+
+    update_doc = {
+        "organization_id": org_id,
+        "year": year,
+        "allocation_cycle": allocation_cycle,
+        "carry_forward": carry_forward,
+        "start_month": start_month,
+        "defaults": defaults,
+        "paid_leave_types": paid_leave_types,
+        "unpaid_leave_types": unpaid_leave_types,
+        "half_day_min_hours": float(req.half_day_min_hours or 4.0),
+        "full_day_min_hours": float(req.full_day_min_hours or 8.0),
+        "late_grace_mins": int(req.late_grace_mins or 15),
+        "short_leave_monthly_limit": int(req.short_leave_monthly_limit or 2),
+        "short_leave_max_hours": float(req.short_leave_max_hours or 2.0),
+        "short_leave_penalty_rule": req.short_leave_penalty_rule or "half_day_per_2_excess",
+        "updated_by": admin.email,
+        "updated_at": datetime.now(timezone.utc)
+    }
 
     await leave_policies_collection.update_one(
         {"organization_id": org_id, "year": year},
-        {
-            "$set": {
-                "organization_id": org_id,
-                "year": year,
-                "allocation_cycle": allocation_cycle,
-                "carry_forward": carry_forward,
-                "start_month": start_month,
-                "defaults": defaults,
-                "updated_by": admin.email,
-                "updated_at": datetime.now(timezone.utc)
-            }
-        },
+        {"$set": update_doc},
         upsert=True
     )
 
     return {
         "status": "success",
         "message": f"Leave policy updated for {year}",
-        "allocation_cycle": allocation_cycle,
-        "carry_forward": carry_forward,
-        "start_month": start_month,
-        "defaults": defaults
+        **update_doc
     }
 
 
@@ -5028,6 +5227,10 @@ async def admin_update_employee_leave_quota(
         "casual_leave": float(req.casual_leave),
         "total_leave": float(req.total_leave)
     }
+    if req.paid_leave_types is not None:
+        override["paid_leave_types"] = req.paid_leave_types
+    if req.unpaid_leave_types is not None:
+        override["unpaid_leave_types"] = req.unpaid_leave_types
 
     await leave_policies_collection.update_one(
         {"organization_id": org_id, "year": year},
