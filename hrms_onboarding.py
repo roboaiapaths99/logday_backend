@@ -16,7 +16,8 @@ from hrms_models import (
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(tags=["HRMS Onboarding"])
+router = APIRouter(prefix="/admin/onboarding", tags=["HRMS Onboarding"])
+employee_onboarding_router = APIRouter(tags=["HRMS Employee Onboarding"])
 
 DEFAULT_ONBOARDING_TASKS = {
     "HR": [
@@ -1109,7 +1110,7 @@ ONBOARDING_UPLOADS_DIR = os.path.join(UPLOAD_DIR, "onboarding_docs")
 os.makedirs(ONBOARDING_UPLOADS_DIR, exist_ok=True)
 
 
-@router.get("/api/employee/onboarding")
+@employee_onboarding_router.get("/api/employee/onboarding")
 async def get_my_onboarding(employee=Depends(get_current_employee)):
     """Retrieve the current logged-in employee's onboarding progress and tasks."""
     clean_email = employee["email"].strip().lower()
@@ -1153,7 +1154,7 @@ async def get_my_onboarding(employee=Depends(get_current_employee)):
     return onb
 
 
-@router.post("/api/employee/onboarding/upload")
+@employee_onboarding_router.post("/api/employee/onboarding/upload")
 async def upload_my_onboarding_document(
     doc_type: str = Form(...),
     file: Optional[UploadFile] = File(None),
@@ -1215,7 +1216,7 @@ async def upload_my_onboarding_document(
     return {"status": "success", "message": f"{doc_type.title()} uploaded successfully", "onboarding": updated}
 
 
-@router.put("/api/employee/onboarding/tasks/{task_id}/complete")
+@employee_onboarding_router.put("/api/employee/onboarding/tasks/{task_id}/complete")
 async def complete_my_onboarding_task(task_id: str, employee=Depends(get_current_employee)):
     """Mark an onboarding checklist task as complete."""
     clean_email = employee["email"].strip().lower()
@@ -1246,7 +1247,7 @@ async def complete_my_onboarding_task(task_id: str, employee=Depends(get_current
     return refreshed
 
 
-@router.post("/api/employee/onboarding/digilocker/pull-sandbox")
+@employee_onboarding_router.post("/api/employee/onboarding/digilocker/pull-sandbox")
 async def employee_digilocker_pull_sandbox(req_body: dict, employee=Depends(get_current_employee)):
     """Instant DigiLocker sandbox document verification and auto-fill for mobile apps."""
     from digilocker import pull_document
@@ -1299,7 +1300,7 @@ async def employee_digilocker_pull_sandbox(req_body: dict, employee=Depends(get_
     }
 
 
-@router.get("/api/employee/onboarding/digilocker/auth-url")
+@employee_onboarding_router.get("/api/employee/onboarding/digilocker/auth-url")
 async def get_digilocker_auth_url(employee=Depends(get_current_employee)):
     """Generate DigiLocker OAuth2 authorization URL for mobile/web login."""
     from digilocker import generate_auth_url
@@ -1309,8 +1310,8 @@ async def get_digilocker_auth_url(employee=Depends(get_current_employee)):
     return auth_data
 
 
-@router.get("/hrms/onboarding/digilocker/callback")
-@router.get("/api/employee/onboarding/digilocker/callback")
+@employee_onboarding_router.get("/hrms/onboarding/digilocker/callback")
+@employee_onboarding_router.get("/api/employee/onboarding/digilocker/callback")
 async def digilocker_oauth_callback(code: str, state: str, error: Optional[str] = None):
     """Handle DigiLocker OAuth2 redirection and exchange authorization code for verified documents."""
     from fastapi.responses import HTMLResponse

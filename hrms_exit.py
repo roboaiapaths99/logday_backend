@@ -15,6 +15,8 @@ router = APIRouter(
     dependencies=[Depends(require_feature("exit_management"))]
 )
 
+employee_exit_router = APIRouter(tags=["HRMS Employee Exit"])
+
 def get_org_filter(admin: Admin):
     if admin.role == "superadmin" or admin.organization_id == "system_org":
         return {}
@@ -482,8 +484,9 @@ async def complete_exit(id: str, current_admin: Admin = Depends(get_current_admi
 
 from auth import get_current_employee
 
-@router.get("/api/employee/exit/my")
-@router.get("/exit-clearance/my")
+@employee_exit_router.get("/api/employee/exit/my")
+@employee_exit_router.get("/exit-clearance/my")
+@employee_exit_router.get("/hrms/exit-clearance/my")
 async def get_my_exit_clearance(employee=Depends(get_current_employee)):
     """Fetch the active resignation & exit clearance workflow for the logged-in employee."""
     clean_email = employee["email"].strip().lower()
@@ -504,8 +507,9 @@ async def get_my_exit_clearance(employee=Depends(get_current_employee)):
     return exit_doc
 
 
-@router.post("/api/employee/exit/resignation")
-@router.post("/exit-clearance/resignation")
+@employee_exit_router.post("/api/employee/exit/resignation")
+@employee_exit_router.post("/exit-clearance/resignation")
+@employee_exit_router.post("/hrms/exit-clearance/resignation")
 async def apply_my_resignation(req: dict, employee=Depends(get_current_employee)):
     """Submit resignation from mobile / desktop app."""
     clean_email = employee["email"].strip().lower()
@@ -563,7 +567,7 @@ async def apply_my_resignation(req: dict, employee=Depends(get_current_employee)
     return new_exit
 
 
-@router.post("/api/employee/exit/interview")
+@employee_exit_router.post("/api/employee/exit/interview")
 async def submit_my_exit_interview(req: dict, employee=Depends(get_current_employee)):
     """Submit the employee exit questionnaire feedback."""
     clean_email = employee["email"].strip().lower()

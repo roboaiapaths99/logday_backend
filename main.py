@@ -111,17 +111,17 @@ app = FastAPI(
 )
 
 # HRMS Routers
-from hrms_onboarding import router as onboarding_router
+from hrms_onboarding import router as onboarding_router, employee_onboarding_router
 from hrms_payroll import router as payroll_router
-from hrms_exit import router as exit_router
+from hrms_exit import router as exit_router, employee_exit_router
 from hrms_employee import router as employee_router
 from hrms_wfh import router as wfh_router
 
 app.include_router(onboarding_router)
-app.include_router(onboarding_router, prefix="/admin/onboarding")
-app.include_router(onboarding_router, prefix="/hrms/onboarding")
+app.include_router(employee_onboarding_router)
 app.include_router(payroll_router)
 app.include_router(exit_router)
+app.include_router(employee_exit_router)
 app.include_router(employee_router)
 app.include_router(wfh_router)
 
