@@ -126,18 +126,39 @@ app.include_router(employee_router)
 app.include_router(wfh_router)
 
 
-# Configure CORS - Allow all origins dynamically with regex for Electron & web clients
+# Configure CORS - Allow all origins dynamically with regex for Web, Vercel, Electron & Mobile
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=r".*",
+    allow_origins=["*"],
+    allow_origin_regex=r"^https?://.*",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["*"],
 )
+
 @app.middleware("http")
-async def add_cache_control_header(request: Request, call_next):
+async def add_cors_and_cache_headers(request: Request, call_next):
+    # Handle preflight OPTIONS requests directly with full CORS headers
+    origin = request.headers.get("origin") or "*"
+    if request.method == "OPTIONS":
+        from fastapi.responses import Response
+        response = Response(status_code=200)
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS, PATCH"
+        response.headers["Access-Control-Allow-Headers"] = request.headers.get("access-control-request-headers", "*")
+        response.headers["Access-Control-Max-Age"] = "86400"
+        return response
+
     response = await call_next(request)
+    
+    # Ensure CORS headers are present even on errors
+    response.headers["Access-Control-Allow-Origin"] = origin
+    response.headers["Access-Control-Allow-Credentials"] = "true"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS, PATCH"
+    response.headers["Access-Control-Allow-Headers"] = "*"
+    
     # Prevent caching of API responses to ensure real-time data accuracy
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     response.headers["Pragma"] = "no-cache"
