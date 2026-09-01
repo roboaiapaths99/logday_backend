@@ -476,3 +476,124 @@ async def complete_exit(id: str, current_admin: Admin = Depends(get_current_admi
         "message": "Exit process completed successfully. Employee account set to Inactive.",
         "status": "completed"
     }
+
+
+# ─── Employee Separation / Resignation Endpoints ───────────────────
+
+from auth import get_current_employee
+
+@router.get("/api/employee/exit/my")
+@router.get("/exit-clearance/my")
+async def get_my_exit_clearance(employee=Depends(get_current_employee)):
+    """Fetch the active resignation & exit clearance workflow for the logged-in employee."""
+    clean_email = employee["email"].strip().lower()
+    exit_doc = await exit_managements_collection.find_one({
+        "employee_email": clean_email,
+        "status": {"$in": [ExitStatus.PENDING, ExitStatus.IN_PROGRESS, ExitStatus.COMPLETED]}
+    })
+    
+    if not exit_doc:
+        # Also try searching by employee_id
+        emp_id = str(employee.get("_id", ""))
+        exit_doc = await exit_managements_collection.find_one({"employee_id": emp_id})
+        
+    if not exit_doc:
+        raise HTTPException(status_code=404, detail="No active exit process on file for your account.")
+        
+    exit_doc["_id"] = str(exit_doc["_id"])
+    return exit_doc
+
+
+@router.post("/api/employee/exit/resignation")
+@router.post("/exit-clearance/resignation")
+async def apply_my_resignation(req: dict, employee=Depends(get_current_employee)):
+    """Submit resignation from mobile / desktop app."""
+    clean_email = employee["email"].strip().lower()
+    org_id = employee.get("organization_id", "system_org")
+    
+    # Check if active process already exists
+    existing = await exit_managements_collection.find_one({
+        "employee_email": clean_email,
+        "status": {"$in": [ExitStatus.PENDING, ExitStatus.IN_PROGRESS]}
+    })
+    if existing:
+        existing["_id"] = str(existing["_id"])
+        return existing
+
+    import copy
+    clearances = copy.deepcopy(DEFAULT_CLEARANCES)
+    
+    last_working_day = req.get("last_working_day") or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    reason = req.get("reason", "Resignation")
+    handover_notes = req.get("handover_notes", "")
+
+    new_exit = {
+        "employee_id": str(employee.get("_id", "")),
+        "employee_name": employee.get("full_name") or employee.get("name", "Employee"),
+        "employee_email": clean_email,
+        "organization_id": org_id,
+        "designation": employee.get("designation", "Employee"),
+        "department": employee.get("department", "General"),
+        "joining_date": employee.get("date_of_joining") or employee.get("joining_date") or "N/A",
+        "resignation_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        "last_working_day": last_working_day,
+        "reason": reason,
+        "handover_notes": handover_notes,
+        "status": ExitStatus.PENDING,
+        "progress": 0.0,
+        "clearances": clearances,
+        "final_settlement": {
+            "gross_payable": 0.0,
+            "deductions": 0.0,
+            "net_payable": 0.0,
+            "processed": False,
+            "processed_at": None
+        },
+        "exit_interview": {
+            "conducted": False,
+            "date": None,
+            "feedback": None
+        },
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat()
+    }
+    
+    res = await exit_managements_collection.insert_one(new_exit)
+    new_exit["_id"] = str(res.inserted_id)
+    return new_exit
+
+
+@router.post("/api/employee/exit/interview")
+async def submit_my_exit_interview(req: dict, employee=Depends(get_current_employee)):
+    """Submit the employee exit questionnaire feedback."""
+    clean_email = employee["email"].strip().lower()
+    exit_doc = await exit_managements_collection.find_one({
+        "employee_email": clean_email,
+        "status": {"$in": [ExitStatus.PENDING, ExitStatus.IN_PROGRESS]}
+    })
+    if not exit_doc:
+        raise HTTPException(status_code=404, detail="No active exit process found to submit interview feedback.")
+
+    interview = {
+        "conducted": True,
+        "interviewer": "Self (Employee App)",
+        "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        "reason_for_leaving": req.get("reason_for_leaving"),
+        "feedback": req.get("feedback"),
+        "would_rejoin": req.get("would_rejoin", "yes"),
+        "improvement_suggestions": req.get("improvement_suggestions")
+    }
+
+    await exit_managements_collection.update_one(
+        {"_id": exit_doc["_id"]},
+        {"$set": {
+            "exit_interview": interview,
+            "clearances.hr.items.0.done": True,
+            "updated_at": datetime.now(timezone.utc)
+        }}
+    )
+    
+    updated = await exit_managements_collection.find_one({"_id": exit_doc["_id"]})
+    updated["_id"] = str(updated["_id"])
+    return updated
+

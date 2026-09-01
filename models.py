@@ -359,18 +359,45 @@ class EmployeeUpdate(BaseModel):
 
 
 
+class ConvertAbsentToLeaveRequest(BaseModel):
+    employee_email: str
+    date: str  # YYYY-MM-DD
+    leave_type: str = "casual_leave"  # sick_leave, casual_leave, on_duty, other, unpaid
+    duration_type: str = "full_day"   # full_day, first_half, second_half
+    duration: float = 1.0             # 1.0 or 0.5
+    is_paid: Optional[bool] = True    # True = Paid Leave, False = LOP
+    reason: str = "Regularized by Admin (Informed via Email / WhatsApp)"
+    admin_notes: Optional[str] = None
+
+
 class SystemSettings(BaseModel):
+    # Desk / General Office Timings
     office_start_time: str = "09:00"
+    office_end_time: str = "18:00"
     late_threshold_mins: int = 15
+    late_grace_mins: int = 15
+    late_to_short_leave_mins: int = 45
+    late_to_half_day_time: str = "11:30"
+    early_leave_short_mins: int = 45
+    early_leave_half_day_time: str = "14:00"
+    half_day_min_hours: float = 4.0
+    full_day_min_hours: float = 8.0
     required_hours: float = 8.0
     
-    # Field specific defaults
+    # Field specific toggle & defaults
+    custom_field_rules_enabled: bool = False
     field_office_start_time: str = "10:00"
+    field_office_end_time: str = "19:00"
     field_late_threshold_mins: int = 30
+    field_late_grace_mins: int = 30
+    field_late_to_half_day_time: str = "12:30"
+    field_half_day_min_hours: float = 4.0
+    field_full_day_min_hours: float = 8.0
     field_required_hours: float = 9.0
     field_visits_goal: int = 10
     field_km_goal: float = 20.0
     field_rate_per_km: float = 10.0
+    field_settings: Optional[dict] = None
     
     timezone_offset: int = 330
     primary_color: Optional[str] = "#6366f1"

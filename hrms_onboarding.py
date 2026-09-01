@@ -1094,3 +1094,205 @@ async def upload_document_ocr(employee_id: str, req_body: dict):
 
     return {"status": "success", "ocr_result": ocr_result, "document": doc_entry}
 
+
+# ─── Employee Authenticated Endpoints for Field / Desk Apps ───────────
+
+from auth import get_current_employee
+from fastapi import File, UploadFile, Form
+import os
+
+UPLOAD_DIR = os.path.join(os.getcwd(), "uploads")
+ONBOARDING_UPLOADS_DIR = os.path.join(UPLOAD_DIR, "onboarding_docs")
+os.makedirs(ONBOARDING_UPLOADS_DIR, exist_ok=True)
+
+
+@router.get("/api/employee/onboarding")
+async def get_my_onboarding(employee=Depends(get_current_employee)):
+    """Retrieve the current logged-in employee's onboarding progress and tasks."""
+    clean_email = employee["email"].strip().lower()
+    onb = await onboardings_collection.find_one({"employee_email": clean_email})
+    if not onb:
+        # Check if we should auto-initialize a default onboarding record for this employee
+        emp_id = str(employee.get("_id", ""))
+        default_docs = ["aadhaar", "pan", "bank_passbook", "photo"]
+        default_tasks = []
+        for cat, t_list in DEFAULT_ONBOARDING_TASKS.items():
+            for t_title in t_list:
+                default_tasks.append({
+                    "task_id": str(uuid.uuid4()),
+                    "title": t_title,
+                    "category": cat,
+                    "status": "pending",
+                    "due_date": None,
+                    "completed_at": None
+                })
+        new_onb = {
+            "employee_id": emp_id,
+            "employee_name": employee.get("full_name") or employee.get("name", "Employee"),
+            "employee_email": clean_email,
+            "organization_id": employee.get("organization_id", "system_org"),
+            "designation": employee.get("designation", "Employee"),
+            "department": employee.get("department", "General"),
+            "joining_date": employee.get("date_of_joining") or employee.get("joining_date") or datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            "status": "pending",
+            "progress": 0.0,
+            "documents_required": default_docs,
+            "documents_submitted": [],
+            "tasks": default_tasks,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        }
+        ins = await onboardings_collection.insert_one(new_onb)
+        new_onb["_id"] = str(ins.inserted_id)
+        return new_onb
+
+    onb["_id"] = str(onb["_id"])
+    return onb
+
+
+@router.post("/api/employee/onboarding/upload")
+async def upload_my_onboarding_document(
+    doc_type: str = Form(...),
+    file: Optional[UploadFile] = File(None),
+    image_b64: Optional[str] = Form(None),
+    employee=Depends(get_current_employee)
+):
+    """Upload or capture a required credential (Aadhaar, PAN, Bank, Photo) from the mobile app."""
+    clean_email = employee["email"].strip().lower()
+    onb = await onboardings_collection.find_one({"employee_email": clean_email})
+    if not onb:
+        raise HTTPException(status_code=404, detail="Onboarding profile not found")
+
+    file_url = None
+    if file:
+        ext = file.filename.split(".")[-1] if "." in file.filename else "jpg"
+        filename = f"{clean_email}_{doc_type}_{uuid.uuid4().hex[:8]}.{ext}"
+        filepath = os.path.join(ONBOARDING_UPLOADS_DIR, filename)
+        content = await file.read()
+        with open(filepath, "wb") as f:
+            f.write(content)
+        file_url = f"/uploads/onboarding_docs/{filename}"
+    elif image_b64:
+        import base64
+        ext = "jpg"
+        if image_b64.startswith("data:image"):
+            header, image_b64 = image_b64.split(",", 1)
+        filename = f"{clean_email}_{doc_type}_{uuid.uuid4().hex[:8]}.{ext}"
+        filepath = os.path.join(ONBOARDING_UPLOADS_DIR, filename)
+        with open(filepath, "wb") as f:
+            f.write(base64.b64decode(image_b64))
+        file_url = f"/uploads/onboarding_docs/{filename}"
+
+    docs_submitted = onb.get("documents_submitted", [])
+    existing = next((d for d in docs_submitted if d["type"] == doc_type), None)
+    
+    doc_entry = {
+        "type": doc_type,
+        "verified": False,
+        "status": "pending_review",
+        "verification_source": "mobile_upload",
+        "file_url": file_url,
+        "submitted_at": datetime.now(timezone.utc).isoformat(),
+        "rejection_reason": None
+    }
+    
+    if existing:
+        existing.update(doc_entry)
+    else:
+        docs_submitted.append(doc_entry)
+
+    await onboardings_collection.update_one(
+        {"_id": onb["_id"]},
+        {"$set": {"documents_submitted": docs_submitted, "updated_at": datetime.now(timezone.utc)}}
+    )
+    await recalculate_progress(onb["_id"])
+    
+    updated = await onboardings_collection.find_one({"_id": onb["_id"]})
+    updated["_id"] = str(updated["_id"])
+    return {"status": "success", "message": f"{doc_type.title()} uploaded successfully", "onboarding": updated}
+
+
+@router.put("/api/employee/onboarding/tasks/{task_id}/complete")
+async def complete_my_onboarding_task(task_id: str, employee=Depends(get_current_employee)):
+    """Mark an onboarding checklist task as complete."""
+    clean_email = employee["email"].strip().lower()
+    onb = await onboardings_collection.find_one({"employee_email": clean_email})
+    if not onb:
+        raise HTTPException(status_code=404, detail="Onboarding profile not found")
+
+    tasks = onb.get("tasks", [])
+    updated = False
+    for t in tasks:
+        if t.get("task_id") == task_id or str(t.get("_id", "")) == task_id:
+            t["status"] = "completed"
+            t["completed_at"] = datetime.now(timezone.utc).isoformat()
+            updated = True
+            break
+
+    if not updated:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    await onboardings_collection.update_one(
+        {"_id": onb["_id"]},
+        {"$set": {"tasks": tasks, "updated_at": datetime.now(timezone.utc)}}
+    )
+    await recalculate_progress(onb["_id"])
+
+    refreshed = await onboardings_collection.find_one({"_id": onb["_id"]})
+    refreshed["_id"] = str(refreshed["_id"])
+    return refreshed
+
+
+@router.post("/api/employee/onboarding/digilocker/pull-sandbox")
+async def employee_digilocker_pull_sandbox(req_body: dict, employee=Depends(get_current_employee)):
+    """Instant DigiLocker sandbox document verification and auto-fill for mobile apps."""
+    from digilocker import pull_document
+    doc_type = req_body.get("doc_type", "aadhaar")
+    clean_email = employee["email"].strip().lower()
+    
+    onb = await onboardings_collection.find_one({"employee_email": clean_email})
+    if not onb:
+        raise HTTPException(status_code=404, detail="Onboarding profile not found")
+
+    # In sandbox mode, mock access token pulls verified UIDAI / CBDT / Transport documents
+    res = await pull_document("sandbox_token", doc_type)
+    if not res or not res.get("success"):
+        raise HTTPException(status_code=400, detail="Failed to retrieve document from DigiLocker")
+
+    docs_submitted = onb.get("documents_submitted", [])
+    existing = next((d for d in docs_submitted if d["type"] == doc_type), None)
+    
+    doc_entry = {
+        "type": doc_type,
+        "verified": True,
+        "status": "verified",
+        "verification_source": "digilocker",
+        "digilocker_uri": res.get("digilocker_uri"),
+        "digilocker_data": res.get("extracted_data"),
+        "file_url": res.get("file_url") or "digilocker_verified_xml",
+        "submitted_at": datetime.now(timezone.utc).isoformat(),
+        "verified_by": "DigiLocker Government Portal",
+        "verified_at": datetime.now(timezone.utc).isoformat()
+    }
+    
+    if existing:
+        existing.update(doc_entry)
+    else:
+        docs_submitted.append(doc_entry)
+
+    await onboardings_collection.update_one(
+        {"_id": onb["_id"]},
+        {"$set": {"documents_submitted": docs_submitted, "updated_at": datetime.now(timezone.utc)}}
+    )
+    await recalculate_progress(onb["_id"])
+
+    updated = await onboardings_collection.find_one({"_id": onb["_id"]})
+    updated["_id"] = str(updated["_id"])
+    return {
+        "status": "success",
+        "message": f"Verified {doc_type.upper()} via DigiLocker successfully!",
+        "document": doc_entry,
+        "onboarding": updated
+    }
+
+

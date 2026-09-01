@@ -117,6 +117,7 @@ from hrms_exit import router as exit_router
 from hrms_employee import router as employee_router
 from hrms_wfh import router as wfh_router
 
+app.include_router(onboarding_router)
 app.include_router(onboarding_router, prefix="/admin/onboarding")
 app.include_router(onboarding_router, prefix="/hrms/onboarding")
 app.include_router(payroll_router)
@@ -4530,6 +4531,75 @@ async def toggle_leave_payment_status(request_id: str, req_body: dict, admin: di
         }}
     )
     return {"status": "success", "is_paid": bool(is_paid), "message": f"Leave marked as {'Paid' if is_paid else 'Loss of Pay (LOP)'}"}
+
+
+@app.post("/admin/attendance/convert-absent-to-leave")
+async def convert_absent_to_leave(req: ConvertAbsentToLeaveRequest, admin: Admin = Depends(get_current_admin)):
+    """Admin regularization: Convert an Absent day into an Approved Leave (e.g. informed via Email/WhatsApp)."""
+    clean_email = req.employee_email.strip().lower()
+    clean_date = normalize_date_str(req.date)
+    if not clean_date:
+        raise HTTPException(status_code=400, detail="Invalid date format. Expected YYYY-MM-DD or DD/MM/YYYY")
+
+    emp = await employees_collection.find_one({"email": clean_email})
+    if not emp:
+        # Try finding by employee_id or other fields
+        emp = await employees_collection.find_one({"employee_id": req.employee_email.strip()})
+        if not emp:
+            raise HTTPException(status_code=404, detail="Employee not found")
+        clean_email = emp["email"]
+
+    org_id = emp.get("organization_id") or admin.organization_id or "system_org"
+
+    # Check if there is already an approved leave for this date
+    existing = await leave_requests_collection.find_one({
+        "employee_id": clean_email,
+        "start_date": {"$lte": clean_date},
+        "end_date": {"$gte": clean_date},
+        "status": "approved"
+    })
+
+    if existing:
+        return {
+            "status": "already_exists",
+            "message": f"An approved leave ({existing.get('leave_type')}) already exists for this date.",
+            "request_id": str(existing["_id"])
+        }
+
+    duration_type = req.duration_type or "full_day"
+    duration = float(req.duration) if req.duration else (0.5 if duration_type in ["first_half", "second_half"] else 1.0)
+
+    # Insert approved leave record
+    new_leave = {
+        "employee_id": clean_email,
+        "organization_id": org_id,
+        "leave_type": req.leave_type,
+        "start_date": clean_date,
+        "end_date": clean_date,
+        "duration_type": duration_type,
+        "duration": duration,
+        "reason": req.reason or "Regularized by Admin (Informed via Email / WhatsApp)",
+        "is_paid": req.is_paid if req.is_paid is not None else True,
+        "exceeds_quota": False,
+        "status": "approved",
+        "admin_notes": req.admin_notes or f"Converted from Absent on {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} by {admin.email}",
+        "processed_at": datetime.now(timezone.utc),
+        "processed_by": admin.email,
+        "created_at": datetime.now(timezone.utc)
+    }
+    result = await leave_requests_collection.insert_one(new_leave)
+
+    # Also calculate updated leave balance for the month
+    target_month = clean_date[:7]
+    balance = await calculate_leave_balance(clean_email, org_id, month=target_month)
+
+    return {
+        "status": "success",
+        "message": f"Absent day ({clean_date}) successfully converted to Approved {req.leave_type.replace('_', ' ').title()}.",
+        "request_id": str(result.inserted_id),
+        "updated_balance": balance
+    }
+
 
 
 # -----------------------------------------------------------------------------
