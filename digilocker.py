@@ -352,20 +352,71 @@ def _parse_digilocker_response(xml_content: bytes, doc_type: str) -> Dict[str, A
     try:
         import xml.etree.ElementTree as ET
         root = ET.fromstring(xml_content)
-        # Basic extraction — structure varies by document type
-        data = {}
-        for child in root:
-            tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
-            data[tag] = child.text
+        data: Dict[str, Any] = {}
+
+        # 1. Specific parser for Aadhaar e-KYC XML (UidData)
+        if doc_type == "aadhaar":
+            # Search for Poi (Proof of Identity) and Poa (Proof of Address)
+            for elem in root.iter():
+                tag_name = elem.tag.split("}")[-1]
+                if tag_name in ("Poi", "poi"):
+                    data["name"] = elem.attrib.get("name") or elem.attrib.get("Name")
+                    data["dob"] = elem.attrib.get("dob") or elem.attrib.get("Dob")
+                    data["gender"] = elem.attrib.get("gender") or elem.attrib.get("Gender")
+                elif tag_name in ("Poa", "poa"):
+                    co = elem.attrib.get("co", "")
+                    house = elem.attrib.get("house", "")
+                    street = elem.attrib.get("street", "")
+                    loc = elem.attrib.get("loc", "")
+                    dist = elem.attrib.get("dist", "")
+                    state = elem.attrib.get("state", "")
+                    pc = elem.attrib.get("pc", "")
+                    addr_parts = [p for p in [co, house, street, loc, dist, state, pc] if p]
+                    data["address"] = ", ".join(addr_parts) if addr_parts else None
+                elif tag_name in ("Pht", "pht") and elem.text:
+                    data["photo_base64"] = elem.text.strip()
+                elif tag_name in ("UidData", "uidData"):
+                    data["uid_masked"] = elem.attrib.get("uid", "XXXX-XXXX-XXXX")
+
+        # 2. Specific parser for PAN Card XML
+        elif doc_type == "pan":
+            for elem in root.iter():
+                tag_name = elem.tag.split("}")[-1]
+                if tag_name in ("Certificate", "CertificateData", "PAN"):
+                    data["pan_number"] = elem.attrib.get("number") or elem.attrib.get("panNo") or elem.attrib.get("pan")
+                elif tag_name in ("Person", "IssuedTo"):
+                    data["name"] = elem.attrib.get("name") or elem.attrib.get("fn")
+                    data["dob"] = elem.attrib.get("dob")
+                    data["father_name"] = elem.attrib.get("swdName") or elem.attrib.get("fatherName")
+
+        # 3. Specific parser for Driving License XML
+        elif doc_type == "driving_license":
+            for elem in root.iter():
+                tag_name = elem.tag.split("}")[-1]
+                if tag_name in ("DrivingLicense", "License", "DL"):
+                    data["dl_number"] = elem.attrib.get("dlNumber") or elem.attrib.get("number")
+                    data["valid_from"] = elem.attrib.get("validFrom")
+                    data["valid_to"] = elem.attrib.get("validTo")
+                    data["name"] = elem.attrib.get("holderName") or elem.attrib.get("name")
+                    data["blood_group"] = elem.attrib.get("bloodGroup")
+
+        # Generic fallback if specific parser didn't extract fields
+        if not data:
+            for child in root.iter():
+                tag = child.tag.split("}")[-1]
+                if child.text and child.text.strip():
+                    data[tag] = child.text.strip()
+                if child.attrib:
+                    data[f"{tag}_attributes"] = child.attrib
 
         return {
             "success": True,
             "doc_type": doc_type,
-            "doc_name": DIGILOCKER_DOC_TYPES[doc_type]["name"],
-            "issuer": DIGILOCKER_DOC_TYPES[doc_type]["issuer"],
+            "doc_name": DIGILOCKER_DOC_TYPES.get(doc_type, {}).get("name", doc_type.title()),
+            "issuer": DIGILOCKER_DOC_TYPES.get(doc_type, {}).get("issuer", "Government of India"),
             "verification_source": "digilocker",
             "is_government_verified": True,
-            "digilocker_uri": DIGILOCKER_DOC_TYPES[doc_type]["uri"],
+            "digilocker_uri": DIGILOCKER_DOC_TYPES.get(doc_type, {}).get("uri", ""),
             "extracted_data": data,
             "pulled_at": datetime.now(timezone.utc).isoformat(),
             "status": "digilocker_verified"

@@ -1296,3 +1296,84 @@ async def employee_digilocker_pull_sandbox(req_body: dict, employee=Depends(get_
     }
 
 
+@router.get("/api/employee/onboarding/digilocker/auth-url")
+async def get_digilocker_auth_url(employee=Depends(get_current_employee)):
+    """Generate DigiLocker OAuth2 authorization URL for mobile/web login."""
+    from digilocker import generate_auth_url
+    clean_email = employee["email"].strip().lower()
+    org_id = employee.get("organization_id", "org_default")
+    auth_data = generate_auth_url(clean_email, org_id)
+    return auth_data
+
+
+@router.get("/hrms/onboarding/digilocker/callback")
+@router.get("/api/employee/onboarding/digilocker/callback")
+async def digilocker_oauth_callback(code: str, state: str, error: Optional[str] = None):
+    """Handle DigiLocker OAuth2 redirection and exchange authorization code for verified documents."""
+    from fastapi.responses import HTMLResponse
+    from digilocker import exchange_code_for_token, pull_document, DIGILOCKER_DOC_TYPES
+
+    if error:
+        return HTMLResponse(
+            f"<html><body style='font-family:sans-serif;text-align:center;padding:40px;'>"
+            f"<h2 style='color:#e11d48;'>DigiLocker Verification Cancelled</h2>"
+            f"<p>{error}</p>"
+            f"<p>You can return to the LogDay app.</p></body></html>"
+        )
+
+    try:
+        parts = state.split(":")
+        emp_email = parts[0]
+        token_res = await exchange_code_for_token(code)
+        access_token = token_res.get("access_token")
+
+        onb = await onboardings_collection.find_one({"employee_email": emp_email})
+        if onb and access_token:
+            docs_submitted = onb.get("documents_submitted", [])
+            for doc_type in ["aadhaar", "pan", "driving_license"]:
+                try:
+                    pulled = await pull_document(access_token, doc_type)
+                    if pulled and pulled.get("success"):
+                        existing = next((d for d in docs_submitted if d["type"] == doc_type), None)
+                        doc_entry = {
+                            "type": doc_type,
+                            "verified": True,
+                            "status": "verified",
+                            "verification_source": "digilocker",
+                            "digilocker_uri": pulled.get("digilocker_uri"),
+                            "digilocker_data": pulled.get("extracted_data"),
+                            "file_url": pulled.get("file_url") or "digilocker_verified_xml",
+                            "submitted_at": datetime.now(timezone.utc).isoformat(),
+                            "verified_by": "DigiLocker Government Portal",
+                            "verified_at": datetime.now(timezone.utc).isoformat()
+                        }
+                        if existing:
+                            existing.update(doc_entry)
+                        else:
+                            docs_submitted.append(doc_entry)
+                except Exception as ex:
+                    logger.warning(f"Could not auto-pull {doc_type} on callback: {ex}")
+
+            await onboardings_collection.update_one(
+                {"_id": onb["_id"]},
+                {"$set": {"documents_submitted": docs_submitted, "updated_at": datetime.now(timezone.utc)}}
+            )
+            await recalculate_progress(onb["_id"])
+
+        return HTMLResponse(
+            "<html><body style='font-family:sans-serif;text-align:center;padding:40px;background:#f0fdf4;'>"
+            "<h2 style='color:#16a34a;'>DigiLocker Verification Successful!</h2>"
+            "<p style='color:#15803d;'>Your government-verified credentials have been linked with your onboarding profile.</p>"
+            "<p>Please return to the LogDay app to continue.</p>"
+            "<script>setTimeout(function(){ window.location.href = 'logday://onboarding-complete'; }, 1500);</script>"
+            "</body></html>"
+        )
+    except Exception as e:
+        logger.error(f"DigiLocker callback processing error: {e}")
+        return HTMLResponse(
+            f"<html><body style='font-family:sans-serif;text-align:center;padding:40px;'>"
+            f"<h2 style='color:#e11d48;'>Verification Error</h2>"
+            f"<p>{str(e)}</p></body></html>"
+        )
+
+
