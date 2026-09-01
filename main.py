@@ -4228,6 +4228,23 @@ async def get_my_leave_requests(employee=Depends(get_current_employee)):
             r["created_at"] = r["created_at"].isoformat()
     return requests
 
+@app.get("/api/leave/my-balance")
+@app.get("/api/leave/balance")
+async def get_my_leave_balance(
+    year: Optional[int] = None,
+    month: Optional[str] = None,
+    employee=Depends(get_current_employee)
+):
+    """Retrieve live computed leave quotas, balances, and carry-forward for the authenticated employee."""
+    org_id = employee.get("organization_id", "system_org")
+    balance = await calculate_leave_balance(
+        email=employee["email"],
+        org_id=org_id,
+        year=year,
+        month=month
+    )
+    return balance
+
 # --- Manager Endpoints ---
 @app.get("/api/manager/team-attendance")
 async def get_team_attendance(manager=Depends(get_current_employee)):
