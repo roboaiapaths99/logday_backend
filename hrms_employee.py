@@ -180,7 +180,21 @@ async def get_salary_structure(employee=Depends(get_current_employee)):
     """Fetch current salary structure details."""
     salary = employee.get("salary_structure")
     if not salary:
-        raise HTTPException(status_code=404, detail="Salary structure not configured yet. Please contact HR.")
+        from database import salary_structures_collection
+        sal_doc = await salary_structures_collection.find_one({"employee_email": employee["email"]})
+        if sal_doc:
+            sal_doc["_id"] = str(sal_doc["_id"])
+            return sal_doc
+        return {
+            "ctc": 0.0,
+            "monthly_salary": 0.0,
+            "basic_salary": 0.0,
+            "hra": 0.0,
+            "special_allowance": 0.0,
+            "bank_name": "Not Configured",
+            "bank_account": "•••• ••••",
+            "bank_ifsc": "N/A"
+        }
     return salary
 
 
