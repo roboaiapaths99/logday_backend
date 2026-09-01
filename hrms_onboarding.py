@@ -1,4 +1,5 @@
 import uuid
+import logging
 from datetime import datetime, timezone
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -12,6 +13,8 @@ from hrms_models import (
     OnboardingCreate, OnboardingTask, OnboardingTaskStatus,
     OnboardingStatus, OnboardingTaskStatus
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["HRMS Onboarding"])
 
