@@ -374,6 +374,8 @@ class SystemSettings(BaseModel):
     # Desk / General Office Timings
     office_start_time: str = "09:00"
     office_end_time: str = "18:00"
+    lunch_start_time: str = "13:00"
+    lunch_end_time: str = "14:00"
     late_threshold_mins: int = 15
     late_grace_mins: int = 15
     late_to_short_leave_mins: int = 45
@@ -388,9 +390,14 @@ class SystemSettings(BaseModel):
     custom_field_rules_enabled: bool = False
     field_office_start_time: str = "10:00"
     field_office_end_time: str = "19:00"
+    field_lunch_start_time: str = "13:00"
+    field_lunch_end_time: str = "14:00"
     field_late_threshold_mins: int = 30
     field_late_grace_mins: int = 30
+    field_late_to_short_leave_mins: int = 45
     field_late_to_half_day_time: str = "12:30"
+    field_early_leave_short_mins: int = 45
+    field_early_leave_half_day_time: str = "15:00"
     field_half_day_min_hours: float = 4.0
     field_full_day_min_hours: float = 8.0
     field_required_hours: float = 9.0
@@ -706,6 +713,14 @@ class LeavePolicyUpdateRequest(BaseModel):
     short_leave_monthly_limit: Optional[int] = 2
     short_leave_max_hours: Optional[float] = 2.0
     short_leave_penalty_rule: Optional[str] = "half_day_per_2_excess"
+    office_start_time: Optional[str] = "09:00"
+    office_end_time: Optional[str] = "18:00"
+    short_leave_cutoff_time: Optional[str] = "10:15"
+    half_day_late_cutoff_time: Optional[str] = "11:30"
+    half_day_early_exit_cutoff_time: Optional[str] = "14:00"
+    lunch_start_time: Optional[str] = "13:00"
+    lunch_end_time: Optional[str] = "14:00"
+    max_lunch_duration_mins: Optional[int] = 60
 
 
 class EmployeeLeaveQuotaUpdateRequest(BaseModel):

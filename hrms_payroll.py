@@ -8,7 +8,7 @@ from database import (
     payrolls_collection, employees_collection,
     attendance_logs_collection, leave_requests_collection,
     km_reimbursements_collection, expense_claims_collection,
-    holidays_collection, leave_policies_collection
+    holidays_collection, leave_policies_collection, settings_collection
 )
 from models import Admin
 from auth import get_current_admin
@@ -237,6 +237,7 @@ async def fetch_attendance_data(employee_email: str, org_id: str, payroll_month:
         end_dt = datetime(year, month + 1, 1, tzinfo=timezone.utc)
 
     # Fetch Leave Policy
+    # Fetch Leave Policy & System Settings
     policy = await leave_policies_collection.find_one({
         "$or": [
             {"organization_id": org_id, "year": year},
@@ -245,66 +246,23 @@ async def fetch_attendance_data(employee_email: str, org_id: str, payroll_month:
             {"organization_id": "system_org"}
         ]
     })
+    org_settings = await settings_collection.find_one({
+        "$or": [
+            {"organization_id": org_id},
+            {"organization_id": "system_org"}
+        ]
+    })
     paid_leave_types = ["sick", "casual", "on_duty", "duty"]
-    half_day_min_hours = 4.0
-    full_day_min_hours = 8.0
     short_leave_monthly_limit = 2
+    short_leave_penalty_rule = "half_day_per_2_excess"
     if policy:
         paid_leave_types = policy.get("paid_leave_types", paid_leave_types)
-        half_day_min_hours = float(policy.get("half_day_min_hours", 4.0))
-        full_day_min_hours = float(policy.get("full_day_min_hours", 8.0))
         short_leave_monthly_limit = int(policy.get("short_leave_monthly_limit", 2))
+        short_leave_penalty_rule = policy.get("short_leave_penalty_rule", "half_day_per_2_excess")
 
-    # 2. Fetch Attendance Logs to evaluate daily hours and presence
-    cursor_logs = attendance_logs_collection.find({
-        "user_id": emp_id,
-        "timestamp": {"$gte": start_dt, "$lt": end_dt}
-    }).sort("timestamp", 1)
-    logs = await cursor_logs.to_list(length=500)
+    from main import classify_attendance_day
 
-    daily_logs = {}
-    for log in logs:
-        ts = log["timestamp"]
-        ist_ts = ts + timedelta(hours=5, minutes=30)
-        d_num = ist_ts.day
-        if d_num not in daily_logs:
-            daily_logs[d_num] = []
-        daily_logs[d_num].append(log)
-
-    check_ins_presence = 0.0
-    early_leaves_count = 0
-
-    for d_num, d_logs in daily_logs.items():
-        if d_num in days_off:
-            continue
-        
-        checkins = [l for l in d_logs if l.get("type") == "check-in"]
-        checkouts = [l for l in d_logs if l.get("type") == "check-out"]
-        
-        if not checkins:
-            continue
-            
-        first_in = checkins[0]["timestamp"]
-        last_out = checkouts[-1]["timestamp"] if checkouts else first_in
-        duration_hours = max(0.0, (last_out - first_in).total_seconds() / 3600.0)
-        
-        if duration_hours >= full_day_min_hours:
-            check_ins_presence += 1.0
-        elif duration_hours >= half_day_min_hours:
-            check_ins_presence += 0.5
-        elif len(checkins) > 0:
-            check_ins_presence += 0.5
-        else:
-            check_ins_presence += 1.0
-
-        if checkouts:
-            last_ts = checkouts[-1]["timestamp"] + timedelta(hours=5, minutes=30)
-            if last_ts.hour < 17:
-                early_leaves_count += 1
-
-    present_days = check_ins_presence + len(days_off)
-
-    # 3. Approved leave days (with duration and paid status)
+    # 2. Approved leave days (with duration and paid status)
     emp_identifiers = [employee_email.strip().lower(), employee_email.strip(), emp_id]
     if "employee_id" in emp and emp["employee_id"]:
         emp_identifiers.append(str(emp["employee_id"]).strip())
@@ -323,6 +281,10 @@ async def fetch_attendance_data(employee_email: str, org_id: str, payroll_month:
     start_month_str = start_dt.strftime("%Y-%m-%d")
     end_month_str = (end_dt - timedelta(days=1)).strftime("%Y-%m-%d")
 
+    # Map approved leaves by date YYYY-MM-DD
+    leaves_by_date = {}
+    short_leave_days_set = set()
+
     for l in leaves:
         l_start = str(l.get("start_date", ""))
         l_end = str(l.get("end_date", l_start))
@@ -337,7 +299,6 @@ async def fetch_attendance_data(employee_email: str, org_id: str, payroll_month:
                 dur = 0.5
             elif dur_type == "short_leave":
                 dur = 0.0
-                early_leaves_count += 1
             else:
                 cur_dt = max(datetime.strptime(l_start[:10], "%Y-%m-%d"), datetime.strptime(start_month_str, "%Y-%m-%d"))
                 end_dt_loop = min(datetime.strptime(l_end[:10], "%Y-%m-%d"), datetime.strptime(end_month_str, "%Y-%m-%d"))
@@ -346,6 +307,16 @@ async def fetch_attendance_data(employee_email: str, org_id: str, payroll_month:
                     if cur_dt.day not in days_off:
                         dur += 1.0
                     cur_dt += timedelta(days=1)
+
+            # Map to individual days for attendance classifier lookup
+            cur_dt = max(datetime.strptime(l_start[:10], "%Y-%m-%d"), datetime.strptime(start_month_str, "%Y-%m-%d"))
+            end_dt_loop = min(datetime.strptime(l_end[:10], "%Y-%m-%d"), datetime.strptime(end_month_str, "%Y-%m-%d"))
+            while cur_dt <= end_dt_loop:
+                d_str = cur_dt.strftime("%Y-%m-%d")
+                leaves_by_date[d_str] = l
+                if dur_type == "short_leave":
+                    short_leave_days_set.add(cur_dt.day)
+                cur_dt += timedelta(days=1)
 
             l_type = str(l.get("leave_type", "other")).lower().strip()
             if l.get("is_paid") is not None:
@@ -358,10 +329,100 @@ async def fetch_attendance_data(employee_email: str, org_id: str, payroll_month:
             elif not is_p and "on_duty" not in l_type and "duty" not in l_type:
                 unpaid_leave_days += dur
 
+    # 3. Fetch Attendance Logs to evaluate daily hours and presence
+    cursor_logs = attendance_logs_collection.find({
+        "$or": [
+            {"user_id": {"$in": emp_identifiers}},
+            {"email": {"$in": emp_identifiers}}
+        ],
+        "timestamp": {"$gte": start_dt, "$lt": end_dt}
+    }).sort("timestamp", 1)
+    logs = await cursor_logs.to_list(length=1000)
+
+    tz_offset = int((org_settings or {}).get("timezone_offset", 330))
+    daily_logs = {}
+    for log in logs:
+        ts = log["timestamp"]
+        if ts.tzinfo is None: ts = ts.replace(tzinfo=timezone.utc)
+        local_ts = ts + timedelta(minutes=tz_offset)
+        d_num = local_ts.day
+        if d_num not in daily_logs:
+            daily_logs[d_num] = []
+        daily_logs[d_num].append(log)
+
+    check_ins_presence = 0.0
+
+    for d_num, d_logs in daily_logs.items():
+        if d_num in days_off:
+            continue
+        
+        checkins = [l for l in d_logs if l.get("type") in ["check-in", "IN"]]
+        checkouts = [l for l in d_logs if l.get("type") in ["check-out", "OUT"]]
+        
+        if not checkins:
+            continue
+            
+        first_in = checkins[0]["timestamp"]
+        if first_in.tzinfo is None: first_in = first_in.replace(tzinfo=timezone.utc)
+        first_in_local = first_in + timedelta(minutes=tz_offset)
+
+        last_out = checkouts[-1]["timestamp"] if checkouts else None
+        if last_out and last_out.tzinfo is None: last_out = last_out.replace(tzinfo=timezone.utc)
+        last_out_local = (last_out + timedelta(minutes=tz_offset)) if last_out else None
+
+        # Calculate paired working session duration
+        duration_sec = 0.0
+        last_in_ts = None
+        for l in d_logs:
+            l_ts = l["timestamp"]
+            if l_ts.tzinfo is None: l_ts = l_ts.replace(tzinfo=timezone.utc)
+            l_type = l.get("type")
+            if l_type in ["check-in", "IN"]:
+                last_in_ts = l_ts
+            elif l_type in ["check-out", "OUT"] and last_in_ts:
+                duration_sec += max(0.0, (l_ts - last_in_ts).total_seconds())
+                last_in_ts = None
+        
+        duration_hours = round(duration_sec / 3600.0, 2)
+        if duration_hours == 0.0 and checkouts and checkins:
+            duration_hours = round(max(0.0, (last_out - first_in).total_seconds()) / 3600.0, 2)
+
+        day_date_str = f"{year:04d}-{month:02d}-{d_num:02d}"
+        matching_leave = leaves_by_date.get(day_date_str)
+
+        classification = classify_attendance_day(
+            first_checkin_local=first_in_local,
+            last_checkout_local=last_out_local,
+            worked_hours=duration_hours,
+            settings=org_settings or {},
+            employee_type=emp.get("employee_type", "desk"),
+            approved_leave=matching_leave
+        )
+
+        check_ins_presence += classification.get("effective_days", 1.0)
+        if classification.get("is_short_leave"):
+            short_leave_days_set.add(d_num)
+
+    present_days = check_ins_presence + len(days_off)
+    short_leaves_count = len(short_leave_days_set)
+
     short_leave_penalty_days = 0.0
-    if early_leaves_count > short_leave_monthly_limit:
-        excess_short = early_leaves_count - short_leave_monthly_limit
-        short_leave_penalty_days = round((excess_short // 2) * 0.5, 2)
+    if short_leaves_count > short_leave_monthly_limit:
+        excess_short = short_leaves_count - short_leave_monthly_limit
+        if short_leave_penalty_rule in ["1_excess_quarter_day", "quarter_day_per_excess"]:
+            short_leave_penalty_days = round(excess_short * 0.25, 2)
+        elif short_leave_penalty_rule in ["1_excess_half_day", "half_day_per_excess"]:
+            short_leave_penalty_days = round(excess_short * 0.50, 2)
+        elif short_leave_penalty_rule in ["1_excess_full_day", "full_day_per_excess"]:
+            short_leave_penalty_days = round(excess_short * 1.00, 2)
+        elif short_leave_penalty_rule in ["full_day_per_2_excess", "2_excess_full_day"]:
+            short_leave_penalty_days = round((excess_short // 2) * 1.0, 2)
+        elif short_leave_penalty_rule in ["3_excess_full_day", "full_day_per_3_excess"]:
+            short_leave_penalty_days = round((excess_short // 3) * 1.0, 2)
+        elif short_leave_penalty_rule == "no_penalty":
+            short_leave_penalty_days = 0.0
+        else:  # half_day_per_2_excess / default
+            short_leave_penalty_days = round((excess_short // 2) * 0.5, 2)
 
     actual_work_days = num_days - len(days_off)
     absent_days = max(0.0, float(actual_work_days) - float(check_ins_presence) - float(paid_leave_days) - float(unpaid_leave_days))

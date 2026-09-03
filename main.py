@@ -1093,6 +1093,335 @@ async def change_password(req: ChangePasswordRequest, employee=Depends(get_curre
     }
 
 
+def classify_attendance_day(
+    first_checkin_local: Optional[datetime],
+    last_checkout_local: Optional[datetime],
+    worked_hours: float,
+    settings: Optional[dict] = None,
+    employee_type: str = "desk",
+    approved_leave: Optional[dict] = None
+) -> dict:
+    """
+    Central enterprise classification engine for an employee's attendance day.
+    Evaluates:
+    - Office/Shift timings (desk vs field configurable by admin)
+    - Late grace & late threshold
+    - Late -> Short Leave threshold (mins or time)
+    - Late -> Half Day threshold (time, e.g. after 11:30 or lunch)
+    - Early Exit -> Half Day threshold (time, e.g. before 14:00)
+    - Early Exit -> Short Leave threshold (mins before shift end)
+    - Min Half-Day hours & Min Full-Day hours
+    - Split off-hours: late deficit vs early exit deficit
+    - Applied Short Leave / Half Day vs Attendance-triggered Short Leave / Half Day
+    """
+    settings = settings or {}
+    emp_type = str(employee_type).lower().strip()
+    is_field = (emp_type == "field") and settings.get("custom_field_rules_enabled", True)
+
+    def _parse_t(t_str, def_h, def_m):
+        try:
+            if t_str and ":" in str(t_str):
+                parts = str(t_str).strip().split(":")
+                return int(parts[0]), int(parts[1])
+        except Exception:
+            pass
+        return def_h, def_m
+
+    # 1. Timings & thresholds from admin configuration
+    if is_field:
+        start_h, start_m = _parse_t(settings.get("field_office_start_time") or settings.get("office_start_time"), 10, 0)
+        end_h, end_m = _parse_t(settings.get("field_office_end_time") or settings.get("office_end_time"), 19, 0)
+        late_grace_mins = int(settings.get("field_late_grace_mins") if settings.get("field_late_grace_mins") is not None else settings.get("late_grace_mins", 30))
+        late_to_short_mins = int(settings.get("field_late_to_short_leave_mins") if settings.get("field_late_to_short_leave_mins") is not None else settings.get("late_to_short_leave_mins", 45))
+        late_half_h, late_half_m = _parse_t(settings.get("field_late_to_half_day_time") or settings.get("late_to_half_day_time"), 12, 30)
+        early_half_h, early_half_m = _parse_t(settings.get("field_early_leave_half_day_time") or settings.get("early_leave_half_day_time"), 15, 0)
+        early_short_mins = int(settings.get("field_early_leave_short_mins") if settings.get("field_early_leave_short_mins") is not None else settings.get("early_leave_short_mins", 45))
+        half_day_min_hours = float(settings.get("field_half_day_min_hours") if settings.get("field_half_day_min_hours") is not None else settings.get("half_day_min_hours", 4.0))
+        full_day_min_hours = float(settings.get("field_full_day_min_hours") if settings.get("field_full_day_min_hours") is not None else settings.get("full_day_min_hours", 8.0))
+        required_hours = float(settings.get("field_required_hours") if settings.get("field_required_hours") is not None else settings.get("required_hours", 9.0))
+        short_leave_max_hours = float(settings.get("field_short_leave_max_hours") if settings.get("field_short_leave_max_hours") is not None else settings.get("short_leave_max_hours", 2.0))
+    else:
+        start_h, start_m = _parse_t(settings.get("office_start_time"), 9, 0)
+        end_h, end_m = _parse_t(settings.get("office_end_time"), 18, 0)
+        late_grace_mins = int(settings.get("late_grace_mins") if settings.get("late_grace_mins") is not None else settings.get("late_threshold_mins", 15))
+        
+        # Support either exact cutoff time or relative mins for late-to-short-leave
+        if settings.get("short_leave_cutoff_time"):
+            sl_h, sl_m = _parse_t(settings.get("short_leave_cutoff_time"), 10, 15)
+            late_to_short_mins = max(0, (sl_h * 60 + sl_m) - (start_h * 60 + start_m))
+        else:
+            late_to_short_mins = int(settings.get("late_to_short_leave_mins", 45))
+
+        late_half_h, late_half_m = _parse_t(settings.get("half_day_late_cutoff_time") or settings.get("late_to_half_day_time"), 11, 30)
+        early_half_h, early_half_m = _parse_t(settings.get("half_day_early_exit_cutoff_time") or settings.get("early_leave_half_day_time"), 14, 0)
+        early_short_mins = int(settings.get("early_leave_short_mins", 45))
+        half_day_min_hours = float(settings.get("half_day_min_hours", 4.0))
+        full_day_min_hours = float(settings.get("full_day_min_hours", 8.0))
+        required_hours = float(settings.get("required_hours", 8.0))
+        short_leave_max_hours = float(settings.get("short_leave_max_hours", 2.0))
+
+    # Format strings for explanations
+    late_half_str = f"{late_half_h:02d}:{late_half_m:02d}"
+    early_half_str = f"{early_half_h:02d}:{early_half_m:02d}"
+
+    # Handle No Check-in Case
+    if not first_checkin_local:
+        if approved_leave:
+            dur_type = str(approved_leave.get("duration_type", "")).lower().strip()
+            l_type = str(approved_leave.get("leave_type", "leave")).title()
+            if dur_type == "short_leave":
+                return {
+                    "status": "Short Leave",
+                    "is_late": False,
+                    "is_early_leave": False,
+                    "is_short_leave": True,
+                    "is_half_day": False,
+                    "short_leave_type": "applied",
+                    "half_day_type": None,
+                    "late_mins": 0,
+                    "early_exit_mins": 0,
+                    "late_off_hours": 0.0,
+                    "early_off_hours": 0.0,
+                    "off_hours": 0.0,
+                    "worked_hours": 0.0,
+                    "required_hours": required_hours,
+                    "effective_days": 1.0,
+                    "classification_reason": f"Approved Short Leave ({l_type})",
+                    "is_applied_leave": True
+                }
+            elif dur_type in ["first_half", "second_half", "half_day"] or approved_leave.get("duration") == 0.5:
+                return {
+                    "status": "Half Day",
+                    "is_late": False,
+                    "is_early_leave": False,
+                    "is_short_leave": False,
+                    "is_half_day": True,
+                    "short_leave_type": None,
+                    "half_day_type": f"{dur_type}_applied",
+                    "late_mins": 0,
+                    "early_exit_mins": 0,
+                    "late_off_hours": 0.0,
+                    "early_off_hours": 0.0,
+                    "off_hours": round(required_hours * 0.5, 2),
+                    "worked_hours": 0.0,
+                    "required_hours": required_hours,
+                    "effective_days": 0.5,
+                    "classification_reason": f"Approved Half Day ({dur_type})",
+                    "is_applied_leave": True
+                }
+            else:
+                return {
+                    "status": f"Leave ({l_type})",
+                    "is_late": False,
+                    "is_early_leave": False,
+                    "is_short_leave": False,
+                    "is_half_day": False,
+                    "short_leave_type": None,
+                    "half_day_type": None,
+                    "late_mins": 0,
+                    "early_exit_mins": 0,
+                    "late_off_hours": 0.0,
+                    "early_off_hours": 0.0,
+                    "off_hours": 0.0,
+                    "worked_hours": 0.0,
+                    "required_hours": required_hours,
+                    "effective_days": 0.0,
+                    "classification_reason": f"Approved Leave ({l_type})",
+                    "is_applied_leave": True
+                }
+
+        return {
+            "status": "Absent",
+            "is_late": False,
+            "is_early_leave": False,
+            "is_short_leave": False,
+            "is_half_day": False,
+            "short_leave_type": None,
+            "half_day_type": None,
+            "late_mins": 0,
+            "early_exit_mins": 0,
+            "late_off_hours": 0.0,
+            "early_off_hours": 0.0,
+            "off_hours": required_hours,
+            "worked_hours": 0.0,
+            "required_hours": required_hours,
+            "effective_days": 0.0,
+            "classification_reason": "No check-in recorded",
+            "is_applied_leave": False
+        }
+
+    # Reference datetimes for shift evaluation
+    shift_start = first_checkin_local.replace(hour=start_h, minute=start_m, second=0, microsecond=0)
+    shift_end = first_checkin_local.replace(hour=end_h, minute=end_m, second=0, microsecond=0)
+    grace_cutoff = shift_start + timedelta(minutes=late_grace_mins)
+    short_leave_late_cutoff = shift_start + timedelta(minutes=late_to_short_mins)
+    half_day_late_cutoff = first_checkin_local.replace(hour=late_half_h, minute=late_half_m, second=0, microsecond=0)
+    half_day_early_cutoff = first_checkin_local.replace(hour=early_half_h, minute=early_half_m, second=0, microsecond=0)
+    short_leave_early_cutoff = shift_end - timedelta(minutes=early_short_mins)
+
+    # 2. Late Arrival Evaluation
+    late_mins = 0
+    late_off_hours = 0.0
+    is_late = False
+    if first_checkin_local > shift_start:
+        diff_sec = (first_checkin_local - shift_start).total_seconds()
+        late_mins = max(0, int(diff_sec / 60))
+        late_off_hours = round(late_mins / 60.0, 2)
+        if first_checkin_local > grace_cutoff:
+            is_late = True
+
+    # 3. Early Departure Evaluation
+    early_exit_mins = 0
+    early_off_hours = 0.0
+    is_early_leave = False
+    if last_checkout_local:
+        if last_checkout_local < shift_end:
+            diff_sec = (shift_end - last_checkout_local).total_seconds()
+            early_exit_mins = max(0, int(diff_sec / 60))
+            early_off_hours = round(early_exit_mins / 60.0, 2)
+            if early_exit_mins > 10:  # 10 mins early checkout grace
+                is_early_leave = True
+
+    # Total off-hours (deficit between required and worked, or sum of late and early deficits)
+    if worked_hours > 0:
+        total_off_hours = round(max(0.0, required_hours - worked_hours), 2)
+    else:
+        total_off_hours = round(late_off_hours + early_off_hours, 2)
+
+    # 4. Status Determination
+    status = "Present"
+    is_short_leave = False
+    is_half_day = False
+    short_leave_type = None
+    half_day_type = None
+    effective_days = 1.0
+    classification_reason = "On-time full day"
+    is_applied_leave = False
+
+    # A) Check if applied leave exists for today
+    if approved_leave:
+        dur_type = str(approved_leave.get("duration_type", "")).lower().strip()
+        slot = str(approved_leave.get("short_leave_slot", "")).lower().strip()
+        if dur_type == "short_leave":
+            is_short_leave = True
+            short_leave_type = "applied"
+            is_applied_leave = True
+            status = "Short Leave"
+            slot_label = f" ({slot.title()})" if slot else ""
+            classification_reason = f"Approved Short Leave{slot_label}"
+            
+            # If short leave slot is morning, late arrival is authorized
+            if slot == "morning":
+                is_late = False
+                late_mins = 0
+                late_off_hours = 0.0
+            elif slot == "evening":
+                is_early_leave = False
+                early_exit_mins = 0
+                early_off_hours = 0.0
+            else:
+                # General / mid-day short leave: waives up to 2 hours of deficit
+                late_off_hours = max(0.0, late_off_hours - 1.0)
+                early_off_hours = max(0.0, early_off_hours - 1.0)
+            total_off_hours = round(late_off_hours + early_off_hours, 2)
+        elif dur_type in ["first_half", "second_half", "half_day"] or approved_leave.get("duration") == 0.5:
+            is_half_day = True
+            half_day_type = f"{dur_type}_applied"
+            is_applied_leave = True
+            status = "Half Day"
+            effective_days = 0.5
+            classification_reason = f"Approved Half Day ({dur_type.replace('_', ' ').title()})"
+            if "first" in dur_type:
+                # 1st half leave: late arrival authorized
+                is_late = False
+                late_mins = 0
+                late_off_hours = 0.0
+            elif "second" in dur_type:
+                # 2nd half leave: early departure authorized
+                is_early_leave = False
+                early_exit_mins = 0
+                early_off_hours = 0.0
+            total_off_hours = round(late_off_hours + early_off_hours, 2)
+
+    # B) Evaluate Half Day thresholds if not already half day
+    if not is_half_day:
+        if first_checkin_local >= half_day_late_cutoff:
+            is_half_day = True
+            half_day_type = "late_arrival"
+            status = "Half Day"
+            effective_days = 0.5
+            classification_reason = f"Check-in at {first_checkin_local.strftime('%H:%M')} (after Half-Day limit {late_half_str})"
+        elif last_checkout_local and last_checkout_local <= half_day_early_cutoff:
+            is_half_day = True
+            half_day_type = "early_departure"
+            status = "Half Day"
+            effective_days = 0.5
+            classification_reason = f"Check-out at {last_checkout_local.strftime('%H:%M')} (before Half-Day limit {early_half_str})"
+        elif last_checkout_local and worked_hours > 0 and worked_hours < half_day_min_hours:
+            status = "Absent"
+            effective_days = 0.0
+            classification_reason = f"Worked only {worked_hours:.1f}h (< min half-day requirement {half_day_min_hours:.1f}h)"
+        elif last_checkout_local and worked_hours > 0 and worked_hours < (full_day_min_hours - short_leave_max_hours):
+            is_half_day = True
+            half_day_type = "low_hours"
+            status = "Half Day"
+            effective_days = 0.5
+            classification_reason = f"Worked {worked_hours:.1f}h (credited as Half-Day, threshold {half_day_min_hours:.1f}h - {full_day_min_hours - short_leave_max_hours:.1f}h)"
+
+    # C) Evaluate Short Leave thresholds if not Half Day and not already Short Leave
+    if not is_half_day and not is_short_leave and status != "Absent":
+        if first_checkin_local > short_leave_late_cutoff:
+            is_short_leave = True
+            short_leave_type = "late_arrival"
+            status = "Short Leave"
+            effective_days = 1.0
+            classification_reason = f"Late by {late_mins}m (exceeds Short Leave limit {late_to_short_mins}m)"
+        elif last_checkout_local and last_checkout_local < short_leave_early_cutoff:
+            is_short_leave = True
+            short_leave_type = "early_departure"
+            status = "Short Leave"
+            effective_days = 1.0
+            classification_reason = f"Early exit by {early_exit_mins}m (exceeds Short Leave limit {early_short_mins}m)"
+        elif last_checkout_local and worked_hours > 0 and worked_hours < full_day_min_hours:
+            is_short_leave = True
+            short_leave_type = "low_hours"
+            status = "Short Leave"
+            effective_days = 1.0
+            classification_reason = f"Worked {worked_hours:.1f}h (< full day requirement {full_day_min_hours:.1f}h)"
+
+    # D) Fallback states
+    if not is_half_day and not is_short_leave:
+        if is_early_leave:
+            status = "Early Leave"
+            classification_reason = f"Left {early_exit_mins} mins early"
+        elif is_late:
+            status = "Late"
+            classification_reason = f"Late check-in by {late_mins} mins"
+        else:
+            status = "Present"
+            classification_reason = "On-time attendance"
+
+    return {
+        "status": status,
+        "is_late": is_late,
+        "is_early_leave": is_early_leave,
+        "is_short_leave": is_short_leave,
+        "is_half_day": is_half_day,
+        "short_leave_type": short_leave_type,
+        "half_day_type": half_day_type,
+        "late_mins": late_mins,
+        "early_exit_mins": early_exit_mins,
+        "late_off_hours": late_off_hours,
+        "early_off_hours": early_off_hours,
+        "off_hours": total_off_hours,
+        "worked_hours": round(worked_hours, 2),
+        "required_hours": round(required_hours, 2),
+        "effective_days": effective_days,
+        "classification_reason": classification_reason,
+        "is_applied_leave": is_applied_leave
+    }
+
+
 @app.post("/verify-presence")
 async def verify_presence(req: VerifyPresenceRequest):
     """Verify user presence using face + GPS + WiFi telemetry."""
@@ -1507,65 +1836,115 @@ async def smart_attendance(req: VerifyPresenceRequest, request: Request, backgro
 
 
 
-        # 4. Log Attendance (Consolidated)
+        # 4. Log Attendance (Consolidated Enterprise Classification)
         attendance_type = req.intended_type or "check-in" # Default or provided
-        
-        is_early_leave = False
-        is_late = False
-        late_mins = 0
-        
+        settings = org_settings or SystemSettings().dict()
+        tz_offset = int(settings.get("timezone_offset", 330))
+        log_time_utc = datetime.now(timezone.utc)
+        current_time_local = log_time_utc + timedelta(minutes=tz_offset)
+        today_date_str = current_time_local.strftime("%Y-%m-%d")
+
+        # Check for approved leave for today (applied short leave, half day, etc.)
+        approved_leave = None
+        try:
+            approved_leave = await leave_requests_collection.find_one({
+                "$or": [
+                    {"employee_id": clean_email},
+                    {"email": clean_email},
+                    {"employee_id": str(user["_id"])}
+                ],
+                "status": {"$regex": "^approved$", "$options": "i"},
+                "start_date": {"$lte": today_date_str},
+                "end_date": {"$gte": today_date_str}
+            })
+        except Exception as e:
+            logger.warning(f"Leave lookup error in attendance: {e}")
+
+        today_start_utc = get_today_start(tz_offset)
+
         if attendance_type == "check-in":
-            # Use org_settings which was fetched at line 833
-            settings = org_settings or SystemSettings().dict()
-            
-            if role == "field":
-                start_time_str = settings.get("field_office_start_time", "10:00")
-                threshold_mins = settings.get("field_late_threshold_mins", 30)
-                tz_offset = settings.get("timezone_offset", 330)
+            classification = classify_attendance_day(
+                first_checkin_local=current_time_local,
+                last_checkout_local=None,
+                worked_hours=0.0,
+                settings=settings,
+                employee_type=role,
+                approved_leave=approved_leave
+            )
+        else: # check-out
+            # Fetch all attendance logs for this employee today (in chronological order)
+            today_logs = await attendance_logs_collection.find(
+                {
+                    "$or": [
+                        {"user_id": user_id_str},
+                        {"user_id": emp_email},
+                        {"email": emp_email}
+                    ],
+                    "timestamp": {"$gte": today_start_utc}
+                }
+            ).sort("timestamp", 1).to_list(100)
+
+            checkin_logs = [l for l in today_logs if l.get("type") in ["check-in", "IN"]]
+            today_first_checkin = checkin_logs[0] if checkin_logs else None
+
+            # Calculate paired worked hours across all sessions today plus this checkout
+            worked_sec = 0.0
+            last_in = None
+            for l in today_logs:
+                l_ts = l["timestamp"]
+                if l_ts.tzinfo is None: l_ts = l_ts.replace(tzinfo=timezone.utc)
+                l_type = l.get("type")
+                if l_type in ["check-in", "IN"]:
+                    last_in = l_ts
+                elif l_type in ["check-out", "OUT"] and last_in:
+                    worked_sec += max(0.0, (l_ts - last_in).total_seconds())
+                    last_in = None
+
+            # Add current checkout session
+            if last_in:
+                worked_sec += max(0.0, (log_time_utc - last_in).total_seconds())
+            elif today_first_checkin:
+                # Fallback if intermediate in/out was missing
+                f_ts = today_first_checkin["timestamp"]
+                if f_ts.tzinfo is None: f_ts = f_ts.replace(tzinfo=timezone.utc)
+                worked_sec = max(0.0, (log_time_utc - f_ts).total_seconds())
+
+            if today_first_checkin:
+                f_ts = today_first_checkin["timestamp"]
+                if f_ts.tzinfo is None: f_ts = f_ts.replace(tzinfo=timezone.utc)
+                first_checkin_local = f_ts + timedelta(minutes=tz_offset)
             else:
-                # Desk: Dynamic from Database with defaults
-                start_time_str = settings.get("office_start_time", "10:00")
-                threshold_mins = settings.get("late_threshold_mins", 15)
-                tz_offset = settings.get("timezone_offset", 330)
-            
-            try:
-                log_time_utc = datetime.now(timezone.utc)
-                current_time_local = log_time_utc + timedelta(minutes=tz_offset)
-                
-                # Limit time for today
-                start_h, start_m = map(int, start_time_str.split(":"))
-                limit_time = current_time_local.replace(hour=start_h, minute=start_m, second=0, microsecond=0) + timedelta(minutes=threshold_mins)
-                
-                if current_time_local > limit_time:
-                    is_late = True
-                    diff = current_time_local - current_time_local.replace(hour=start_h, minute=start_m, second=0, microsecond=0)
-                    late_mins = int(diff.total_seconds() / 60)
-            except Exception as e:
-                logger.error(f"Error calculating lateness: {e}")
-                
-        elif attendance_type == "check-out":
-            # Check for early leave
-            settings = org_settings or SystemSettings().dict()
-            if role == "field":
-                end_time_str = settings.get("field_office_end_time", "18:00")
-                tz_offset = settings.get("timezone_offset", 330)
-            else:
-                # Desk: Dynamic from Database with defaults
-                end_time_str = settings.get("office_end_time", "18:00")
-                tz_offset = settings.get("timezone_offset", 330)
-                
-            try:
-                log_time_utc = datetime.now(timezone.utc)
-                current_time_local = log_time_utc + timedelta(minutes=tz_offset)
-                end_h, end_m = map(int, end_time_str.split(":"))
-                
-                # Assume grace of 10 minutes (e.g. 17:50)
-                early_limit_time = current_time_local.replace(hour=end_h, minute=end_m, second=0, microsecond=0) - timedelta(minutes=10)
-                
-                if current_time_local < early_limit_time:
-                    is_early_leave = True
-            except Exception as e:
-                logger.error(f"Error calculating early checkout: {e}")
+                first_checkin_local = current_time_local
+
+            worked_hours = round(worked_sec / 3600.0, 2)
+
+            classification = classify_attendance_day(
+                first_checkin_local=first_checkin_local,
+                last_checkout_local=current_time_local,
+                worked_hours=worked_hours,
+                settings=settings,
+                employee_type=role,
+                approved_leave=approved_leave
+            )
+
+            # Retroactively update today's first check-in log with final full-day classification
+            if today_first_checkin:
+                await attendance_logs_collection.update_one(
+                    {"_id": today_first_checkin["_id"]},
+                    {"$set": {
+                        "attendance_status": classification["status"],
+                        "is_short_leave": classification["is_short_leave"],
+                        "is_half_day": classification["is_half_day"],
+                        "short_leave_type": classification["short_leave_type"],
+                        "half_day_type": classification["half_day_type"],
+                        "off_hours": classification["off_hours"],
+                        "late_off_hours": classification["late_off_hours"],
+                        "early_off_hours": classification["early_off_hours"],
+                        "classification_reason": classification["classification_reason"],
+                        "is_applied_leave": classification["is_applied_leave"],
+                        "effective_days": classification["effective_days"]
+                    }}
+                )
 
         # Determine unified attendance type
         att_type_val = AttendanceType.REMOTE_FIELD
@@ -1582,7 +1961,6 @@ async def smart_attendance(req: VerifyPresenceRequest, request: Request, backgro
         wfh_session_id = None
         if wfh_approved or role == EmployeeType.WFH or role == "wfh":
             if attendance_type == "check-in":
-                # Ensure a WFH session is started
                 active_session = await wfh_sessions_collection.find_one({
                     "employee_id": str(user["_id"]),
                     "organization_id": org_id,
@@ -1615,7 +1993,6 @@ async def smart_attendance(req: VerifyPresenceRequest, request: Request, backgro
                 else:
                     wfh_session_id = str(active_session["_id"])
             elif attendance_type == "check-out":
-                # Complete the WFH session
                 session = await wfh_sessions_collection.find_one({
                     "employee_id": str(user["_id"]),
                     "organization_id": org_id,
@@ -1646,14 +2023,28 @@ async def smart_attendance(req: VerifyPresenceRequest, request: Request, backgro
             "user_id": str(user["_id"]),
             "email": user["email"],
             "organization_id": user.get("organization_id"),
-            "timestamp": datetime.now(timezone.utc),
+            "timestamp": log_time_utc,
             "type": attendance_type,
             "attendance_type": att_type_val,
+            "attendance_status": classification["status"],
+            "is_late": classification["is_late"],
+            "is_early_leave": classification["is_early_leave"],
+            "is_short_leave": classification["is_short_leave"],
+            "is_half_day": classification["is_half_day"],
+            "short_leave_type": classification["short_leave_type"],
+            "half_day_type": classification["half_day_type"],
+            "late_mins": classification["late_mins"],
+            "early_exit_mins": classification["early_exit_mins"],
+            "late_off_hours": classification["late_off_hours"],
+            "early_off_hours": classification["early_off_hours"],
+            "off_hours": classification["off_hours"],
+            "worked_hours": classification["worked_hours"],
+            "required_hours": classification["required_hours"],
+            "effective_days": classification["effective_days"],
+            "classification_reason": classification["classification_reason"],
+            "is_applied_leave": classification["is_applied_leave"],
             "location": {"lat": req.lat, "long": req.long},
             "check_in_method": check_in_method,
-            "is_late": is_late,
-            "is_early_leave": is_early_leave,
-            "late_mins": max(0, late_mins),
             "wifi_confidence": wifi_pct if role == EmployeeType.DESK else 0,
             "confidence_score": float(distance),
             "status": "SUCCESS",
@@ -1671,11 +2062,11 @@ async def smart_attendance(req: VerifyPresenceRequest, request: Request, backgro
             {"$set": {
                 "checked_in": (attendance_type == "check-in"),
                 "last_attendance_type": attendance_type,
-                "last_attendance_time": log["timestamp"]
+                "last_attendance_time": log["timestamp"],
+                "last_attendance_status": classification["status"]
             }}
         )
 
-        
         # Trigger Background Sync to Google Sheets
         background_tasks.add_task(sync_to_google_sheets, log)
         
@@ -1706,10 +2097,25 @@ async def smart_attendance(req: VerifyPresenceRequest, request: Request, backgro
             "status": "success",
             "type": attendance_type,
             "current_status": attendance_type, # Provide immediate state for UI sync
-            "message": f"Attendance {attendance_type.replace('-', ' ').title()} Successful. Verified via {check_in_method.value.replace('_', ' ').title()}.",
+            "attendance_status": classification["status"],
+            "is_late": classification["is_late"],
+            "is_early_leave": classification["is_early_leave"],
+            "is_short_leave": classification["is_short_leave"],
+            "is_half_day": classification["is_half_day"],
+            "short_leave_type": classification["short_leave_type"],
+            "half_day_type": classification["half_day_type"],
+            "late_mins": classification["late_mins"],
+            "early_exit_mins": classification["early_exit_mins"],
+            "late_off_hours": classification["late_off_hours"],
+            "early_off_hours": classification["early_off_hours"],
+            "off_hours": classification["off_hours"],
+            "worked_hours": classification["worked_hours"],
+            "required_hours": classification["required_hours"],
+            "effective_days": classification["effective_days"],
+            "classification_reason": classification["classification_reason"],
+            "is_applied_leave": classification["is_applied_leave"],
+            "message": f"Attendance {attendance_type.replace('-', ' ').title()} Recorded: {classification['status']} ({classification['classification_reason']})",
             "time": log["timestamp"].isoformat(),
-            "is_late": is_late,
-            "is_early_leave": is_early_leave,
             "wifi_confidence": wifi_pct,
             "wfh_session_id": wfh_session_id,
             "wfh_policy": policy
@@ -1770,10 +2176,15 @@ def attendance_type_str(val):
 @app.get("/api/logs/{email}")
 async def get_logs(email: str, page: int = 1, limit: int = 50, start_date: Optional[str] = None, end_date: Optional[str] = None, current_user: dict = Depends(get_current_employee)):
     """Get attendance logs for a user with date filters and pagination (JWT Protected)."""
-    if current_user["email"] != email:
+    if current_user["email"].strip().lower() != email.strip().lower():
         raise HTTPException(status_code=403, detail="Forbidden: You can only access your own logs.")
 
-    user = await employees_collection.find_one({"email": email})
+    user = await employees_collection.find_one({
+        "$or": [
+            {"email": email.strip().lower()},
+            {"email": email.strip()}
+        ]
+    })
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
@@ -1980,17 +2391,22 @@ async def get_my_analytics(current_user: dict = Depends(get_current_employee)):
 
         # On-time count
         on_time_count = 0
+        user_type = user.get("employee_type", "desk")
+        org_doc = None
+        if org_id:
+            try:
+                org_doc = await settings_collection.find_one({"organization_id": str(org_id) if ObjectId.is_valid(str(org_id)) else org_id})
+            except Exception: pass
+
+        if user_type == "field":
+            start_time_str = (org_doc or {}).get("field_office_start_time", "10:00")
+            threshold_mins = int((org_doc or {}).get("field_late_grace_mins") or (org_doc or {}).get("field_late_threshold_mins", 30))
+        else:
+            start_time_str = (org_doc or {}).get("office_start_time", "09:00")
+            threshold_mins = int((org_doc or {}).get("late_grace_mins") or (org_doc or {}).get("late_threshold_mins", 15))
+
         for log in aware_logs:
             if "in" in log.get("type", "").lower():
-                user_type = user.get("employee_type", "desk")
-                start_time_str = "10:00"
-                threshold_mins = 15
-                if user_type == "field" and org_id:
-                    org_doc = await settings_collection.find_one({"organization_id": str(org_id) if ObjectId.is_valid(str(org_id)) else org_id})
-                    if org_doc:
-                        start_time_str = org_doc.get("field_office_start_time", "10:00")
-                        threshold_mins = org_doc.get("field_late_threshold_mins", 30)
-                
                 try:
                     start_h, start_m = map(int, start_time_str.split(":"))
                     local_log_time = log["aware_ts"] + timedelta(minutes=tz_offset)
@@ -2052,6 +2468,45 @@ async def get_my_analytics(current_user: dict = Depends(get_current_employee)):
         # Leave balance
         leave_balance = await calculate_leave_balance(user_email, org_id or "system_org")
 
+        # Today's attendance classification
+        today_first_checkin = next((l for l in today_logs if l.get("type") == "check-in"), None)
+        today_last_checkout = next((l for l in reversed(today_logs) if l.get("type") == "check-out"), None)
+        
+        first_in_local = (today_first_checkin["aware_ts"] + timedelta(minutes=tz_offset)) if today_first_checkin else None
+        last_out_local = (today_last_checkout["aware_ts"] + timedelta(minutes=tz_offset)) if today_last_checkout else None
+
+        # Check if user has approved leave for today
+        today_approved_leave = None
+        try:
+            today_approved_leave = await leave_requests_collection.find_one({
+                "$or": [
+                    {"employee_id": user_email.lower().strip()},
+                    {"email": user_email.lower().strip()},
+                    {"employee_id": str(user["_id"])}
+                ],
+                "status": {"$regex": "^approved$", "$options": "i"},
+                "start_date": {"$lte": today_str},
+                "end_date": {"$gte": today_str}
+            })
+        except Exception:
+            pass
+
+        org_settings_doc = None
+        if org_id:
+            try:
+                org_settings_doc = await settings_collection.find_one({"organization_id": str(org_id) if ObjectId.is_valid(str(org_id)) else org_id})
+            except Exception:
+                pass
+
+        today_classification = classify_attendance_day(
+            first_checkin_local=first_in_local,
+            last_checkout_local=last_out_local,
+            worked_hours=today_hours,
+            settings=org_settings_doc or {},
+            employee_type=user.get("employee_type", "desk"),
+            approved_leave=today_approved_leave
+        )
+
         return {
             "email": user["email"],
             "today_hours": today_hours,
@@ -2059,6 +2514,18 @@ async def get_my_analytics(current_user: dict = Depends(get_current_employee)):
             "month_total": month_hours,
             "on_time_count": on_time_count,
             "current_status": current_status,
+            "today_attendance_status": today_classification["status"],
+            "is_short_leave": today_classification["is_short_leave"],
+            "is_half_day": today_classification["is_half_day"],
+            "is_late": today_classification["is_late"],
+            "is_early_leave": today_classification["is_early_leave"],
+            "late_mins": today_classification["late_mins"],
+            "early_exit_mins": today_classification["early_exit_mins"],
+            "late_off_hours": today_classification["late_off_hours"],
+            "early_off_hours": today_classification["early_off_hours"],
+            "off_hours": today_classification["off_hours"],
+            "classification_reason": today_classification["classification_reason"],
+            "is_applied_leave": today_classification["is_applied_leave"],
             "history": history,
             "office_wifi_ssid": org_wifi_ssid,
             "upcoming_holidays": upcoming_holidays,
@@ -3603,6 +4070,14 @@ async def sync_offline_batch(req: SyncBatchRequest, background_tasks: Background
         synced_count = {"attendance": 0, "visits": 0, "pings": 0}
 
         # 1. Sync Attendance Logs
+        org_settings = None
+        tz_offset = 330
+        try:
+            org_settings = await settings_collection.find_one({"organization_id": employee.get("organization_id")})
+            if org_settings:
+                tz_offset = int(org_settings.get("timezone_offset", 330))
+        except Exception: pass
+
         for att in req.attendance_logs:
             offline_id = att.get("offline_id")
             if not offline_id:
@@ -3610,8 +4085,9 @@ async def sync_offline_batch(req: SyncBatchRequest, background_tasks: Background
             exists = await attendance_logs_collection.find_one({"offline_id": offline_id})
             if not exists:
                 att["synced_at"] = now
-                # Hard link to current user to prevent tampering
                 att["user_id"] = str(employee["_id"]) 
+                att["email"] = employee.get("email")
+                att["full_name"] = employee.get("full_name")
                 att["organization_id"] = employee["organization_id"]
                 # Convert string timestamp to datetime if needed
                 if "timestamp" in att and isinstance(att["timestamp"], str):
@@ -3619,6 +4095,36 @@ async def sync_offline_batch(req: SyncBatchRequest, background_tasks: Background
                         att["timestamp"] = datetime.fromisoformat(att["timestamp"].replace("Z", "+00:00"))
                     except:
                         pass
+
+                # Classify offline attendance log
+                try:
+                    l_ts = att.get("timestamp") or now
+                    if l_ts.tzinfo is None: l_ts = l_ts.replace(tzinfo=timezone.utc)
+                    local_ts = l_ts + timedelta(minutes=tz_offset)
+                    att_type = att.get("type", "check-in")
+
+                    classification = classify_attendance_day(
+                        first_checkin_local=local_ts,
+                        last_checkout_local=None if att_type in ["check-in", "IN"] else local_ts,
+                        worked_hours=0.0,
+                        settings=org_settings or {},
+                        employee_type=employee.get("employee_type", "field"),
+                        approved_leave=None
+                    )
+                    att["attendance_status"] = classification["status"]
+                    att["is_short_leave"] = classification["is_short_leave"]
+                    att["is_half_day"] = classification["is_half_day"]
+                    att["short_leave_type"] = classification["short_leave_type"]
+                    att["half_day_type"] = classification["half_day_type"]
+                    att["late_mins"] = classification["late_mins"]
+                    att["early_exit_mins"] = classification["early_exit_mins"]
+                    att["late_off_hours"] = classification["late_off_hours"]
+                    att["early_off_hours"] = classification["early_off_hours"]
+                    att["off_hours"] = classification["off_hours"]
+                    att["classification_reason"] = classification["classification_reason"]
+                except Exception as ex:
+                    logger.warning(f"Offline sync classification error: {ex}")
+
                 await attendance_logs_collection.insert_one(att)
                 synced_count["attendance"] += 1
 
@@ -3860,24 +4366,104 @@ async def get_field_day_summary(employee_id: str, date: Optional[str] = None, cu
                 total_km += d
         total_km = total_km / 1000.0 # Convert to KM
     
-    # 3. Current Attendance Status (TODAY ONLY)
-    # Only check today's logs to determine status. If the last log is from
-    # a previous day, treat it as a fresh day (check-out / "Start of Day").
-    today_log = await attendance_logs_collection.find_one(
-        {"email": employee_id, "timestamp": {"$gte": today_start}},
-        sort=[("timestamp", -1)]
+    # 3. Current Attendance Status and Classification (TODAY ONLY)
+    today_field_logs = await attendance_logs_collection.find({
+        "$or": [
+            {"email": employee_id},
+            {"user_id": employee_id},
+            {"email": employee_id.lower().strip()},
+            {"user_id": employee_id.lower().strip()}
+        ],
+        "timestamp": {"$gte": today_start}
+    }).sort("timestamp", 1).to_list(length=100)
+
+    first_in_log = next((l for l in today_field_logs if l.get("type") in ["check-in", "IN"]), None)
+    last_out_log = next((l for l in reversed(today_field_logs) if l.get("type") in ["check-out", "OUT"]), None)
+
+    org_id = current_user.get("organization_id")
+    org_settings_doc = None
+    tz_offset = current_user.get("timezone_offset", 330)
+    if org_id:
+        try:
+            org_settings_doc = await settings_collection.find_one({"organization_id": str(org_id) if ObjectId.is_valid(str(org_id)) else org_id})
+            if org_settings_doc:
+                tz_offset = org_settings_doc.get("timezone_offset", tz_offset)
+        except Exception:
+            pass
+
+    first_in_local = (first_in_log["timestamp"] + timedelta(minutes=tz_offset)) if first_in_log else None
+    last_out_local = (last_out_log["timestamp"] + timedelta(minutes=tz_offset)) if last_out_log else None
+
+    # Calculate worked duration today (paired multi-sessions)
+    worked_sec = 0.0
+    last_in_ts = None
+    for l in today_field_logs:
+        l_ts = l["timestamp"]
+        if l_ts.tzinfo is None: l_ts = l_ts.replace(tzinfo=timezone.utc)
+        l_type = l.get("type")
+        if l_type in ["check-in", "IN"]:
+            last_in_ts = l_ts
+        elif l_type in ["check-out", "OUT"] and last_in_ts:
+            worked_sec += max(0.0, (l_ts - last_in_ts).total_seconds())
+            last_in_ts = None
+
+    if last_in_ts:
+        worked_sec += max(0.0, (datetime.now(timezone.utc) - last_in_ts).total_seconds())
+    elif not worked_sec and first_in_log and last_out_log:
+        f_in = first_in_log["timestamp"]
+        l_out = last_out_log["timestamp"]
+        if f_in.tzinfo is None: f_in = f_in.replace(tzinfo=timezone.utc)
+        if l_out.tzinfo is None: l_out = l_out.replace(tzinfo=timezone.utc)
+        worked_sec = max(0.0, (l_out - f_in).total_seconds())
+
+    worked_hours = round(worked_sec / 3600.0, 2)
+
+    # Check for approved leave today
+    today_date_str = (datetime.now(timezone.utc) + timedelta(minutes=tz_offset)).strftime("%Y-%m-%d")
+    approved_leave = None
+    try:
+        approved_leave = await leave_requests_collection.find_one({
+            "$or": [
+                {"employee_id": employee_id.lower().strip()},
+                {"email": employee_id.lower().strip()}
+            ],
+            "status": {"$regex": "^approved$", "$options": "i"},
+            "start_date": {"$lte": today_date_str},
+            "end_date": {"$gte": today_date_str}
+        })
+    except Exception:
+        pass
+
+    classification = classify_attendance_day(
+        first_checkin_local=first_in_local,
+        last_checkout_local=last_out_local,
+        worked_hours=worked_hours,
+        settings=org_settings_doc or {},
+        employee_type="field",
+        approved_leave=approved_leave
     )
-    if today_log:
-        current_status = today_log.get("type", "check-out")
-    else:
-        # No log today → fresh day → user needs to check in
-        current_status = "check-out"
+
+    current_status = today_field_logs[-1].get("type", "check-out") if today_field_logs else "check-out"
             
     return {
         "date": query_date,
         "total_visits": visits,
         "total_km": round(total_km, 2),
         "attendance_status": current_status,
+        "today_attendance_status": classification["status"],
+        "is_short_leave": classification["is_short_leave"],
+        "is_half_day": classification["is_half_day"],
+        "is_late": classification["is_late"],
+        "is_early_leave": classification["is_early_leave"],
+        "late_mins": classification["late_mins"],
+        "early_exit_mins": classification["early_exit_mins"],
+        "late_off_hours": classification["late_off_hours"],
+        "early_off_hours": classification["early_off_hours"],
+        "off_hours": classification["off_hours"],
+        "worked_hours": classification["worked_hours"],
+        "required_hours": classification["required_hours"],
+        "classification_reason": classification["classification_reason"],
+        "is_applied_leave": classification["is_applied_leave"],
         "status": "Active"
     }
 
@@ -4017,17 +4603,25 @@ async def get_admin_stats(admin: dict = Depends(get_current_admin)):
     tz_offset = org_settings.get("timezone_offset", 330) if org_settings else 330
     today_start = get_today_start(tz_offset)
     
-    # Get relevant employee IDs
-    org_employees = await employees_collection.find(filter_query, {"_id": 1}).to_list(None)
+    # Get relevant employee IDs & emails
+    org_employees = await employees_collection.find(filter_query, {"_id": 1, "email": 1}).to_list(None)
     org_emp_ids = [str(emp["_id"]) for emp in org_employees]
+    org_emp_emails = [emp.get("email") for emp in org_employees if emp.get("email")]
     
     logs_query = {
         "timestamp": {"$gte": today_start},
-        "type": "check-in",
-        "user_id": {"$in": org_emp_ids}
+        "type": {"$in": ["check-in", "IN"]},
+        "$or": [
+            {"user_id": {"$in": org_emp_ids}},
+            {"email": {"$in": org_emp_emails}}
+        ]
     }
          
-    clocked_in_today = await attendance_logs_collection.count_documents(logs_query)
+    today_checkins = await attendance_logs_collection.find(logs_query).to_list(2000)
+    clocked_in_today = len(today_checkins)
+    late_arrivals_today = sum(1 for l in today_checkins if l.get("is_late") or l.get("attendance_status") == "Late")
+    short_leaves_today = sum(1 for l in today_checkins if l.get("is_short_leave") or l.get("attendance_status") == "Short Leave")
+    half_days_today = sum(1 for l in today_checkins if l.get("is_half_day") or l.get("attendance_status") == "Half Day")
     
     # Alerts & Fraud Detection Stats
     alert_query = {
@@ -4074,7 +4668,9 @@ async def get_admin_stats(admin: dict = Depends(get_current_admin)):
     return {
         "total_employees": total_employees,
         "clocked_in_today": clocked_in_today,
-        "late_arrivals_today": total_alerts_today, 
+        "late_arrivals_today": late_arrivals_today, 
+        "short_leaves_today": short_leaves_today,
+        "half_days_today": half_days_today,
         "on_leave": on_leave_count,
         "absent_today": absent_count,
         "is_holiday_today": is_today_holiday,
@@ -4524,6 +5120,75 @@ async def handle_leave_request(request_id: str, action: str, req_body: Optional[
         {"_id": obj_id},
         {"$set": update_fields}
     )
+
+    # 4. Retroactively reclassify attendance logs for this employee across the leave period
+    if action == "approve":
+        try:
+            l_start = str(leave_req.get("start_date", ""))
+            l_end = str(leave_req.get("end_date", l_start))
+            if l_start:
+                s_dt = datetime.strptime(l_start[:10], "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                e_dt = datetime.strptime(l_end[:10], "%Y-%m-%d").replace(tzinfo=timezone.utc) + timedelta(days=1)
+                emp_id_str = str(leave_req.get("employee_id", ""))
+                emp_email = str(leave_req.get("email", emp_id_str))
+
+                org_settings = await settings_collection.find_one({"organization_id": leave_req.get("organization_id")})
+                tz_offset = int((org_settings or {}).get("timezone_offset", 330))
+
+                date_logs = await attendance_logs_collection.find({
+                    "$or": [
+                        {"email": emp_email},
+                        {"user_id": emp_id_str},
+                        {"email": emp_id_str},
+                        {"user_id": emp_email}
+                    ],
+                    "timestamp": {"$gte": s_dt, "$lt": e_dt}
+                }).sort("timestamp", 1).to_list(100)
+
+                if date_logs:
+                    updated_leave_req = {**leave_req, **update_fields}
+                    checkins = [l for l in date_logs if l.get("type") in ["check-in", "IN"]]
+                    checkouts = [l for l in date_logs if l.get("type") in ["check-out", "OUT"]]
+                    
+                    if checkins:
+                        f_in = checkins[0]["timestamp"]
+                        if f_in.tzinfo is None: f_in = f_in.replace(tzinfo=timezone.utc)
+                        f_in_local = f_in + timedelta(minutes=tz_offset)
+                        
+                        l_out_local = None
+                        worked_hours = 0.0
+                        if checkouts:
+                            l_out = checkouts[-1]["timestamp"]
+                            if l_out.tzinfo is None: l_out = l_out.replace(tzinfo=timezone.utc)
+                            l_out_local = l_out + timedelta(minutes=tz_offset)
+                            worked_hours = round(max(0.0, (l_out - f_in).total_seconds()) / 3600.0, 2)
+
+                        new_class = classify_attendance_day(
+                            first_checkin_local=f_in_local,
+                            last_checkout_local=l_out_local,
+                            worked_hours=worked_hours,
+                            settings=org_settings or {},
+                            employee_type=leave_req.get("employee_type", "desk"),
+                            approved_leave=updated_leave_req
+                        )
+
+                        await attendance_logs_collection.update_one(
+                            {"_id": checkins[0]["_id"]},
+                            {"$set": {
+                                "attendance_status": new_class["status"],
+                                "is_short_leave": new_class["is_short_leave"],
+                                "is_half_day": new_class["is_half_day"],
+                                "short_leave_type": new_class["short_leave_type"],
+                                "half_day_type": new_class["half_day_type"],
+                                "off_hours": new_class["off_hours"],
+                                "late_off_hours": new_class["late_off_hours"],
+                                "early_off_hours": new_class["early_off_hours"],
+                                "classification_reason": new_class["classification_reason"],
+                                "is_applied_leave": True
+                            }}
+                        )
+        except Exception as ex:
+            logger.warning(f"Leave approval reclassification error: {ex}")
         
     return {"status": "success", "new_status": status_map[action]}
 
@@ -4739,7 +5404,7 @@ async def calculate_leave_balance(
     if not month:
         month = f"{year}-{now.month:02d}"
 
-    # 1. Fetch Leave Policy
+    # 1. Fetch Leave Policy & Org Settings
     policy = await leave_policies_collection.find_one({
         "$or": [
             {"organization_id": org_id, "year": year},
@@ -4748,6 +5413,14 @@ async def calculate_leave_balance(
             {"organization_id": "system_org"}
         ]
     })
+
+    org_settings = None
+    tz_offset = 330
+    try:
+        org_settings = await settings_collection.find_one({"organization_id": org_id})
+        if org_settings:
+            tz_offset = int(org_settings.get("timezone_offset", 330))
+    except Exception: pass
 
     allocation_cycle = "annual"
     carry_forward = True
@@ -4975,6 +5648,80 @@ async def calculate_leave_balance(
                 carried_cl = 0.0
                 carried_tl = 0.0
 
+        # Count attendance-based and applied short leaves / half days in target month (de-duplicated by date)
+        short_leave_dates = set()
+        half_day_dates = set()
+        att_short_leave_dates = set()
+        att_half_day_dates = set()
+        applied_short_leave_dates = set()
+        applied_half_day_dates = set()
+
+        try:
+            m_start_utc = datetime.strptime(f"{month}-01", "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            yr_int, mo_int = map(int, month.split("-"))
+            next_m_utc = datetime(yr_int + 1, 1, 1, tzinfo=timezone.utc) if mo_int == 12 else datetime(yr_int, mo_int + 1, 1, tzinfo=timezone.utc)
+
+            month_att_logs = await attendance_logs_collection.find({
+                "$or": [
+                    {"user_id": {"$in": emp_identifiers}},
+                    {"email": {"$in": emp_identifiers}}
+                ],
+                "type": {"$in": ["check-in", "IN"]},
+                "timestamp": {"$gte": m_start_utc, "$lt": next_m_utc}
+            }).to_list(1000)
+
+            for l in month_att_logs:
+                l_ts = l["timestamp"]
+                if l_ts.tzinfo is None: l_ts = l_ts.replace(tzinfo=timezone.utc)
+                l_date = (l_ts + timedelta(minutes=tz_offset)).strftime("%Y-%m-%d")
+                if l.get("is_short_leave") or l.get("attendance_status") == "Short Leave":
+                    att_short_leave_dates.add(l_date)
+                    short_leave_dates.add(l_date)
+                if l.get("is_half_day") or l.get("attendance_status") == "Half Day":
+                    att_half_day_dates.add(l_date)
+                    half_day_dates.add(l_date)
+        except Exception as e:
+            logger.warning(f"Error fetching month att logs for leave balance: {e}")
+
+        for l in leaves:
+            dur_type = str(l.get("duration_type", "")).lower().strip()
+            l_start = str(l.get("start_date", ""))
+            l_end = str(l.get("end_date", l_start))
+            if not l_start or not (l_start.startswith(month) or l_end.startswith(month)):
+                continue
+            
+            try:
+                c_dt = max(datetime.strptime(l_start[:10], "%Y-%m-%d"), datetime.strptime(f"{month}-01", "%Y-%m-%d"))
+                e_dt = min(datetime.strptime(l_end[:10], "%Y-%m-%d"), next_m_utc.replace(tzinfo=None) - timedelta(days=1))
+                while c_dt <= e_dt:
+                    d_str = c_dt.strftime("%Y-%m-%d")
+                    if dur_type == "short_leave":
+                        applied_short_leave_dates.add(d_str)
+                        short_leave_dates.add(d_str)
+                    elif dur_type in ["first_half", "second_half", "half_day"] or l.get("duration") == 0.5:
+                        applied_half_day_dates.add(d_str)
+                        half_day_dates.add(d_str)
+                    c_dt += timedelta(days=1)
+            except Exception: pass
+
+        total_short_leaves = len(short_leave_dates)
+        total_half_days = len(half_day_dates)
+        short_leave_monthly_limit = int((policy or {}).get("short_leave_monthly_limit", 2))
+        short_leave_remaining = max(0, short_leave_monthly_limit - total_short_leaves)
+
+        target_month_data["short_leave"] = {
+            "monthly_limit": short_leave_monthly_limit,
+            "used": total_short_leaves,
+            "remaining": short_leave_remaining,
+            "attendance_triggered": len(att_short_leave_dates - applied_short_leave_dates),
+            "applied": len(applied_short_leave_dates)
+        }
+        target_month_data["half_day"] = {
+            "used": total_half_days,
+            "attendance_triggered": len(att_half_day_dates - applied_half_day_dates),
+            "applied": len(applied_half_day_dates)
+        }
+
         return target_month_data
 
     else:
@@ -4999,6 +5746,42 @@ async def calculate_leave_balance(
         rem_tl = max(0.0, base_tl - paid_used_tl)
         excess_lop = max(0.0, paid_used_tl - base_tl) + unpaid_used_tl
 
+        # Count attendance-based and applied short leaves / half days in target month
+        try:
+            m_start_utc = datetime.strptime(f"{month}-01", "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            yr_int, mo_int = map(int, month.split("-"))
+            next_m_utc = datetime(yr_int + 1, 1, 1, tzinfo=timezone.utc) if mo_int == 12 else datetime(yr_int, mo_int + 1, 1, tzinfo=timezone.utc)
+
+            att_short_leaves = await attendance_logs_collection.count_documents({
+                "$or": [
+                    {"user_id": {"$in": emp_identifiers}},
+                    {"email": {"$in": emp_identifiers}}
+                ],
+                "is_short_leave": True,
+                "type": "check-in",
+                "timestamp": {"$gte": m_start_utc, "$lt": next_m_utc}
+            })
+            att_half_days = await attendance_logs_collection.count_documents({
+                "$or": [
+                    {"user_id": {"$in": emp_identifiers}},
+                    {"email": {"$in": emp_identifiers}}
+                ],
+                "is_half_day": True,
+                "type": "check-in",
+                "timestamp": {"$gte": m_start_utc, "$lt": next_m_utc}
+            })
+        except Exception:
+            att_short_leaves = 0
+            att_half_days = 0
+
+        applied_short_leaves = sum(1 for l in leaves if str(l.get("duration_type", "")).lower().strip() == "short_leave" and str(l.get("start_date", "")).startswith(month))
+        applied_half_days = sum(1 for l in leaves if str(l.get("duration_type", "")).lower().strip() in ["first_half", "second_half", "half_day"] and str(l.get("start_date", "")).startswith(month))
+
+        total_short_leaves = att_short_leaves + applied_short_leaves
+        total_half_days = att_half_days + applied_half_days
+        short_leave_monthly_limit = int((policy or {}).get("short_leave_monthly_limit", 2))
+        short_leave_remaining = max(0, short_leave_monthly_limit - total_short_leaves)
+
         return {
             "year": year,
             "month": month,
@@ -5020,6 +5803,18 @@ async def calculate_leave_balance(
                 "unpaid_used": round(unpaid_used_tl, 2),
                 "remaining": round(rem_tl, 2),
                 "excess_lop": round(excess_lop, 2)
+            },
+            "short_leave": {
+                "monthly_limit": short_leave_monthly_limit,
+                "used": total_short_leaves,
+                "remaining": short_leave_remaining,
+                "attendance_triggered": att_short_leaves,
+                "applied": applied_short_leaves
+            },
+            "half_day": {
+                "used": total_half_days,
+                "attendance_triggered": att_half_days,
+                "applied": applied_half_days
             },
             "on_duty": {
                 "used": round(used_on_duty, 2)
@@ -5266,6 +6061,14 @@ async def admin_get_leave_policy(year: Optional[int] = None, admin: dict = Depen
         "short_leave_monthly_limit": short_leave_monthly_limit,
         "short_leave_max_hours": short_leave_max_hours,
         "short_leave_penalty_rule": short_leave_penalty_rule,
+        "office_start_time": (policy or {}).get("office_start_time", "09:00"),
+        "office_end_time": (policy or {}).get("office_end_time", "18:00"),
+        "short_leave_cutoff_time": (policy or {}).get("short_leave_cutoff_time", "10:15"),
+        "half_day_late_cutoff_time": (policy or {}).get("half_day_late_cutoff_time", "11:30"),
+        "half_day_early_exit_cutoff_time": (policy or {}).get("half_day_early_exit_cutoff_time", "14:00"),
+        "lunch_start_time": (policy or {}).get("lunch_start_time", "13:00"),
+        "lunch_end_time": (policy or {}).get("lunch_end_time", "14:00"),
+        "max_lunch_duration_mins": (policy or {}).get("max_lunch_duration_mins", 60),
         "overrides": overrides
     }
 
@@ -5302,6 +6105,14 @@ async def admin_update_leave_policy(req: LeavePolicyUpdateRequest, admin: dict =
         "short_leave_monthly_limit": int(req.short_leave_monthly_limit or 2),
         "short_leave_max_hours": float(req.short_leave_max_hours or 2.0),
         "short_leave_penalty_rule": req.short_leave_penalty_rule or "half_day_per_2_excess",
+        "office_start_time": req.office_start_time or "09:00",
+        "office_end_time": req.office_end_time or "18:00",
+        "short_leave_cutoff_time": req.short_leave_cutoff_time or "10:15",
+        "half_day_late_cutoff_time": req.half_day_late_cutoff_time or "11:30",
+        "half_day_early_exit_cutoff_time": req.half_day_early_exit_cutoff_time or "14:00",
+        "lunch_start_time": req.lunch_start_time or "13:00",
+        "lunch_end_time": req.lunch_end_time or "14:00",
+        "max_lunch_duration_mins": int(req.max_lunch_duration_mins or 60),
         "updated_by": admin.email,
         "updated_at": datetime.now(timezone.utc)
     }
@@ -5312,9 +6123,31 @@ async def admin_update_leave_policy(req: LeavePolicyUpdateRequest, admin: dict =
         upsert=True
     )
 
+    # Mirror shift attendance cutoffs to organization settings
+    settings_mirror = {
+        "office_start_time": req.office_start_time or "09:00",
+        "office_end_time": req.office_end_time or "18:00",
+        "late_grace_mins": int(req.late_grace_mins or 15),
+        "short_leave_cutoff_time": req.short_leave_cutoff_time or "10:15",
+        "half_day_late_cutoff_time": req.half_day_late_cutoff_time or "11:30",
+        "half_day_early_exit_cutoff_time": req.half_day_early_exit_cutoff_time or "14:00",
+        "lunch_start_time": req.lunch_start_time or "13:00",
+        "lunch_end_time": req.lunch_end_time or "14:00",
+        "max_lunch_duration_mins": int(req.max_lunch_duration_mins or 60),
+        "half_day_min_hours": float(req.half_day_min_hours or 4.0),
+        "full_day_min_hours": float(req.full_day_min_hours or 8.0),
+        "short_leave_max_hours": float(req.short_leave_max_hours or 2.0),
+        "short_leave_monthly_limit": int(req.short_leave_monthly_limit or 2),
+        "short_leave_penalty_rule": req.short_leave_penalty_rule or "half_day_per_2_excess",
+    }
+    if org_id == "system_org":
+        await settings_collection.update_one({"id": "config"}, {"$set": settings_mirror}, upsert=True)
+    else:
+        await settings_collection.update_one({"organization_id": org_id}, {"$set": settings_mirror}, upsert=True)
+
     return {
         "status": "success",
-        "message": f"Leave policy updated for {year}",
+        "message": f"Leave policy and attendance cutoffs updated for {year}",
         **update_doc
     }
 
@@ -6675,6 +7508,21 @@ async def get_employee_monthly_summary(
         day_info = {
             "date": day_str,
             "status": "Absent",
+            "is_late": False,
+            "is_early_leave": False,
+            "is_short_leave": False,
+            "is_half_day": False,
+            "short_leave_type": None,
+            "half_day_type": None,
+            "late_mins": 0,
+            "early_exit_mins": 0,
+            "late_off_hours": 0.0,
+            "early_off_hours": 0.0,
+            "off_hours": 0.0,
+            "required_hours": 8.0,
+            "effective_days": 0.0,
+            "classification_reason": "",
+            "is_applied_leave": False,
             "first_in": None,
             "last_out": None,
             "duration_hours": 0,
@@ -6682,22 +7530,19 @@ async def get_employee_monthly_summary(
         }
 
         # 1. Check for Approved Leave on this day
-        is_on_leave = False
-        leave_label = None
+        matching_leave = None
         for leave in leaves:
             s_date = str(leave.get("start_date", ""))[:10]
             e_date = str(leave.get("end_date", ""))[:10]
             if s_date and e_date and (s_date <= day_str <= e_date):
-                l_type = leave.get("leave_type", "General")
-                leave_label = f"Leave ({l_type})"
-                is_on_leave = True
+                matching_leave = leave
                 leaves_count += 1
                 break
 
         # 2. Check for Pending Leave on this day
         is_pending_leave = False
         pending_label = None
-        if not is_on_leave:
+        if not matching_leave:
             for pl in pending_leaves:
                 s_date = str(pl.get("start_date", ""))[:10]
                 e_date = str(pl.get("end_date", ""))[:10]
@@ -6709,17 +7554,15 @@ async def get_employee_monthly_summary(
 
         # 3. Check for Configured Holidays / Days Off / Weekend
         day_num = current_day_local.day
-        if is_on_leave:
-            day_info["status"] = leave_label
-        elif is_pending_leave and not day_logs:
-            day_info["status"] = pending_label
-        elif day_num in days_off_set:
+        is_weekend_or_holiday = False
+        if day_num in days_off_set:
+            is_weekend_or_holiday = True
             if current_day_local.weekday() >= 5:
                 day_info["status"] = "Weekend"
             else:
                 day_info["status"] = holiday_names.get(str(day_num), "Holiday")
         elif current_day_local.weekday() >= 5:
-            # Check for Weekend (Saturday=5, Sunday=6)
+            is_weekend_or_holiday = True
             day_info["status"] = "Weekend"
 
         if day_logs:
@@ -6738,22 +7581,17 @@ async def get_employee_monthly_summary(
                 local_log_time = log_ts + timedelta(minutes=tz_offset)
                 
                 log_type = log.get("type", "")
-                log_status = "Present"
-                
-                if log_type == "check-in":
-                    limit_time = local_log_time.replace(hour=start_h, minute=start_m, second=0, microsecond=0) + timedelta(minutes=late_threshold_mins)
-                    if local_log_time > limit_time:
-                        log_status = "Late"
-                elif log_type == "check-out":
-                    early_limit = local_log_time.replace(hour=end_h, minute=end_m, second=0, microsecond=0) - timedelta(minutes=10)
-                    if local_log_time < early_limit:
-                        log_status = "Early Leave"
+                log_status = log.get("attendance_status") or "Present"
 
                 # Basic representation for frontend
                 day_info["logs"].append({
                     "time": log_ts.isoformat(),
                     "type": log_type,
                     "status": log_status,
+                    "attendance_status": log.get("attendance_status", log_status),
+                    "is_short_leave": log.get("is_short_leave", False),
+                    "is_half_day": log.get("is_half_day", False),
+                    "off_hours": log.get("off_hours", 0.0),
                     "method": log.get("check_in_method", "N/A"),
                     "location": log.get("location"),
                     "selfie": log.get("selfie_url"),
@@ -6768,50 +7606,96 @@ async def get_employee_monthly_summary(
                     last_in_time = None
                     day_info["last_out"] = log_ts.isoformat()
 
-            day_info["duration_hours"] = round(day_duration_ms / (1000 * 3600), 2)
+            duration_hours = round(day_duration_ms / (1000 * 3600), 2)
+            day_info["duration_hours"] = duration_hours
             total_working_ms += day_duration_ms
 
-            # Evaluate day overall status based on FIRST check-in and LAST check-out of the day
+            # Comprehensive classification via classify_attendance_day
             checkout_logs = [l for l in day_logs if l.get("type") == "check-out"]
             first_checkin = [l for l in day_logs if l.get("type") == "check-in"]
 
-            is_last_out_early = False
-            if checkout_logs:
-                last_out_log = checkout_logs[-1] # Always evaluate the LAST check-out of the day!
-                last_ts = last_out_log["timestamp"]
-                if last_ts.tzinfo is None:
-                    last_ts = last_ts.replace(tzinfo=timezone.utc)
-                local_last_out = last_ts + timedelta(minutes=tz_offset)
-                early_limit = local_last_out.replace(hour=end_h, minute=end_m, second=0, microsecond=0) - timedelta(minutes=10)
-                if local_last_out < early_limit:
-                    is_last_out_early = True
+            first_in_ts = first_checkin[0]["timestamp"] if first_checkin else day_logs[0]["timestamp"]
+            if first_in_ts.tzinfo is None: first_in_ts = first_in_ts.replace(tzinfo=timezone.utc)
+            local_first_in = first_in_ts + timedelta(minutes=tz_offset)
 
-            if is_last_out_early:
-                day_info["status"] = "Early Leave"
-            elif first_checkin:
-                first_ts = first_checkin[0]["timestamp"]
-                if first_ts.tzinfo is None:
-                    first_ts = first_ts.replace(tzinfo=timezone.utc)
-                local_first_in = first_ts + timedelta(minutes=tz_offset)
-                limit_time = local_first_in.replace(hour=start_h, minute=start_m, second=0, microsecond=0) + timedelta(minutes=late_threshold_mins)
-                if local_first_in > limit_time:
-                    day_info["status"] = "Late"
-                else:
-                    day_info["status"] = "Present"
-            else:
-                day_info["status"] = "Present"
+            local_last_out = None
+            if checkout_logs:
+                last_ts = checkout_logs[-1]["timestamp"]
+                if last_ts.tzinfo is None: last_ts = last_ts.replace(tzinfo=timezone.utc)
+                local_last_out = last_ts + timedelta(minutes=tz_offset)
+
+            classification = classify_attendance_day(
+                first_checkin_local=local_first_in,
+                last_checkout_local=local_last_out,
+                worked_hours=duration_hours,
+                settings=org_doc or {},
+                employee_type=employee.get("employee_type", "desk"),
+                approved_leave=matching_leave
+            )
+
+            day_info["status"] = classification["status"]
+            day_info["is_late"] = classification["is_late"]
+            day_info["is_early_leave"] = classification["is_early_leave"]
+            day_info["is_short_leave"] = classification["is_short_leave"]
+            day_info["is_half_day"] = classification["is_half_day"]
+            day_info["short_leave_type"] = classification["short_leave_type"]
+            day_info["half_day_type"] = classification["half_day_type"]
+            day_info["late_mins"] = classification["late_mins"]
+            day_info["early_exit_mins"] = classification["early_exit_mins"]
+            day_info["late_off_hours"] = classification["late_off_hours"]
+            day_info["early_off_hours"] = classification["early_off_hours"]
+            day_info["off_hours"] = classification["off_hours"]
+            day_info["required_hours"] = classification["required_hours"]
+            day_info["effective_days"] = classification["effective_days"]
+            day_info["classification_reason"] = classification["classification_reason"]
+            day_info["is_applied_leave"] = classification["is_applied_leave"]
 
         else:
-            # Not present: only increment absent if status is actually Absent (not leave, not pending leave, not weekend, not holiday)
-            if day_info["status"] == "Absent":
+            # No attendance logs on this day
+            if matching_leave:
+                classification = classify_attendance_day(
+                    first_checkin_local=None,
+                    last_checkout_local=None,
+                    worked_hours=0.0,
+                    settings=org_doc or {},
+                    employee_type=employee.get("employee_type", "desk"),
+                    approved_leave=matching_leave
+                )
+                day_info["status"] = classification["status"]
+                day_info["is_short_leave"] = classification["is_short_leave"]
+                day_info["is_half_day"] = classification["is_half_day"]
+                day_info["short_leave_type"] = classification["short_leave_type"]
+                day_info["half_day_type"] = classification["half_day_type"]
+                day_info["off_hours"] = classification["off_hours"]
+                day_info["effective_days"] = classification["effective_days"]
+                day_info["classification_reason"] = classification["classification_reason"]
+                day_info["is_applied_leave"] = True
+            elif is_pending_leave:
+                day_info["status"] = pending_label
+                day_info["classification_reason"] = "Pending Leave Approval"
+            elif is_weekend_or_holiday:
+                day_info["classification_reason"] = day_info["status"]
+            else:
+                day_info["status"] = "Absent"
+                day_info["classification_reason"] = "Unexcused Absence"
                 absent_days += 1
+                req_h = float((org_doc or {}).get("required_hours", 8.0))
+                day_info["off_hours"] = req_h
+                day_info["required_hours"] = req_h
 
         daily_breakdown.append(day_info)
         current_day_local = next_day_local
 
     # Calculate holiday count from breakdown
-    holiday_days_count = sum(1 for d in daily_breakdown if d.get("status") not in ["Present", "Late", "Early Leave", "Absent", "Weekend"] and not str(d.get("status", "")).startswith("Leave") and not str(d.get("status", "")).startswith("Pending Leave"))
+    holiday_days_count = sum(1 for d in daily_breakdown if d.get("status") not in ["Present", "Late", "Early Leave", "Short Leave", "Half Day", "Absent", "Weekend"] and not str(d.get("status", "")).startswith("Leave") and not str(d.get("status", "")).startswith("Pending Leave"))
     
+    # Calculate Short Leave & Half Day metrics
+    short_leave_days = sum(1 for d in daily_breakdown if d.get("is_short_leave"))
+    half_day_days = sum(1 for d in daily_breakdown if d.get("is_half_day"))
+    total_off_hours = round(sum(d.get("off_hours", 0.0) for d in daily_breakdown if d.get("status") not in ["Weekend", "Holiday"] and not str(d.get("status", "")).startswith("Leave")), 2)
+    total_late_off_hours = round(sum(d.get("late_off_hours", 0.0) for d in daily_breakdown), 2)
+    total_early_off_hours = round(sum(d.get("early_off_hours", 0.0) for d in daily_breakdown), 2)
+
     # Live leave balance for this year and month (including unexcused absent days in total deduction)
     leave_balance = await calculate_leave_balance(email, org_id or "system_org", year, month, absent_days=absent_days)
 
@@ -6832,6 +7716,11 @@ async def get_employee_monthly_summary(
             "present_days": present_days,
             "leaves_taken": leaves_count,
             "absent_days": absent_days,
+            "short_leave_days": short_leave_days,
+            "half_day_days": half_day_days,
+            "total_off_hours": total_off_hours,
+            "total_late_off_hours": total_late_off_hours,
+            "total_early_off_hours": total_early_off_hours,
             "holiday_days": holiday_days_count,
             "total_days_evaluated": len(daily_breakdown),
             "leave_balance": leave_balance
