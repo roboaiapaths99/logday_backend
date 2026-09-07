@@ -1093,6 +1093,58 @@ async def change_password(req: ChangePasswordRequest, employee=Depends(get_curre
     }
 
 
+async def get_effective_org_settings(org_id: Optional[str]) -> dict:
+    """
+    Unified settings loader that combines:
+    1. Base organization settings from `settings_collection` (Office Times, Geofence, Timezone)
+    2. Active Leave & Attendance policy from `leave_policies_collection` (Cutoffs, Grace, Min hours, Quotas)
+    Ensures that configurations saved across any admin panel tab apply consistently across backend and apps.
+    """
+    if not org_id:
+        return {}
+    
+    org_str = str(org_id).strip()
+    query = {"$or": [{"organization_id": org_str}]}
+    if ObjectId.is_valid(org_str):
+        query["$or"].append({"organization_id": ObjectId(org_str)})
+    
+    merged = {}
+    try:
+        base_settings = await settings_collection.find_one(query)
+        if base_settings:
+            merged.update(base_settings)
+            merged["_id"] = str(base_settings["_id"])
+    except Exception as e:
+        logger.warning(f"Error loading base settings for org {org_str}: {e}")
+
+    try:
+        current_year = datetime.now(timezone.utc).year
+        policy = await leave_policies_collection.find_one({
+            "$or": [
+                {"organization_id": org_str, "year": current_year},
+                {"organization_id": org_str}
+            ]
+        }, sort=[("year", -1), ("updated_at", -1)])
+        
+        if policy:
+            keys_to_merge = [
+                "office_start_time", "office_end_time", "late_grace_mins",
+                "short_leave_cutoff_time", "late_to_short_leave_mins",
+                "half_day_late_cutoff_time", "half_day_early_exit_cutoff_time",
+                "early_leave_short_mins", "half_day_min_hours", "full_day_min_hours",
+                "required_hours", "short_leave_max_hours", "short_leave_monthly_limit",
+                "short_leave_penalty_rule", "lunch_start_time", "lunch_end_time",
+                "max_lunch_duration_mins", "allocation_cycle", "carry_forward"
+            ]
+            for k in keys_to_merge:
+                if k in policy and policy[k] is not None:
+                    merged[k] = policy[k]
+    except Exception as e:
+        logger.warning(f"Error loading leave policy for org {org_str}: {e}")
+
+    return merged
+
+
 def classify_attendance_day(
     first_checkin_local: Optional[datetime],
     last_checkout_local: Optional[datetime],
@@ -1265,10 +1317,16 @@ def classify_attendance_day(
     is_late = False
     if first_checkin_local > shift_start:
         diff_sec = (first_checkin_local - shift_start).total_seconds()
-        late_mins = max(0, int(diff_sec / 60))
-        late_off_hours = round(late_mins / 60.0, 2)
+        raw_late_mins = max(0, int(diff_sec / 60))
         if first_checkin_local > grace_cutoff:
             is_late = True
+            late_mins = raw_late_mins
+            late_off_hours = round(late_mins / 60.0, 2)
+        else:
+            # Arrival within grace is fully ON-TIME: zero penalty, zero deficit
+            is_late = False
+            late_mins = 0
+            late_off_hours = 0.0
 
     # 3. Early Departure Evaluation
     early_exit_mins = 0
@@ -1277,14 +1335,22 @@ def classify_attendance_day(
     if last_checkout_local:
         if last_checkout_local < shift_end:
             diff_sec = (shift_end - last_checkout_local).total_seconds()
-            early_exit_mins = max(0, int(diff_sec / 60))
-            early_off_hours = round(early_exit_mins / 60.0, 2)
-            if early_exit_mins > 10:  # 10 mins early checkout grace
+            raw_early_mins = max(0, int(diff_sec / 60))
+            if raw_early_mins > 10:  # 10 mins early checkout grace
                 is_early_leave = True
+                early_exit_mins = raw_early_mins
+                early_off_hours = round(early_exit_mins / 60.0, 2)
 
-    # Total off-hours (deficit between required and worked, or sum of late and early deficits)
+    # Total off-hours
+    grace_hours = round(late_grace_mins / 60.0, 2)
     if worked_hours > 0:
-        total_off_hours = round(max(0.0, required_hours - worked_hours), 2)
+        raw_off_hours = round(max(0.0, required_hours - worked_hours), 2)
+        # If employee arrived within grace and left at or after shift end (or within 10m checkout grace),
+        # minor clock rounding deficit (<= grace_hours or <= 0.25h) is completely waived (0 deficit)
+        if not is_late and not is_early_leave and (raw_off_hours <= grace_hours or raw_off_hours <= 0.25):
+            total_off_hours = 0.0
+        else:
+            total_off_hours = raw_off_hours
     else:
         total_off_hours = round(late_off_hours + early_off_hours, 2)
 
@@ -1382,12 +1448,21 @@ def classify_attendance_day(
             status = "Short Leave"
             effective_days = 1.0
             classification_reason = f"Early exit by {early_exit_mins}m (exceeds Short Leave limit {early_short_mins}m)"
-        elif last_checkout_local and worked_hours > 0 and worked_hours < full_day_min_hours:
-            is_short_leave = True
-            short_leave_type = "low_hours"
-            status = "Short Leave"
-            effective_days = 1.0
-            classification_reason = f"Worked {worked_hours:.1f}h (< full day requirement {full_day_min_hours:.1f}h)"
+        elif last_checkout_local and worked_hours > 0:
+            # Low-hours short leave evaluation:
+            # 1. If employee arrived within grace and left on/after shift end, they fulfilled their day: NEVER short leave!
+            # 2. Deficit must exceed grace_hours margin
+            # 3. Deficit must be at least 1.0 hour OR accompanied by unexcused late/early
+            hours_deficit = round(full_day_min_hours - worked_hours, 2)
+            if not is_late and not is_early_leave:
+                # On-time full day completed within allowable shift schedule
+                pass
+            elif hours_deficit > grace_hours and (is_late or is_early_leave or hours_deficit >= 1.0):
+                is_short_leave = True
+                short_leave_type = "low_hours"
+                status = "Short Leave"
+                effective_days = 1.0
+                classification_reason = f"Worked {worked_hours:.1f}h (< full day requirement {full_day_min_hours:.1f}h)"
 
     # D) Fallback states
     if not is_half_day and not is_short_leave:
@@ -1617,8 +1692,8 @@ async def smart_attendance(req: VerifyPresenceRequest, request: Request, backgro
         
         # Fetch settings.
         org_id = user.get("organization_id")
-        org_settings = await settings_collection.find_one({"organization_id": org_id}) if org_id else None
-        settings = org_settings or {}
+        settings = await get_effective_org_settings(org_id)
+        org_settings = settings
         
         emp_type = user.get("employee_type", "desk")
         
@@ -2491,12 +2566,7 @@ async def get_my_analytics(current_user: dict = Depends(get_current_employee)):
         except Exception:
             pass
 
-        org_settings_doc = None
-        if org_id:
-            try:
-                org_settings_doc = await settings_collection.find_one({"organization_id": str(org_id) if ObjectId.is_valid(str(org_id)) else org_id})
-            except Exception:
-                pass
+        org_settings_doc = await get_effective_org_settings(org_id) if org_id else {}
 
         today_classification = classify_attendance_day(
             first_checkin_local=first_in_local,
@@ -4070,13 +4140,8 @@ async def sync_offline_batch(req: SyncBatchRequest, background_tasks: Background
         synced_count = {"attendance": 0, "visits": 0, "pings": 0}
 
         # 1. Sync Attendance Logs
-        org_settings = None
-        tz_offset = 330
-        try:
-            org_settings = await settings_collection.find_one({"organization_id": employee.get("organization_id")})
-            if org_settings:
-                tz_offset = int(org_settings.get("timezone_offset", 330))
-        except Exception: pass
+        org_settings = await get_effective_org_settings(employee.get("organization_id"))
+        tz_offset = int(org_settings.get("timezone_offset", 330))
 
         for att in req.attendance_logs:
             offline_id = att.get("offline_id")
@@ -4381,15 +4446,8 @@ async def get_field_day_summary(employee_id: str, date: Optional[str] = None, cu
     last_out_log = next((l for l in reversed(today_field_logs) if l.get("type") in ["check-out", "OUT"]), None)
 
     org_id = current_user.get("organization_id")
-    org_settings_doc = None
-    tz_offset = current_user.get("timezone_offset", 330)
-    if org_id:
-        try:
-            org_settings_doc = await settings_collection.find_one({"organization_id": str(org_id) if ObjectId.is_valid(str(org_id)) else org_id})
-            if org_settings_doc:
-                tz_offset = org_settings_doc.get("timezone_offset", tz_offset)
-        except Exception:
-            pass
+    org_settings_doc = await get_effective_org_settings(org_id) if org_id else {}
+    tz_offset = org_settings_doc.get("timezone_offset", current_user.get("timezone_offset", 330))
 
     first_in_local = (first_in_log["timestamp"] + timedelta(minutes=tz_offset)) if first_in_log else None
     last_out_local = (last_out_log["timestamp"] + timedelta(minutes=tz_offset)) if last_out_log else None
@@ -5132,7 +5190,7 @@ async def handle_leave_request(request_id: str, action: str, req_body: Optional[
                 emp_id_str = str(leave_req.get("employee_id", ""))
                 emp_email = str(leave_req.get("email", emp_id_str))
 
-                org_settings = await settings_collection.find_one({"organization_id": leave_req.get("organization_id")})
+                org_settings = await get_effective_org_settings(leave_req.get("organization_id"))
                 tz_offset = int((org_settings or {}).get("timezone_offset", 330))
 
                 date_logs = await attendance_logs_collection.find({
@@ -5345,14 +5403,19 @@ async def sync_holiday_days_off(org_id: str, payroll_month: str):
         }).to_list(length=100)
 
         holiday_days = set()
+        holiday_names = {}
         for h in month_holidays:
-            if "day" in h:
-                holiday_days.add(int(h["day"]))
-            elif "date" in h:
+            d_val = None
+            if "day" in h and h["day"] is not None:
+                d_val = int(h["day"])
+            elif "date" in h and h["date"]:
                 try:
-                    holiday_days.add(int(str(h["date"]).split("-")[2]))
+                    d_val = int(str(h["date"]).split("-")[2])
                 except Exception:
                     pass
+            if d_val is not None:
+                holiday_days.add(d_val)
+                holiday_names[str(d_val)] = h.get("name", "Holiday")
 
         # Update the payroll days_off doc for this month
         payroll_doc = await holidays_collection.find_one({
@@ -5363,10 +5426,12 @@ async def sync_holiday_days_off(org_id: str, payroll_month: str):
 
         if payroll_doc:
             current_days_off = set(payroll_doc.get("days_off", []))
-            merged = list(current_days_off.union(holiday_days))
+            merged = sorted(list(current_days_off.union(holiday_days)))
+            merged_names = payroll_doc.get("holiday_names", {})
+            merged_names.update(holiday_names)
             await holidays_collection.update_one(
                 {"_id": payroll_doc["_id"]},
-                {"$set": {"days_off": merged, "updated_at": datetime.now(timezone.utc)}}
+                {"$set": {"days_off": merged, "holiday_names": merged_names, "updated_at": datetime.now(timezone.utc)}}
             )
         else:
             # Create default days_off doc with Sundays + holidays
@@ -5382,6 +5447,7 @@ async def sync_holiday_days_off(org_id: str, payroll_month: str):
                     "organization_id": org_id,
                     "payroll_month": payroll_month,
                     "days_off": initial_days_off,
+                    "holiday_names": holiday_names,
                     "created_at": datetime.now(timezone.utc)
                 })
             except Exception as cr_err:
@@ -7428,47 +7494,65 @@ async def get_employee_monthly_summary(
     absent_days = 0
     leaves_count = 0
     
-    # Fetch org settings for timezone and shift times
+    # Fetch org settings for timezone and shift times (unified from settings + leave_policy)
     org_id = employee.get("organization_id")
-    tz_offset = 330
-    office_end_time_str = "18:00"
-    office_start_time_str = "10:00"
-    late_threshold_mins = 15
+    org_doc = await get_effective_org_settings(org_id)
+    tz_offset = org_doc.get("timezone_offset", 330)
 
-    if org_id:
-        try:
-            org_doc = await settings_collection.find_one({"organization_id": str(org_id) if ObjectId.is_valid(str(org_id)) else org_id})
-            if org_doc:
-                tz_offset = org_doc.get("timezone_offset", 330)
-                if employee.get("employee_type") == "field":
-                    office_end_time_str = org_doc.get("field_office_end_time", "18:00")
-                    office_start_time_str = org_doc.get("field_office_start_time", "10:00")
-                    late_threshold_mins = org_doc.get("field_late_threshold_mins", 30)
-                else:
-                    office_end_time_str = org_doc.get("office_end_time", "18:00")
-                    office_start_time_str = org_doc.get("office_start_time", "10:00")
-                    late_threshold_mins = org_doc.get("late_threshold_mins", 15)
-        except Exception:
-            pass
+    if employee.get("employee_type") == "field":
+        office_end_time_str = org_doc.get("field_office_end_time") or org_doc.get("office_end_time", "18:00")
+        office_start_time_str = org_doc.get("field_office_start_time") or org_doc.get("office_start_time", "10:00")
+        late_threshold_mins = org_doc.get("field_late_grace_mins") if org_doc.get("field_late_grace_mins") is not None else org_doc.get("field_late_threshold_mins", 30)
+    else:
+        office_end_time_str = org_doc.get("office_end_time", "18:00")
+        office_start_time_str = org_doc.get("office_start_time", "10:00")
+        late_threshold_mins = org_doc.get("late_grace_mins") if org_doc.get("late_grace_mins") is not None else org_doc.get("late_threshold_mins", 15)
 
     # Fetch configured days off / holidays for this organization and month
     days_off_set = set()
     holiday_names = {}
     if org_id:
         try:
+            # 1. Fetch days_off doc (has composite days_off array)
             h_doc = await holidays_collection.find_one({
-                "organization_id": str(org_id),
-                "payroll_month": month
+                "$or": [
+                    {"organization_id": str(org_id), "payroll_month": month, "days_off": {"$exists": True}},
+                    {"organization_id": "system_org", "payroll_month": month, "days_off": {"$exists": True}}
+                ]
             })
-            if not h_doc:
-                # Fallback to system_org if not explicitly defined
-                h_doc = await holidays_collection.find_one({
-                    "organization_id": "system_org",
-                    "payroll_month": month
-                })
             if h_doc:
-                days_off_set = set(h_doc.get("days_off", []))
-                holiday_names = h_doc.get("holiday_names", {})
+                days_off_set.update(h_doc.get("days_off", []))
+                holiday_names.update(h_doc.get("holiday_names", {}))
+
+            # 2. Fetch all named holidays for this month (e.g. Janmashtami, festival, company)
+            named_holidays = await holidays_collection.find({
+                "$or": [
+                    {"organization_id": str(org_id), "payroll_month": month, "date": {"$exists": True}},
+                    {"organization_id": "system_org", "payroll_month": month, "date": {"$exists": True}}
+                ]
+            }).to_list(length=100)
+            for nh in named_holidays:
+                d_num = None
+                if "day" in nh and nh["day"] is not None:
+                    d_num = int(nh["day"])
+                elif "date" in nh and nh["date"]:
+                    try:
+                        d_num = int(str(nh["date"]).split("-")[2])
+                    except Exception:
+                        pass
+                if d_num is not None:
+                    days_off_set.add(d_num)
+                    holiday_names[str(d_num)] = nh.get("name") or "Holiday"
+
+            # 3. Always include all Sundays in this month as weekends
+            try:
+                y_m = month.split("-")
+                month_days_cnt = calendar.monthrange(int(y_m[0]), int(y_m[1]))[1]
+                for di in range(1, month_days_cnt + 1):
+                    if datetime(int(y_m[0]), int(y_m[1]), di).weekday() == 6:
+                        days_off_set.add(di)
+            except Exception:
+                pass
         except Exception as e:
             logger.warning(f"Failed to fetch holidays in monthly summary: {e}")
 
@@ -7557,8 +7641,10 @@ async def get_employee_monthly_summary(
         is_weekend_or_holiday = False
         if day_num in days_off_set:
             is_weekend_or_holiday = True
-            if current_day_local.weekday() >= 5:
+            if current_day_local.weekday() == 6:
                 day_info["status"] = "Weekend"
+            elif current_day_local.weekday() == 5:
+                day_info["status"] = holiday_names.get(str(day_num), "Weekend")
             else:
                 day_info["status"] = holiday_names.get(str(day_num), "Holiday")
         elif current_day_local.weekday() >= 5:
@@ -7675,6 +7761,8 @@ async def get_employee_monthly_summary(
                 day_info["classification_reason"] = "Pending Leave Approval"
             elif is_weekend_or_holiday:
                 day_info["classification_reason"] = day_info["status"]
+                day_info["off_hours"] = 0.0
+                day_info["effective_days"] = 1.0 if day_info["status"] not in ["Weekend"] else 0.0
             else:
                 day_info["status"] = "Absent"
                 day_info["classification_reason"] = "Unexcused Absence"
