@@ -1843,18 +1843,73 @@ async def smart_attendance(req: VerifyPresenceRequest, request: Request, backgro
                     await employees_collection.update_one({"_id": user["_id"]}, {"$set": {"gps_otp": None, "gps_otp_expiry": None}})
                     check_in_method = CheckInMethod.OTP_FALLBACK
                 else:
-                    # Territory verification
+                    # Multi-Tier Territory & Plan verification for Field Agents
+                    territory_verified = False
+                    verification_reason = ""
+                    min_distance = 9999999
+
+                    # Check 1: Polygon Territory (if configured)
+                    t_poly = user.get("territory_polygon")
+                    if user.get("territory_type") == "polygon" and t_poly and len(t_poly) >= 3:
+                        if is_point_in_polygon(req.lat, req.long, t_poly):
+                            territory_verified = True
+                            verification_reason = "Within assigned polygon zone"
+
+                    # Check 2: Circular Radius Territory (if configured)
                     t_lat_val = user.get("territory_center_lat")
                     t_lng_val = user.get("territory_center_lng")
-                    t_lat = float(t_lat_val) if t_lat_val is not None else 0.0
-                    t_lng = float(t_lng_val) if t_lng_val is not None else 0.0
-                    if abs(t_lat) < 0.01 and abs(office_lat) > 0.01:
-                        t_lat, t_lng = office_lat, office_long
-                    t_radius_val = user.get("territory_radius_meters")
-                    t_radius = float(t_radius_val) if t_radius_val is not None else 500.0
-                    dist = calculate_haversine(req.lat, req.long, t_lat, t_lng)
-                    if dist > t_radius:
-                        raise HTTPException(status_code=403, detail=f"Territory Breach. You are {dist:.0f}m away from your assigned zone.")
+                    if not territory_verified and t_lat_val is not None and t_lng_val is not None:
+                        t_lat = float(t_lat_val)
+                        t_lng = float(t_lng_val)
+                        if abs(t_lat) > 0.001 or abs(t_lng) > 0.001:
+                            t_radius = float(user.get("territory_radius_meters") or 5000.0)
+                            dist = calculate_haversine(req.lat, req.long, t_lat, t_lng)
+                            min_distance = min(min_distance, dist)
+                            if dist <= t_radius:
+                                territory_verified = True
+                                verification_reason = f"Within territory radius ({dist:.0f}m from center)"
+
+                    # Check 3: Today's Approved Visit Plan Stops
+                    if not territory_verified:
+                        plan = await visit_plans_collection.find_one({
+                            "$or": [
+                                {"employee_id": clean_email},
+                                {"employee_id": user.get("employee_id")}
+                            ],
+                            "date": today_date_str,
+                            "status": {"$in": ["approved", "submitted"]}
+                        })
+
+                        if plan and plan.get("stops"):
+                            for stop in plan["stops"]:
+                                s_lat = float(stop.get("place_lat", 0) or 0)
+                                s_lng = float(stop.get("place_lng", 0) or 0)
+                                if abs(s_lat) > 0.001:
+                                    s_dist = calculate_haversine(req.lat, req.long, s_lat, s_lng)
+                                    min_distance = min(min_distance, s_dist)
+                                    # Allow within 1000m of any approved stop for Start of Day
+                                    if s_dist <= 1000:
+                                        territory_verified = True
+                                        verification_reason = f"At scheduled visit stop '{stop.get('place_name')}' ({s_dist:.0f}m away)"
+                                        break
+
+                    # Check 4: Office Fallback (if employee territory is not set up at all)
+                    if not territory_verified and (t_lat_val is None or abs(float(t_lat_val)) < 0.001):
+                        if abs(office_lat) > 0.001 or abs(office_long) > 0.001:
+                            dist = calculate_haversine(req.lat, req.long, office_lat, office_long)
+                            min_distance = min(min_distance, dist)
+                            if dist <= float(radius):
+                                territory_verified = True
+                                verification_reason = f"At registered office location ({dist:.0f}m away)"
+
+                    if not territory_verified:
+                        dist_msg = f"{min_distance:.0f}m away" if min_distance < 9000000 else "Outside assigned area"
+                        raise HTTPException(
+                            status_code=403,
+                            detail=f"Territory Breach. You are {dist_msg} from your assigned zone or visit stops. Contact admin for a GPS OTP to bypass."
+                        )
+
+                    logger.info(f"Field agent {clean_email} attendance verified: {verification_reason}")
                     check_in_method = CheckInMethod.GPS_TERRITORY
 
 
@@ -4497,7 +4552,10 @@ async def update_territory(email: str, req: dict, admin=Depends(get_current_admi
     
     # Check if employee exists within admin scope
     base_filter = get_employee_filter(admin)
-    query = {"email": clean_email, **base_filter}
+    query = {"$or": [{"email": clean_email}, {"employee_id": clean_email}]}
+    if base_filter:
+        query = {"$and": [query, base_filter]}
+
     user = await employees_collection.find_one(query)
     if not user:
         raise HTTPException(status_code=404, detail="Employee not found or access denied")
@@ -4513,15 +4571,16 @@ async def update_territory(email: str, req: dict, admin=Depends(get_current_admi
         update_fields["territory_center_lng"] = None
         update_fields["territory_radius_meters"] = None
     else:
-        update_fields["territory_center_lat"] = req.get("territory_center_lat")
-        update_fields["territory_center_lng"] = req.get("territory_center_lng")
-        update_fields["territory_radius_meters"] = req.get("territory_radius_meters")
+        lat = req.get("territory_center_lat")
+        lng = req.get("territory_center_lng")
+        rad = req.get("territory_radius_meters")
+        update_fields["territory_center_lat"] = float(lat) if (lat is not None and str(lat).strip() != "") else None
+        update_fields["territory_center_lng"] = float(lng) if (lng is not None and str(lng).strip() != "") else None
+        update_fields["territory_radius_meters"] = float(rad) if (rad is not None and str(rad).strip() != "") else 5000.0
         # Clear polygon fields when switching to radius
         update_fields["territory_polygon"] = None
 
-    result = await employees_collection.update_one(query, {"$set": update_fields})
-    if result.matched_count == 0:
-        raise HTTPException(status_code=404, detail="Employee not found or access denied")
+    result = await employees_collection.update_one({"_id": user["_id"]}, {"$set": update_fields})
     return {"status": "success", "message": f"Territory updated to {req.get('territory_type', 'radius')} for {email}"}
 
 
