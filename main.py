@@ -33,6 +33,7 @@ import base64
 import uuid
 from fastapi.staticfiles import StaticFiles
 import requests
+import httpx
 try:
     from PIL import Image as PILImage  # type: ignore[import-not-found]  # optional: Pillow
 except ImportError:
@@ -748,7 +749,10 @@ async def get_public_settings(slug: str):
         return SystemSettings().dict()
     
     settings_doc = await settings_collection.find_one({"organization_id": str(org["_id"])})
-    return settings_doc if settings_doc else SystemSettings().dict()
+    if settings_doc:
+        settings_doc["_id"] = str(settings_doc["_id"])
+        return settings_doc
+    return SystemSettings().dict()
 
 
 from fastapi import Request
@@ -7309,14 +7313,70 @@ async def get_field_leaderboard(employee=Depends(get_current_employee)):
 
 
 # -----------------------------------------------------------------------------
-# AREA 3: MANAGER NUDGE
+# AREA 3: MANAGER & ADMIN NUDGE SYSTEM WITH REAL BACKGROUND PUSH NOTIFICATIONS
 # -----------------------------------------------------------------------------
+
+async def send_expo_push_notifications(
+    tokens: List[str], 
+    title: str, 
+    body: str, 
+    data: Optional[Dict] = None, 
+    sound: str = "default", 
+    channel_id: str = "nudges"
+):
+    """
+    Sends real background push notifications via Expo Push Notification API.
+    Works even when the mobile app is in the background or killed.
+    """
+    if not tokens:
+        return
+    
+    valid_tokens = []
+    for t in tokens:
+        if isinstance(t, str) and (t.startswith("ExponentPushToken[") or t.startswith("ExpoPushToken[")):
+            valid_tokens.append(t)
+            
+    if not valid_tokens:
+        logger.info("[PUSH] No valid Expo push tokens found among provided candidates.")
+        return
+    
+    valid_tokens = list(set(valid_tokens))
+
+    messages = [
+        {
+            "to": token,
+            "sound": sound,
+            "title": title,
+            "body": body,
+            "data": data or {},
+            "priority": "high",
+            "channelId": channel_id,
+            "_displayInForeground": True
+        }
+        for token in valid_tokens
+    ]
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                "https://exp.host/--/api/v2/push/send",
+                json=messages,
+                headers={
+                    "Accept": "application/json",
+                    "Accept-Encoding": "gzip, deflate",
+                    "Content-Type": "application/json"
+                }
+            )
+            logger.info(f"[PUSH] Expo push notification dispatched to {len(valid_tokens)} device(s). Status: {resp.status_code}")
+    except Exception as e:
+        logger.error(f"[PUSH] Error sending Expo push notifications: {e}")
+
 
 @app.post("/api/manager/nudge")
 async def send_manager_nudge(req: dict, manager=Depends(get_current_employee)):
     """
-    Manager sends a motivational nudge to one or more team members.
-    Logged to DB. FCM push notification can be added here in production.
+    Manager sends a motivational nudge to one or more team members or all.
+    Dispatches real background push notifications to field employees' devices.
     """
     # Verify manager status
     subordinates_count = await employees_collection.count_documents({"manager_id": manager["email"]})
@@ -7324,43 +7384,78 @@ async def send_manager_nudge(req: dict, manager=Depends(get_current_employee)):
         raise HTTPException(status_code=403, detail="Only managers can send nudges.")
 
     employee_emails = req.get("employee_emails", [])
+    recipient_type = req.get("recipient_type", "individual")  # 'individual' or 'all'
     message = req.get("message", "").strip()
-    nudge_type = req.get("nudge_type", "general")  # general | target_missed | late_start | great_job
+    nudge_type = req.get("nudge_type", "general")
 
-    if not employee_emails:
-        raise HTTPException(status_code=400, detail="At least one employee email is required.")
     if not message:
         raise HTTPException(status_code=400, detail="Nudge message cannot be empty.")
 
-    # Verify all recipients belong to the manager
-    valid_recipients = []
-    for email in employee_emails:
-        emp = await employees_collection.find_one({"email": email, "manager_id": manager["email"]})
-        if emp:
-            valid_recipients.append(email)
+    # If sending to all subordinates or "all" in employee_emails
+    if recipient_type == "all" or "all" in employee_emails or not employee_emails:
+        recipient_type = "all"
+        cursor = employees_collection.find({"manager_id": manager["email"], "is_active": {"$ne": False}})
+        subordinates = await cursor.to_list(length=500)
+        valid_recipients = [s["email"] for s in subordinates if s.get("email")]
+    else:
+        valid_recipients = []
+        for email in employee_emails:
+            emp = await employees_collection.find_one({"email": email, "manager_id": manager["email"]})
+            if emp:
+                valid_recipients.append(email)
 
     if not valid_recipients:
         raise HTTPException(status_code=400, detail="No valid team members found in the provided emails.")
 
-    # Save nudge log
+    manager_name = manager.get("full_name") or manager.get("name") or manager.get("email")
+
     nudge_log = {
         "manager_id": manager["email"],
-        "manager_name": manager.get("full_name", manager["email"]),
+        "manager_name": manager_name,
         "organization_id": manager.get("organization_id"),
         "recipients": valid_recipients,
+        "recipient_type": recipient_type,
         "message": message,
         "nudge_type": nudge_type,
+        "read_by": [],
         "sent_at": datetime.now(timezone.utc),
-        # FCM push would go here in production: firebase_admin.messaging.send_multicast(...)
     }
     result = await nudge_logs_collection.insert_one(nudge_log)
+    nudge_id = str(result.inserted_id)
 
-    logger.info(f"Manager nudge sent by {manager['email']} to {valid_recipients}: [{nudge_type}] {message}")
+    # Collect push tokens for all recipients
+    push_tokens = []
+    async for emp in employees_collection.find({"email": {"$in": valid_recipients}}):
+        if emp.get("push_token"):
+            push_tokens.append(emp["push_token"])
+        if isinstance(emp.get("push_tokens"), list):
+            push_tokens.extend(emp["push_tokens"])
+
+    nudge_titles = {
+        "general": f"⚡ Message from {manager_name}",
+        "target_missed": f"🎯 Target Alert from {manager_name}",
+        "late_start": f"⏰ Schedule Alert from {manager_name}",
+        "great_job": f"🌟 Great Job from {manager_name}!"
+    }
+    title = nudge_titles.get(nudge_type, f"⚡ Nudge from {manager_name}")
+
+    push_data = {
+        "type": "nudge",
+        "nudge_id": nudge_id,
+        "nudge_type": nudge_type,
+        "sender_name": manager_name,
+        "sender_role": "Manager",
+        "message": message,
+        "sent_at": datetime.now(timezone.utc).isoformat()
+    }
+
+    asyncio.create_task(send_expo_push_notifications(push_tokens, title, message, push_data))
 
     return {
         "status": "sent",
-        "nudge_id": str(result.inserted_id),
+        "nudge_id": nudge_id,
         "recipients_count": len(valid_recipients),
+        "recipient_type": recipient_type,
         "recipients": valid_recipients,
         "message": f"Nudge sent to {len(valid_recipients)} team member(s)."
     }
@@ -7380,47 +7475,92 @@ async def get_nudge_history(manager=Depends(get_current_employee)):
 
     return logs
 
+
 @app.post("/admin/nudge")
 async def admin_send_nudge(req: dict, admin=Depends(get_current_admin)):
-    """Admin sends a motivational nudge to field team members in their organization."""
+    """
+    Admin sends a motivational nudge/message to field team members in their organization.
+    Supports private 1-to-1 nudge or broadcast to all field team employees.
+    Dispatches real background push notifications to field employees' devices.
+    """
     org_id = admin.organization_id
     employee_emails = req.get("employee_emails", [])
+    recipient_type = req.get("recipient_type", "individual")  # 'individual' or 'all'
     message = req.get("message", "").strip()
     nudge_type = req.get("nudge_type", "general")
 
-    if not employee_emails:
-        raise HTTPException(status_code=400, detail="At least one employee email is required.")
     if not message:
         raise HTTPException(status_code=400, detail="Nudge message cannot be empty.")
 
-    # Verify recipients belong to same organization
-    valid_recipients = []
-    for email in employee_emails:
-        query = {"email": email}
+    if recipient_type == "all" or "all" in employee_emails or not employee_emails:
+        recipient_type = "all"
+        query = {"is_active": {"$ne": False}}
         if org_id:
             query["organization_id"] = org_id
-            
-        emp = await employees_collection.find_one(query)
-        if emp:
-            valid_recipients.append(email)
+        all_emps = await employees_collection.find(query).to_list(length=1000)
+        valid_recipients = [e["email"] for e in all_emps if e.get("email")]
+    else:
+        valid_recipients = []
+        for email in employee_emails:
+            query = {"email": email}
+            if org_id:
+                query["organization_id"] = org_id
+            emp = await employees_collection.find_one(query)
+            if emp:
+                valid_recipients.append(email)
 
     if not valid_recipients:
         raise HTTPException(status_code=400, detail="No valid employees found in your organization.")
 
+    admin_name = getattr(admin, "full_name", None) or getattr(admin, "name", None) or admin.email
+
     nudge_log = {
         "admin_id": admin.email,
-        "admin_name": admin.full_name,
+        "admin_name": admin_name,
         "organization_id": org_id,
         "recipients": valid_recipients,
+        "recipient_type": recipient_type,
         "message": message,
         "nudge_type": nudge_type,
+        "read_by": [],
         "sent_at": datetime.now(timezone.utc),
     }
     result = await nudge_logs_collection.insert_one(nudge_log)
+    nudge_id = str(result.inserted_id)
+
+    # Collect push tokens
+    push_tokens = []
+    async for emp in employees_collection.find({"email": {"$in": valid_recipients}}):
+        if emp.get("push_token"):
+            push_tokens.append(emp["push_token"])
+        if isinstance(emp.get("push_tokens"), list):
+            push_tokens.extend(emp["push_tokens"])
+
+    nudge_titles = {
+        "general": f"📢 Announcement from {admin_name}",
+        "target_missed": f"🎯 Target Alert from Admin",
+        "late_start": f"⏰ Attendance Notice from Admin",
+        "great_job": f"🏆 Recognition from Admin!"
+    }
+    title = nudge_titles.get(nudge_type, f"⚡ Message from Admin ({admin_name})")
+
+    push_data = {
+        "type": "nudge",
+        "nudge_id": nudge_id,
+        "nudge_type": nudge_type,
+        "sender_name": admin_name,
+        "sender_role": "Admin",
+        "message": message,
+        "sent_at": datetime.now(timezone.utc).isoformat()
+    }
+
+    asyncio.create_task(send_expo_push_notifications(push_tokens, title, message, push_data))
+
     return {
         "status": "sent",
-        "nudge_id": str(result.inserted_id),
+        "nudge_id": nudge_id,
         "recipients_count": len(valid_recipients),
+        "recipient_type": recipient_type,
         "message": f"Nudge sent to {len(valid_recipients)} member(s)."
     }
 
@@ -7440,6 +7580,90 @@ async def admin_get_nudge_history(admin=Depends(get_current_admin)):
             log["sent_at"] = log["sent_at"].isoformat()
 
     return logs
+
+
+# -----------------------------------------------------------------------------
+# EMPLOYEE NUDGE & PUSH NOTIFICATION TOKEN ENDPOINTS
+# -----------------------------------------------------------------------------
+
+@app.post("/api/employee/push-token")
+async def register_push_token(req: dict, emp=Depends(get_current_employee)):
+    """
+    Register mobile Expo push token for the current employee.
+    Enables real background notifications even when the app is closed.
+    """
+    token = req.get("push_token") or req.get("token")
+    device_info = req.get("device_info", {})
+    if not token:
+        raise HTTPException(status_code=400, detail="push_token is required.")
+        
+    await employees_collection.update_one(
+        {"email": emp["email"]},
+        {
+            "$set": {
+                "push_token": token,
+                "push_token_updated_at": datetime.now(timezone.utc),
+                "device_info": device_info
+            },
+            "$addToSet": {
+                "push_tokens": token
+            }
+        }
+    )
+    return {"status": "success", "message": "Push token registered successfully"}
+
+
+@app.get("/api/employee/nudges")
+async def get_employee_nudges(emp=Depends(get_current_employee)):
+    """
+    Fetch all nudges received by this employee (both targeted to them or broadcast to all in org).
+    """
+    org_id = emp.get("organization_id")
+    email = emp.get("email")
+
+    query = {
+        "$or": [
+            {"recipients": email},
+            {"recipient_type": "all", "organization_id": org_id},
+            {"recipients": "all", "organization_id": org_id}
+        ]
+    }
+    
+    logs = await nudge_logs_collection.find(query).sort("sent_at", -1).to_list(length=100)
+    result = []
+    for log in logs:
+        log_id = str(log["_id"])
+        read_by = log.get("read_by", [])
+        is_read = email in read_by
+        sent_at_val = log.get("sent_at")
+        sent_at_str = sent_at_val.isoformat() if isinstance(sent_at_val, datetime) else str(sent_at_val or "")
+
+        result.append({
+            "id": log_id,
+            "_id": log_id,
+            "sender_name": log.get("admin_name") or log.get("manager_name") or "Management",
+            "sender_role": "Admin" if log.get("admin_id") else "Manager",
+            "message": log.get("message", ""),
+            "nudge_type": log.get("nudge_type", "general"),
+            "sent_at": sent_at_str,
+            "is_read": is_read
+        })
+    return result
+
+
+@app.post("/api/employee/nudges/{nudge_id}/read")
+async def mark_nudge_read(nudge_id: str, emp=Depends(get_current_employee)):
+    """Mark a nudge as read by this employee."""
+    try:
+        oid = ObjectId(nudge_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid nudge ID")
+
+    await nudge_logs_collection.update_one(
+        {"_id": oid},
+        {"$addToSet": {"read_by": emp["email"]}}
+    )
+    return {"status": "success", "message": "Marked as read"}
 
 @app.get("/admin/leaderboard")
 async def get_admin_leaderboard(admin=Depends(get_current_admin)):
