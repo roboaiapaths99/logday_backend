@@ -1254,7 +1254,7 @@ def classify_attendance_day(
                     "early_exit_mins": 0,
                     "late_off_hours": 0.0,
                     "early_off_hours": 0.0,
-                    "off_hours": round(required_hours * 0.5, 2),
+                    "off_hours": 0.0,
                     "worked_hours": 0.0,
                     "required_hours": required_hours,
                     "effective_days": 0.5,
@@ -1294,7 +1294,7 @@ def classify_attendance_day(
             "early_exit_mins": 0,
             "late_off_hours": 0.0,
             "early_off_hours": 0.0,
-            "off_hours": required_hours,
+            "off_hours": 0.0,
             "worked_hours": 0.0,
             "required_hours": required_hours,
             "effective_days": 0.0,
@@ -1341,18 +1341,10 @@ def classify_attendance_day(
                 early_exit_mins = raw_early_mins
                 early_off_hours = round(early_exit_mins / 60.0, 2)
 
-    # Total off-hours
-    grace_hours = round(late_grace_mins / 60.0, 2)
-    if worked_hours > 0:
-        raw_off_hours = round(max(0.0, required_hours - worked_hours), 2)
-        # If employee arrived within grace and left at or after shift end (or within 10m checkout grace),
-        # minor clock rounding deficit (<= grace_hours or <= 0.25h) is completely waived (0 deficit)
-        if not is_late and not is_early_leave and (raw_off_hours <= grace_hours or raw_off_hours <= 0.25):
-            total_off_hours = 0.0
-        else:
-            total_off_hours = raw_off_hours
-    else:
-        total_off_hours = round(late_off_hours + early_off_hours, 2)
+    # Total off-hours: waived / zeroed out across the app
+    total_off_hours = 0.0
+    late_off_hours = 0.0
+    early_off_hours = 0.0
 
     # 4. Status Determination
     status = "Present"
@@ -1364,7 +1356,7 @@ def classify_attendance_day(
     classification_reason = "On-time full day"
     is_applied_leave = False
 
-    # A) Check if applied leave exists for today
+    # A) Check if approved applied leave exists for today
     if approved_leave:
         dur_type = str(approved_leave.get("duration_type", "")).lower().strip()
         slot = str(approved_leave.get("short_leave_slot", "")).lower().strip()
@@ -1375,21 +1367,12 @@ def classify_attendance_day(
             status = "Short Leave"
             slot_label = f" ({slot.title()})" if slot else ""
             classification_reason = f"Approved Short Leave{slot_label}"
-            
-            # If short leave slot is morning, late arrival is authorized
             if slot == "morning":
                 is_late = False
                 late_mins = 0
-                late_off_hours = 0.0
             elif slot == "evening":
                 is_early_leave = False
                 early_exit_mins = 0
-                early_off_hours = 0.0
-            else:
-                # General / mid-day short leave: waives up to 2 hours of deficit
-                late_off_hours = max(0.0, late_off_hours - 1.0)
-                early_off_hours = max(0.0, early_off_hours - 1.0)
-            total_off_hours = round(late_off_hours + early_off_hours, 2)
         elif dur_type in ["first_half", "second_half", "half_day"] or approved_leave.get("duration") == 0.5:
             is_half_day = True
             half_day_type = f"{dur_type}_applied"
@@ -1398,19 +1381,14 @@ def classify_attendance_day(
             effective_days = 0.5
             classification_reason = f"Approved Half Day ({dur_type.replace('_', ' ').title()})"
             if "first" in dur_type:
-                # 1st half leave: late arrival authorized
                 is_late = False
                 late_mins = 0
-                late_off_hours = 0.0
             elif "second" in dur_type:
-                # 2nd half leave: early departure authorized
                 is_early_leave = False
                 early_exit_mins = 0
-                early_off_hours = 0.0
-            total_off_hours = round(late_off_hours + early_off_hours, 2)
 
-    # B) Evaluate Half Day thresholds if not already half day
-    if not is_half_day:
+    # B) Evaluate Half Day thresholds if not already half day or approved leave
+    if not is_half_day and not is_short_leave:
         if first_checkin_local >= half_day_late_cutoff:
             is_half_day = True
             half_day_type = "late_arrival"
@@ -1423,50 +1401,20 @@ def classify_attendance_day(
             status = "Half Day"
             effective_days = 0.5
             classification_reason = f"Check-out at {last_checkout_local.strftime('%H:%M')} (before Half-Day limit {early_half_str})"
-        elif last_checkout_local and worked_hours > 0 and worked_hours < half_day_min_hours:
-            status = "Absent"
-            effective_days = 0.0
-            classification_reason = f"Worked only {worked_hours:.1f}h (< min half-day requirement {half_day_min_hours:.1f}h)"
-        elif last_checkout_local and worked_hours > 0 and worked_hours < (full_day_min_hours - short_leave_max_hours):
+        elif last_checkout_local and 0 < worked_hours < half_day_min_hours:
             is_half_day = True
             half_day_type = "low_hours"
             status = "Half Day"
             effective_days = 0.5
-            classification_reason = f"Worked {worked_hours:.1f}h (credited as Half-Day, threshold {half_day_min_hours:.1f}h - {full_day_min_hours - short_leave_max_hours:.1f}h)"
+            classification_reason = f"Worked {worked_hours:.1f}h (< min half-day requirement {half_day_min_hours:.1f}h)"
 
-    # C) Evaluate Short Leave thresholds if not Half Day and not already Short Leave
-    if not is_half_day and not is_short_leave and status != "Absent":
-        if first_checkin_local > short_leave_late_cutoff:
-            is_short_leave = True
-            short_leave_type = "late_arrival"
-            status = "Short Leave"
-            effective_days = 1.0
-            classification_reason = f"Late by {late_mins}m (exceeds Short Leave limit {late_to_short_mins}m)"
-        elif last_checkout_local and last_checkout_local < short_leave_early_cutoff:
-            is_short_leave = True
-            short_leave_type = "early_departure"
-            status = "Short Leave"
-            effective_days = 1.0
-            classification_reason = f"Early exit by {early_exit_mins}m (exceeds Short Leave limit {early_short_mins}m)"
-        elif last_checkout_local and worked_hours > 0:
-            # Low-hours short leave evaluation:
-            # 1. If employee arrived within grace and left on/after shift end, they fulfilled their day: NEVER short leave!
-            # 2. Deficit must exceed grace_hours margin
-            # 3. Deficit must be at least 1.0 hour OR accompanied by unexcused late/early
-            hours_deficit = round(full_day_min_hours - worked_hours, 2)
-            if not is_late and not is_early_leave:
-                # On-time full day completed within allowable shift schedule
-                pass
-            elif hours_deficit > grace_hours and (is_late or is_early_leave or hours_deficit >= 1.0):
-                is_short_leave = True
-                short_leave_type = "low_hours"
-                status = "Short Leave"
-                effective_days = 1.0
-                classification_reason = f"Worked {worked_hours:.1f}h (< full day requirement {full_day_min_hours:.1f}h)"
-
-    # D) Fallback states
+    # C) Short Leave is strictly for approved leave applications (never automatic)
+    # D) Fallback states for standard working day
     if not is_half_day and not is_short_leave:
-        if is_early_leave:
+        if last_checkout_local and worked_hours >= (full_day_min_hours - 1.0):
+            status = "Present"
+            classification_reason = f"Full day attendance (worked {worked_hours:.1f}h)" if is_late else "On-time full day"
+        elif is_early_leave:
             status = "Early Leave"
             classification_reason = f"Left {early_exit_mins} mins early"
         elif is_late:
@@ -1486,9 +1434,9 @@ def classify_attendance_day(
         "half_day_type": half_day_type,
         "late_mins": late_mins,
         "early_exit_mins": early_exit_mins,
-        "late_off_hours": late_off_hours,
-        "early_off_hours": early_off_hours,
-        "off_hours": total_off_hours,
+        "late_off_hours": 0.0,
+        "early_off_hours": 0.0,
+        "off_hours": 0.0,
         "worked_hours": round(worked_hours, 2),
         "required_hours": round(required_hours, 2),
         "effective_days": effective_days,
@@ -2002,23 +1950,24 @@ async def smart_attendance(req: VerifyPresenceRequest, request: Request, backgro
                 approved_leave=approved_leave
             )
 
-            # Retroactively update today's first check-in log with final full-day classification
+            # Retroactively update today's first check-in log with final status metadata without corrupting check-in reason
             if today_first_checkin:
+                checkin_upd = {
+                    "is_half_day": classification["is_half_day"],
+                    "half_day_type": classification["half_day_type"],
+                    "off_hours": 0.0,
+                    "late_off_hours": 0.0,
+                    "early_off_hours": 0.0,
+                    "is_short_leave": classification["is_short_leave"],
+                    "short_leave_type": classification["short_leave_type"],
+                    "effective_days": classification["effective_days"]
+                }
+                if classification.get("is_applied_leave"):
+                    checkin_upd["attendance_status"] = classification["status"]
+                    checkin_upd["is_applied_leave"] = True
                 await attendance_logs_collection.update_one(
                     {"_id": today_first_checkin["_id"]},
-                    {"$set": {
-                        "attendance_status": classification["status"],
-                        "is_short_leave": classification["is_short_leave"],
-                        "is_half_day": classification["is_half_day"],
-                        "short_leave_type": classification["short_leave_type"],
-                        "half_day_type": classification["half_day_type"],
-                        "off_hours": classification["off_hours"],
-                        "late_off_hours": classification["late_off_hours"],
-                        "early_off_hours": classification["early_off_hours"],
-                        "classification_reason": classification["classification_reason"],
-                        "is_applied_leave": classification["is_applied_leave"],
-                        "effective_days": classification["effective_days"]
-                    }}
+                    {"$set": checkin_upd}
                 )
 
         # Determine unified attendance type
