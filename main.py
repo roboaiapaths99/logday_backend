@@ -1670,7 +1670,7 @@ async def smart_attendance(req: VerifyPresenceRequest, request: Request, backgro
         db_wifi_bssid = settings.get("office_wifi_bssid")
         office_wifi_bssid = str(db_wifi_bssid).strip() if (db_wifi_bssid and str(db_wifi_bssid).strip() != "") else os.getenv("OFFICE_WIFI_BSSID", "")
 
-        role = user.get("employee_type", "desk")
+        role = str(user.get("employee_type") or user.get("role") or "desk").lower()
         attendance_type = req.intended_type or "check-in"
         logger.info(f"Processing {attendance_type.replace('-', ' ').title()} for {user['email']} (Role: {role}, Superadmin: {is_superadmin})")
 
@@ -1790,6 +1790,7 @@ async def smart_attendance(req: VerifyPresenceRequest, request: Request, backgro
         now_utc = datetime.now(timezone.utc)
         local_now = now_utc + timedelta(minutes=tz_offset)
         today_str = local_now.strftime("%Y-%m-%d")
+        today_date_str = today_str
 
         wfh_approved = False
         wfh_req = await wfh_requests_collection.find_one({
@@ -2235,19 +2236,35 @@ def calculate_haversine(lat1, lon1, lat2, lon2):
 
 
 def is_point_in_polygon(lat: float, lng: float, polygon: list) -> bool:
-    """Ray-casting algorithm to check if a point is inside a polygon.
-    polygon: list of dicts with 'lat' and 'lng' keys.
-    """
-    n = len(polygon)
-    inside = False
-    j = n - 1
-    for i in range(n):
-        xi, yi = polygon[i]["lat"], polygon[i]["lng"]
-        xj, yj = polygon[j]["lat"], polygon[j]["lng"]
-        if ((yi > lng) != (yj > lng)) and (lat < (xj - xi) * (lng - yi) / (yj - yi) + xi):
-            inside = not inside
-        j = i
-    return inside
+    """Ray-casting algorithm to check if a point is inside a polygon."""
+    if not polygon or len(polygon) < 3:
+        return False
+    try:
+        lat = float(lat)
+        lng = float(lng)
+        n = len(polygon)
+        inside = False
+        j = n - 1
+        for i in range(n):
+            pi = polygon[i]
+            pj = polygon[j]
+            if isinstance(pi, (list, tuple)):
+                xi, yi = float(pi[0]), float(pi[1])
+            else:
+                xi = float(pi.get("lat", pi.get("latitude", 0)))
+                yi = float(pi.get("lng", pi.get("longitude", 0)))
+            if isinstance(pj, (list, tuple)):
+                xj, yj = float(pj[0]), float(pj[1])
+            else:
+                xj = float(pj.get("lat", pj.get("latitude", 0)))
+                yj = float(pj.get("lng", pj.get("longitude", 0)))
+            if ((yi > lng) != (yj > lng)) and (abs(yj - yi) > 1e-9) and (lat < (xj - xi) * (lng - yi) / (yj - yi) + xi):
+                inside = not inside
+            j = i
+        return inside
+    except Exception as e:
+        logger.warning(f"Polygon point test error: {e}")
+        return False
 
 
 def attendance_type_str(val):
@@ -3734,23 +3751,27 @@ async def submit_visit_plan(plan: VisitPlan, employee=Depends(get_current_employ
 @app.get("/api/field/plan/{employee_id}")
 async def get_current_plan(employee_id: str, date: Optional[str] = None, current_user=Depends(get_current_employee)):
     """Retrieve the active (approved) plan for today."""
-    # Privacy Enforcement: Can only see own plan (or admin if we added that check)
-    if employee_id != current_user["email"]:
+    user_email = (current_user.get("email") or "").lower().strip()
+    user_emp_code = str(current_user.get("employee_id") or "").strip()
+    req_id = employee_id.lower().strip()
+
+    if req_id != user_email and employee_id.strip() != user_emp_code:
         raise HTTPException(status_code=403, detail="Access denied: Cannot view another agent's plan.")
         
     query_date = date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    plan = await visit_plans_collection.find_one({
-        "employee_id": employee_id,
-        "date": query_date,
-        "status": PlanStatus.APPROVED
-    })
+    plan_filter = {
+        "$or": [
+            {"employee_id": user_email},
+            {"employee_id": employee_id},
+            {"employee_id": user_emp_code}
+        ] if user_emp_code else [{"employee_id": user_email}, {"employee_id": employee_id}],
+        "date": query_date
+    }
+    plan = await visit_plans_collection.find_one({**plan_filter, "status": PlanStatus.APPROVED})
     
     if not plan:
         # Check for submitted/draft if no approved one exists
-        plan = await visit_plans_collection.find_one({
-            "employee_id": employee_id,
-            "date": query_date
-        })
+        plan = await visit_plans_collection.find_one(plan_filter)
         
     if not plan:
         return {"status": "no_plan", "message": "No visit plan found for today."}
