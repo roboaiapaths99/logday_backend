@@ -8094,17 +8094,20 @@ async def get_employee_monthly_summary(
                     "off_hours": log.get("off_hours", 0.0),
                     "method": log.get("check_in_method", "N/A"),
                     "location": log.get("location"),
+                    "address": log.get("address") or log.get("location_name"),
+                    "location_name": log.get("location_name") or log.get("address"),
                     "selfie": log.get("selfie_url"),
                     "wifi_confidence": log.get("wifi_confidence", 0)
                 })
 
                 if log_type == "check-in":
                     last_in_time = log_ts
-                elif log_type == "check-out" and last_in_time:
-                    delta = log_ts - last_in_time
-                    day_duration_ms += delta.total_seconds() * 1000
-                    last_in_time = None
+                elif log_type == "check-out":
                     day_info["last_out"] = log_ts.isoformat()
+                    if last_in_time:
+                        delta = log_ts - last_in_time
+                        day_duration_ms += delta.total_seconds() * 1000
+                        last_in_time = None
 
             duration_hours = round(day_duration_ms / (1000 * 3600), 2)
             day_info["duration_hours"] = duration_hours
