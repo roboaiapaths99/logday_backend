@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from typing import List, Optional, Any
 from datetime import datetime
 from enum import Enum
@@ -32,6 +32,7 @@ class AdminFeature(str, Enum):
     WFH_MONITORING = "wfh_monitoring"
     SETTINGS = "settings"
     SUB_ADMINS = "sub_admins"
+    FLYFIELD = "flyfield"
 
 
 class WFHStatus(str, Enum):
@@ -164,6 +165,7 @@ class EmployeeBase(BaseModel):
     department: str = "General"
     organization_id: str
     employee_type: EmployeeType = EmployeeType.DESK
+    field_mode: Optional[str] = "planned"
     manager_id: Optional[str] = None
     beat_zone_name: Optional[str] = None
     salary_structure: Optional[SalaryStructure] = None
@@ -255,6 +257,7 @@ class RegisterRequest(BaseModel):
     face_image: Optional[str] = None
     device_id: Optional[str] = None
     employee_type: EmployeeType = EmployeeType.DESK
+    field_mode: Optional[str] = "planned"
 
 
 class LoginRequest(BaseModel):
@@ -266,19 +269,42 @@ class LoginRequest(BaseModel):
 
 
 class VerifyPresenceRequest(BaseModel):
-    email: str
-    image: str
-    lat: float
-    long: float
+    email: Optional[str] = None
+    image: Optional[str] = None
+    lat: Optional[float] = None
+    long: Optional[float] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
     accuracy: Optional[float] = None
     wifi_ssid: str = ""
     wifi_bssid: str = ""
     wifi_strength: float = -50.0
     address: Optional[str] = None
     intended_type: Optional[str] = None
+    punch_type: Optional[str] = None
     device_id: Optional[str] = None
     otp_used: bool = False
     mock_detected: bool = False
+    client_type: Optional[str] = None
+    organization_id: Optional[str] = None
+
+    @model_validator(mode="after")
+    def sync_coords(self):
+        if self.lat is None and self.latitude is not None:
+            self.lat = self.latitude
+        elif self.latitude is None and self.lat is not None:
+            self.latitude = self.lat
+        if self.long is None and self.longitude is not None:
+            self.long = self.longitude
+        elif self.longitude is None and self.long is not None:
+            self.longitude = self.long
+        return self
+
+    def get_lat(self) -> float:
+        return self.lat if self.lat is not None else (self.latitude or 0.0)
+
+    def get_long(self) -> float:
+        return self.long if self.long is not None else (self.longitude or 0.0)
 
 
 class UpdateFaceRequest(BaseModel):
@@ -349,6 +375,7 @@ class EmployeeUpdate(BaseModel):
     department: Optional[str] = None
     status: Optional[str] = None
     employee_type: Optional[EmployeeType] = None
+    field_mode: Optional[str] = None
     manager_id: Optional[str] = None
     territory_type: Optional[TerritoryType] = None
     territory_center_lat: Optional[float] = None
@@ -482,13 +509,27 @@ class LocationPing(BaseModel):
     employee_id: Optional[str] = None
     organization_id: Optional[str] = None
     attendance_id: Optional[str] = None
-    lat: float
-    lng: float
-    accuracy: float
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    accuracy: float = 10.0
     recorded_at: datetime = Field(default_factory=datetime.utcnow)
-    source: PingSource = PingSource.AUTO
+    source: Any = "auto"
     offline_id: Optional[str] = None
     synced_at: Optional[datetime] = None
+
+    @model_validator(mode="after")
+    def sync_coords(self):
+        if self.lat is None and self.latitude is not None:
+            self.lat = self.latitude
+        elif self.latitude is None and self.lat is not None:
+            self.latitude = self.lat
+        if self.lng is None and self.longitude is not None:
+            self.lng = self.longitude
+        elif self.longitude is None and self.lng is not None:
+            self.longitude = self.lng
+        return self
 
 
 class KMReimbursement(BaseModel):

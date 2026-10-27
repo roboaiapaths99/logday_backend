@@ -204,7 +204,7 @@ async def get_my_payslips(employee=Depends(get_current_employee)):
     cursor = payrolls_collection.find({
         "employee_email": employee["email"],
         "organization_id": employee["organization_id"],
-        "status": {"$in": ["locked", "paid"]}
+        "status": {"$in": ["locked", "paid", "approved", "processed"]}
     }).sort("payroll_month", -1)
     
     payrolls = await cursor.to_list(length=100)

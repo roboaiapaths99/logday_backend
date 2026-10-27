@@ -117,6 +117,7 @@ from hrms_payroll import router as payroll_router
 from hrms_exit import router as exit_router, employee_exit_router
 from hrms_employee import router as employee_router
 from hrms_wfh import router as wfh_router
+from flyfield import router as flyfield_router
 
 app.include_router(onboarding_router)
 app.include_router(employee_onboarding_router)
@@ -125,6 +126,7 @@ app.include_router(exit_router)
 app.include_router(employee_exit_router)
 app.include_router(employee_router)
 app.include_router(wfh_router)
+app.include_router(flyfield_router)
 
 
 # Configure CORS - Allow all origins dynamically with regex for Web, Vercel, Electron & Mobile
@@ -1543,12 +1545,13 @@ async def verify_presence(req: VerifyPresenceRequest):
         "timestamp": datetime.now(timezone.utc),
         "type": attendance_type,
         "status": "SUCCESS",
-        "location": {"lat": req.lat, "long": req.long},
+        "location": {"lat": req.get_lat(), "long": req.get_long()},
         "location_name": req.address or "Verified Zone",
         "distance_meters": dist_meters,
         "wifi_info": {"bssid": req.wifi_bssid, "strength": req.wifi_strength},
         "face_confidence": float(distance),
-        "device_id": req.device_id
+        "device_id": req.device_id,
+        "organization_id": str(user.get("organization_id")) if user.get("organization_id") else None,
     }
     await attendance_logs_collection.insert_one(log)
     await employees_collection.update_one(
@@ -1594,7 +1597,7 @@ async def smart_attendance(req: VerifyPresenceRequest, request: Request, backgro
         
         if not user:
             # Try 1:N face search ONLY if email is blank/generic AND embedding is non-dummy
-            if not clean_email or clean_email in ["unknown", "auto", ""]:
+            if req.image and (not clean_email or clean_email in ["unknown", "auto", ""]):
                 new_embedding = get_face_embedding(req.image)
                 if new_embedding is not None and not is_dummy_embedding(new_embedding):
                     emp_query = {"face_embedding": {"$ne": None}}
@@ -1671,7 +1674,13 @@ async def smart_attendance(req: VerifyPresenceRequest, request: Request, backgro
         office_wifi_bssid = str(db_wifi_bssid).strip() if (db_wifi_bssid and str(db_wifi_bssid).strip() != "") else os.getenv("OFFICE_WIFI_BSSID", "")
 
         role = str(user.get("employee_type") or user.get("role") or "desk").lower()
-        attendance_type = req.intended_type or "check-in"
+        attendance_type = "check-in"
+        if req.punch_type in ["out", "check-out", "checkout"] or req.intended_type in ["check-out", "out", "checkout"]:
+            attendance_type = "check-out"
+        elif req.intended_type:
+            attendance_type = req.intended_type
+        elif req.punch_type:
+            attendance_type = req.punch_type
         logger.info(f"Processing {attendance_type.replace('-', ' ').title()} for {user['email']} (Role: {role}, Superadmin: {is_superadmin})")
 
         # Session Validation
@@ -1764,12 +1773,25 @@ async def smart_attendance(req: VerifyPresenceRequest, request: Request, backgro
             else:
                 logger.info(f"Superadmin bypass: Device mismatch ignored.")
 
-        if not user.get("face_embedding") and not is_superadmin:
-            raise HTTPException(status_code=400, detail="Face biometric not enrolled for this user.")
+        if not user.get("face_embedding") and not is_superadmin and req.image:
+            try:
+                new_emb = get_face_embedding(req.image)
+                if new_emb is not None and not is_dummy_embedding(new_emb):
+                    await employees_collection.update_one(
+                        {"_id": user["_id"]},
+                        {"$set": {"face_embedding": new_emb}}
+                    )
+                    user["face_embedding"] = new_emb
+                    logger.info(f"Auto-enrolled face biometric for {user.get('email')}")
+            except Exception as emb_err:
+                logger.warning(f"Face auto-enrollment attempt failed: {emb_err}")
+            
+            if not user.get("face_embedding") and not is_superadmin and req.client_type != "flyfield":
+                raise HTTPException(status_code=400, detail="Face biometric not enrolled for this user.")
         
-        # Face Verification (Bypass for Superadmin or if no embedding)
+        # Face Verification (Bypass for Superadmin, checkout, or if no image provided)
         distance = 0.0
-        if user.get("face_embedding"):
+        if req.image and user.get("face_embedding") and attendance_type != "check-out":
             is_match, distance = verify_face(req.image, user["face_embedding"])
             if not is_match and not is_superadmin:
                 background_tasks.add_task(
@@ -1781,8 +1803,10 @@ async def smart_attendance(req: VerifyPresenceRequest, request: Request, backgro
         check_in_method = CheckInMethod.GPS_TERRITORY
         is_at_office = False
         office_dist = 9999999
+        req_lat = req.get_lat()
+        req_long = req.get_long()
         if abs(office_lat) > 0.01 or abs(office_long) > 0.01:
-            office_dist = calculate_haversine(req.lat, req.long, float(office_lat), float(office_long))
+            office_dist = calculate_haversine(req_lat, req_long, float(office_lat), float(office_long))
             if office_dist <= float(radius):
                 is_at_office = True
 
@@ -1852,6 +1876,11 @@ async def smart_attendance(req: VerifyPresenceRequest, request: Request, backgro
                     territory_verified = False
                     verification_reason = ""
                     min_distance = 9999999
+
+                    # Check 0: FlyField Mode (Dynamic on-the-fly field staff bypass fixed plan/territory)
+                    if user.get("field_mode") == "flyfield" or req.client_type == "flyfield":
+                        territory_verified = True
+                        verification_reason = "FlyField dynamic agent — location recorded"
 
                     # Check 1: Polygon Territory (if configured)
                     t_poly = user.get("territory_polygon")
@@ -2037,10 +2066,16 @@ async def smart_attendance(req: VerifyPresenceRequest, request: Request, backgro
         elif role == EmployeeType.DESK or role == "desk":
             att_type_val = AttendanceType.OFFICE
 
-        # Location name default
-        loc_name_val = req.address or ("Office Zone" if role == EmployeeType.DESK and not wfh_approved else "Field Location")
-        if wfh_approved or role == EmployeeType.WFH or role == "wfh":
-            loc_name_val = req.address or "Remote Workspace"
+        # Location name & real physical address resolution
+        loc_name_val = req.address
+        if not loc_name_val or not any(c.isalpha() for c in str(loc_name_val)):
+            if role == EmployeeType.DESK and not wfh_approved:
+                loc_name_val = "Office Zone"
+            elif wfh_approved or role in [EmployeeType.WFH, "wfh"]:
+                loc_name_val = "Remote Workspace"
+            else:
+                from flyfield import resolve_real_address
+                loc_name_val = await resolve_real_address(req.lat, req.long, req.address)
 
         wfh_session_id = None
         if wfh_approved or role == EmployeeType.WFH or role == "wfh":
@@ -2133,6 +2168,8 @@ async def smart_attendance(req: VerifyPresenceRequest, request: Request, backgro
             "confidence_score": float(distance),
             "status": "SUCCESS",
             "location_name": loc_name_val,
+            "address": loc_name_val,
+            "field_mode": user.get("field_mode"),
             "selfie_verified": True,
             "device_id": req.device_id,
             "mock_location_detected": req.mock_detected
@@ -3339,6 +3376,7 @@ async def admin_create_employee(req: RegisterRequest, current_admin: Admin = Dep
         "created_at": datetime.now(timezone.utc),
         "needs_face_enrollment": True if not embedding else False,
         "employee_type": req.employee_type,
+        "field_mode": getattr(req, "field_mode", "planned") or "planned",
         "organization_id": req.organization_id if (req.organization_id and _is_superadmin(current_admin)) else current_admin.organization_id,  # Superadmin can target any org
         "force_password_change": True,  # Employee must set their own password on first desk login
         "status": "Active"
