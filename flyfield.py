@@ -533,13 +533,13 @@ async def end_flyfield_visit(
     updated_doc["_id"] = str(updated_doc["_id"])
 
     # Record real-time breadcrumb for live map
-    if end_lat and end_long:
+    if cur_lat and cur_long:
         try:
             await location_pings_collection.insert_one({
                 "employee_id": email,
                 "organization_id": user.get("organization_id"),
-                "lat": end_lat,
-                "lng": end_long,
+                "lat": cur_lat,
+                "lng": cur_long,
                 "accuracy": req.accuracy or 10.0,
                 "recorded_at": now_utc,
                 "source": "flyfield_visit_checkout"
