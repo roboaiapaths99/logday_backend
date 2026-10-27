@@ -180,12 +180,13 @@ async def get_flyfield_today(user: dict = Depends(get_current_employee)):
         "timestamp": {"$gte": today_start_utc, "$lt": today_end_utc}
     }).sort("timestamp", 1).to_list(length=20)
 
-    check_in_log = next((l for l in today_logs if l.get("type") in ["check-in", "IN"]), None)
-    check_out_log = next((l for l in reversed(today_logs) if l.get("type") in ["check-out", "OUT"]), None)
+    last_punch = today_logs[-1] if today_logs else None
+    day_started = bool(last_punch)
+    day_active = bool(last_punch and last_punch.get("type") in ["check-in", "IN"])
+    day_ended = bool(last_punch and last_punch.get("type") in ["check-out", "OUT"])
 
-    day_active = False
-    if check_in_log and not check_out_log:
-        day_active = True
+    first_in_log = next((l for l in today_logs if l.get("type") in ["check-in", "IN"]), None)
+    latest_out_log = next((l for l in reversed(today_logs) if l.get("type") in ["check-out", "OUT"]), None)
 
     # 2. Fetch today's FlyField visits
     visits = await visit_logs_collection.find({
@@ -219,12 +220,12 @@ async def get_flyfield_today(user: dict = Depends(get_current_employee)):
 
     # 4. Compute worked hours
     worked_hours = 0.0
-    if check_in_log:
+    if first_in_log:
         now_utc = datetime.now(timezone.utc)
-        in_time = check_in_log["timestamp"]
+        in_time = first_in_log["timestamp"]
         if in_time.tzinfo is None:
             in_time = in_time.replace(tzinfo=timezone.utc)
-        out_time = check_out_log["timestamp"] if check_out_log else now_utc
+        out_time = latest_out_log["timestamp"] if latest_out_log else now_utc
         if out_time.tzinfo is None:
             out_time = out_time.replace(tzinfo=timezone.utc)
         worked_hours = round(max(0.0, (out_time - in_time).total_seconds() / 3600.0), 2)
@@ -233,18 +234,18 @@ async def get_flyfield_today(user: dict = Depends(get_current_employee)):
         "status": "success",
         "date": today_str,
         "day_active": day_active,
-        "day_started": bool(check_in_log),
-        "day_ended": bool(check_out_log),
+        "day_started": day_started,
+        "day_ended": day_ended,
         "check_in": {
-            "time": check_in_log["timestamp"].isoformat() if check_in_log else None,
-            "address": check_in_log.get("address") or check_in_log.get("location_name") if check_in_log else None,
-            "face_verified": check_in_log.get("selfie_verified", True) if check_in_log else False
-        } if check_in_log else None,
+            "time": first_in_log["timestamp"].isoformat() if first_in_log else None,
+            "address": first_in_log.get("address") or first_in_log.get("location_name") if first_in_log else None,
+            "face_verified": first_in_log.get("selfie_verified", True) if first_in_log else False
+        } if first_in_log else None,
         "check_out": {
-            "time": check_out_log["timestamp"].isoformat() if check_out_log else None,
-            "address": check_out_log.get("address") or check_out_log.get("location_name") if check_out_log else None,
-            "face_verified": check_out_log.get("selfie_verified", True) if check_out_log else False
-        } if check_out_log else None,
+            "time": latest_out_log["timestamp"].isoformat() if latest_out_log else None,
+            "address": latest_out_log.get("address") or latest_out_log.get("location_name") if latest_out_log else None,
+            "face_verified": latest_out_log.get("selfie_verified", True) if latest_out_log else False
+        } if latest_out_log else None,
         "active_visit": active_visit,
         "visits_completed_count": len(completed_visits),
         "total_km": total_km,
@@ -269,28 +270,18 @@ async def start_flyfield_visit(req: VisitStartRequest, user: dict = Depends(get_
     org_id = user.get("organization_id")
     today_start_utc, today_end_utc, today_str = get_today_bounds()
 
-    # 1. Verify Start Day has happened
-    today_checkin = await attendance_logs_collection.find_one({
-        "email": email,
-        "timestamp": {"$gte": today_start_utc, "$lt": today_end_utc},
-        "type": {"$in": ["check-in", "IN"]}
-    })
-    if not today_checkin:
+    # 1. Verify shift is currently active (latest punch is check-in, not check-out)
+    latest_punch = await attendance_logs_collection.find_one(
+        {
+            "email": email,
+            "timestamp": {"$gte": today_start_utc, "$lt": today_end_utc}
+        },
+        sort=[("timestamp", -1)]
+    )
+    if not latest_punch or latest_punch.get("type") not in ["check-in", "IN"]:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Please complete Morning Check-In (Start Day) before starting client visits."
-        )
-
-    # Also check if day has already ended
-    today_checkout = await attendance_logs_collection.find_one({
-        "email": email,
-        "timestamp": {"$gte": today_start_utc, "$lt": today_end_utc},
-        "type": {"$in": ["check-out", "OUT"]}
-    })
-    if today_checkout:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Your working day has already ended. Please start a new day to create visits."
+            detail="Your shift is not currently active. Please complete Check-In (Start Day) before starting client visits."
         )
 
     # 2. Strict Sequential Visit Rule: Check if an active visit already exists
