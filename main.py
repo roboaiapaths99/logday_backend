@@ -961,8 +961,8 @@ async def login(req: LoginRequest, request: Request):
     subordinates_count = await employees_collection.count_documents({"manager_id": clean_email})
     is_manager = subordinates_count > 0
     
-    # Check if user needs face enrollment (no face_embedding)
-    needs_enrollment = user.get("face_embedding") is None
+    # Check if user needs face enrollment (no face_embedding or dummy/mock embedding)
+    needs_enrollment = (user.get("face_embedding") is None) or is_dummy_embedding(user.get("face_embedding"))
     
     # Return full profile with defaults for legacy accounts
     response_data = {
@@ -1090,7 +1090,7 @@ async def change_password(req: ChangePasswordRequest, employee=Depends(get_curre
     )
     
     # Check if face enrollment is still needed
-    needs_enrollment = user.get("face_embedding") is None
+    needs_enrollment = (user.get("face_embedding") is None) or is_dummy_embedding(user.get("face_embedding"))
     
     return {
         "status": "success", 
@@ -1773,20 +1773,25 @@ async def smart_attendance(req: VerifyPresenceRequest, request: Request, backgro
             else:
                 logger.info(f"Superadmin bypass: Device mismatch ignored.")
 
-        if not user.get("face_embedding") and not is_superadmin and req.image:
+        has_valid_face = bool(user.get("face_embedding")) and not is_dummy_embedding(user.get("face_embedding"))
+        if not has_valid_face and not is_superadmin and req.image:
             try:
                 new_emb = get_face_embedding(req.image)
                 if new_emb is not None and not is_dummy_embedding(new_emb):
                     await employees_collection.update_one(
                         {"_id": user["_id"]},
-                        {"$set": {"face_embedding": new_emb}}
+                        {"$set": {
+                            "face_embedding": new_emb,
+                            "needs_face_enrollment": False
+                        }}
                     )
                     user["face_embedding"] = new_emb
+                    has_valid_face = True
                     logger.info(f"Auto-enrolled face biometric for {user.get('email')}")
             except Exception as emb_err:
                 logger.warning(f"Face auto-enrollment attempt failed: {emb_err}")
             
-            if not user.get("face_embedding") and not is_superadmin and req.client_type != "flyfield":
+            if not has_valid_face and not is_superadmin and req.client_type != "flyfield":
                 raise HTTPException(status_code=400, detail="Face biometric not enrolled for this user.")
         
         # Face Verification (Bypass for Superadmin, checkout, or if no image provided)
@@ -2414,8 +2419,8 @@ async def get_employee_profile(current_user: dict = Depends(get_current_employee
         "designation": user.get("designation"),
         "employee_type": user.get("employee_type"),
         "profile_image": user.get("profile_image"),
-        "has_face_data": bool(user.get("face_embedding")),
-        "needs_face_enrollment": user.get("face_embedding") is None,
+        "has_face_data": bool(user.get("face_embedding")) and not is_dummy_embedding(user.get("face_embedding")),
+        "needs_face_enrollment": (user.get("face_embedding") is None) or is_dummy_embedding(user.get("face_embedding")),
         "organization_id": str(user.get("organization_id", "")),
         "is_manager": user.get("is_manager", False),
         "status": user.get("status", "Active"),
@@ -8595,8 +8600,25 @@ async def wfh_checkin(req: dict, employee=Depends(get_current_employee)):
         raise HTTPException(status_code=400, detail="face_image is required")
 
     stored_embedding = employee.get("face_embedding")
-    if not stored_embedding:
-        raise HTTPException(status_code=400, detail="Face enrollment missing")
+    if not stored_embedding or is_dummy_embedding(stored_embedding):
+        # Auto-enroll real DeepFace biometric if clear face image is provided
+        new_emb = get_face_embedding(face_image)
+        if new_emb is not None and not is_dummy_embedding(new_emb):
+            await employees_collection.update_one(
+                {"_id": employee["_id"]},
+                {"$set": {
+                    "face_embedding": new_emb,
+                    "needs_face_enrollment": False,
+                    "profile_image": face_image
+                }}
+            )
+            stored_embedding = new_emb
+            logger.info(f"Auto-enrolled real DeepFace biometric during WFH checkin for {email}")
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="Face biometric enrollment missing or needs refresh. Please ensure your face is well-lit and clearly visible to complete registration."
+            )
 
     face_ok, face_distance = verify_face(face_image, stored_embedding)
 
