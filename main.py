@@ -3663,35 +3663,90 @@ async def get_public_settings(request: Request):
 
 
 @app.get("/organizations/search")
-async def search_organizations(q: str):
-    """Public search for organizations by name or slug."""
-    logger.info(f"[SEARCH] Query received: '{q}'")
-    if not q or len(q) < 2:
+async def search_organizations(q: str = None):
+    """Public search for organizations by name or slug with improved error handling."""
+    try:
+        search_query = q.strip() if q else ""
+        logger.info(f"[SEARCH] Query received: '{search_query}'")
+        
+        if not search_query or len(search_query) < 2:
+            # Return top organizations if query is empty or 1 character
+            cursor = organizations_collection.find({}).limit(20)
+            orgs = await cursor.to_list(length=20)
+        else:
+            # Case-insensitive partial match on both name and slug
+            regex_pattern = {"$regex": re.escape(search_query), "$options": "i"}
+            mongo_query = {
+                "$or": [
+                    {"name": regex_pattern},
+                    {"slug": regex_pattern}
+                ]
+            }
+            cursor = organizations_collection.find(mongo_query).limit(15)
+            orgs = await cursor.to_list(length=15)
+        
+        # Log results
+        logger.info(f"[SEARCH] Found {len(orgs)} organizations for query: '{search_query}'")
+        
+        # Format results (strip oversized inline base64 logos to avoid Android 2KB SecureStore limit)
+        results = []
+        for org in orgs:
+            raw_logo = org.get("logo_url")
+            safe_logo = None if (raw_logo and len(str(raw_logo)) > 500) else raw_logo
+            result_item = {
+                "id": str(org["_id"]),
+                "name": org.get("name", "Unknown"),
+                "slug": org.get("slug", ""),
+                "logo_url": safe_logo,
+                "primary_color": org.get("primary_color", "#0f172a"),
+                "_id": str(org["_id"])  # Include both 'id' and '_id' for compatibility
+            }
+            results.append(result_item)
+        
+        # Return plain list for Play Store mobile app FlatList compatibility
+        return results
+        
+    except Exception as e:
+        logger.error(f"[SEARCH] Error searching organizations: {str(e)}", exc_info=True)
         return []
-        
-    # Case-insensitive partial match
-    regex_query = {"$regex": q, "$options": "i"}
-    query = {
-        "$or": [
-            {"name": regex_query},
-            {"slug": regex_query}
-        ]
-    }
+
+
+@app.get("/organizations/debug")
+async def debug_organizations():
+    """Debug endpoint: List all organizations in database (only in non-prod)"""
+    if APP_ENV == "production":
+        raise HTTPException(status_code=403, detail="Debug endpoint not available in production")
     
-    cursor = organizations_collection.find(query).limit(5)
-    orgs = await cursor.to_list(length=5)
-    
-    results = []
-    for org in orgs:
-        results.append({
-            "id": str(org["_id"]),
-            "name": org["name"],
-            "slug": org["slug"],
-            "logo_url": org.get("logo_url"),
-            "primary_color": org.get("primary_color")
-        })
+    try:
+        logger.info("[DEBUG] Fetching all organizations...")
         
-    return results
+        all_orgs = await organizations_collection.find().to_list(100)
+        
+        results = []
+        for org in all_orgs:
+            results.append({
+                "_id": str(org["_id"]),
+                "name": org.get("name", "Unknown"),
+                "slug": org.get("slug", ""),
+                "logo_url": org.get("logo_url"),
+                "primary_color": org.get("primary_color"),
+                "created_at": org.get("created_at")
+            })
+        
+        return {
+            "total": len(results),
+            "organizations": results,
+            "environment": APP_ENV,
+            "message": "All organizations in database"
+        }
+    except Exception as e:
+        logger.error(f"[DEBUG] Error: {str(e)}", exc_info=True)
+        return {
+            "total": 0,
+            "organizations": [],
+            "error": str(e),
+            "message": "Failed to fetch organizations"
+        }
 
 
 
@@ -4590,8 +4645,37 @@ async def update_territory(email: str, req: dict, admin=Depends(get_current_admi
 
 @app.get("/admin/field/visit-plans")
 async def get_plans_for_approval(status: str = "submitted", admin=Depends(get_current_admin)):
-    """List visit plans pending approval."""
-    plans = await visit_plans_collection.find({"status": status}).to_list(length=100)
+    """List visit plans with filtering, execution progress, and proof media."""
+    from collections import defaultdict
+    query = {}
+    if admin.organization_id:
+        query["organization_id"] = admin.organization_id
+    if status and status != "all":
+        query["status"] = status
+
+    plans = await visit_plans_collection.find(query).sort([("date", -1), ("_id", -1)]).to_list(length=150)
+    
+    # Enrichment: Add employee names and details
+    emp_ids = list({p["employee_id"] for p in plans if p.get("employee_id")})
+    employees = await employees_collection.find(
+        {"$or": [{"employee_id": {"$in": emp_ids}}, {"email": {"$in": emp_ids}}]},
+        {"employee_id": 1, "email": 1, "full_name": 1, "phone": 1}
+    ).to_list(length=len(emp_ids) * 2 + 10)
+    
+    emp_map = {}
+    for e in employees:
+        if e.get("employee_id"):
+            emp_map[e["employee_id"]] = e
+        if e.get("email"):
+            emp_map[e["email"]] = e
+
+    # Fetch visit logs for the dates of these plans to link live execution & proof photos
+    plan_dates = list({p["date"] for p in plans if p.get("date")})
+    visit_logs_query = {"date": {"$in": plan_dates}}
+    if admin.organization_id:
+        visit_logs_query["organization_id"] = admin.organization_id
+        
+    visit_logs = await visit_logs_collection.find(visit_logs_query).to_list(length=1000)
     
     # Group logs by (employee_identifier, date)
     logs_by_key = defaultdict(list)
@@ -4608,9 +4692,84 @@ async def get_plans_for_approval(status: str = "submitted", admin=Depends(get_cu
 
     enriched_plans = []
     for plan in plans:
-        emp = await employees_collection.find_one({"employee_id": plan["employee_id"]})
         plan["_id"] = str(plan["_id"])
-        plan["full_name"] = emp["full_name"] if emp else "Unknown"
+        emp_obj = emp_map.get(plan.get("employee_id"), {})
+        plan["full_name"] = emp_obj.get("full_name", plan.get("employee_id", "Unknown"))
+        plan["employee_email"] = emp_obj.get("email", plan.get("employee_id"))
+        plan["employee_phone"] = emp_obj.get("phone", "")
+
+        # Find matching logs for this plan
+        p_date = plan.get("date")
+        emp_id = plan.get("employee_id")
+        emp_email = emp_obj.get("email")
+        matched_logs = logs_by_key.get((emp_id, p_date), [])
+        if not matched_logs and emp_email:
+            matched_logs = logs_by_key.get((emp_email, p_date), [])
+
+        stops = plan.get("stops", [])
+        completed_stops = 0
+        ongoing_stops = 0
+
+        for stop in stops:
+            seq = stop.get("sequence_order")
+            pname = (stop.get("place_name") or "").strip().lower()
+
+            # Find matching log
+            stop_log = None
+            for lg in matched_logs:
+                lg_stop_id = lg.get("visit_plan_stop_id")
+                if lg_stop_id is not None and str(lg_stop_id) == str(seq):
+                    stop_log = lg
+                    break
+            if not stop_log:
+                for lg in matched_logs:
+                    if (lg.get("place_name") or "").strip().lower() == pname:
+                        stop_log = lg
+                        break
+
+            if stop_log:
+                s_status = stop_log.get("status", "pending")
+                if s_status == "completed":
+                    completed_stops += 1
+                elif s_status == "ongoing":
+                    ongoing_stops += 1
+
+                stop["execution"] = {
+                    "visit_id": stop_log.get("_id"),
+                    "status": s_status,
+                    "check_in_time": stop_log.get("check_in_time"),
+                    "check_out_time": stop_log.get("check_out_time"),
+                    "check_in_lat": stop_log.get("check_in_lat"),
+                    "check_in_lng": stop_log.get("check_in_lng"),
+                    "check_out_lat": stop_log.get("check_out_lat"),
+                    "check_out_lng": stop_log.get("check_out_lng"),
+                    "geofence_validated": stop_log.get("geofence_validated", True),
+                    "distance_meters": stop_log.get("geofence_distance_meters"),
+                    "site_photo_url": stop_log.get("site_photo_url"),
+                    "selfie_url": stop_log.get("selfie_url"),
+                    "voice_note_url": stop_log.get("voice_note_url"),
+                    "person_met_name": stop_log.get("person_met_name"),
+                    "person_met_role": stop_log.get("person_met_role"),
+                    "remarks": stop_log.get("remarks"),
+                    "outcome": stop_log.get("outcome"),
+                    "order_captured": stop_log.get("order_captured", False),
+                    "lead_captured": stop_log.get("lead_captured", False),
+                    "lead_details": stop_log.get("lead_details")
+                }
+            else:
+                stop["execution"] = {
+                    "status": "pending",
+                    "geofence_validated": None,
+                    "site_photo_url": None,
+                    "selfie_url": None
+                }
+
+        plan["execution_summary"] = {
+            "total_stops": len(stops),
+            "completed_stops": completed_stops,
+            "ongoing_stops": ongoing_stops,
+            "all_completed": len(stops) > 0 and completed_stops == len(stops)
+        }
         enriched_plans.append(plan)
         
     return enriched_plans
