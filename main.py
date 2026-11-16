@@ -115,9 +115,7 @@ async def add_cache_control_header(request: Request, call_next):
     response.headers["Expires"] = "0"
     return response
 
-@app.get("/health")
-async def health_check():
-    return {"status": "healthy", "timestamp": datetime.now(timezone.utc).isoformat()}
+# (Health check consolidated at line 340)
 
 # --- GEOCODING PROXY ---
 @app.get("/api/geocoding/reverse")
@@ -2364,14 +2362,16 @@ async def get_public_settings(request: Request):
 
 
 @app.get("/organizations/search")
-async def search_organizations(q: str):
+async def search_organizations(q: str = ""):
     """Public search for organizations by name or slug."""
-    logger.info(f"[SEARCH] Query received: '{q}'")
-    if not q or len(q) < 2:
+    import re
+    clean_q = q.strip() if q else ""
+    logger.info(f"[SEARCH] Query received: '{clean_q}'")
+    if not clean_q or len(clean_q) < 2:
         return []
         
-    # Case-insensitive partial match
-    regex_query = {"$regex": q, "$options": "i"}
+    # Case-insensitive partial match (escaped for regex safety)
+    regex_query = {"$regex": re.escape(clean_q), "$options": "i"}
     query = {
         "$or": [
             {"name": regex_query},
@@ -2379,17 +2379,20 @@ async def search_organizations(q: str):
         ]
     }
     
-    cursor = organizations_collection.find(query).limit(5)
-    orgs = await cursor.to_list(length=5)
+    cursor = organizations_collection.find(query).limit(15)
+    orgs = await cursor.to_list(length=15)
     
     results = []
     for org in orgs:
+        raw_logo = org.get("logo_url")
+        safe_logo = None if (raw_logo and len(str(raw_logo)) > 500) else raw_logo
         results.append({
             "id": str(org["_id"]),
-            "name": org["name"],
-            "slug": org["slug"],
-            "logo_url": org.get("logo_url"),
-            "primary_color": org.get("primary_color")
+            "_id": str(org["_id"]),
+            "name": org.get("name", "Unknown"),
+            "slug": org.get("slug", ""),
+            "logo_url": safe_logo,
+            "primary_color": org.get("primary_color", "#0f172a")
         })
         
     return results
@@ -3155,14 +3158,22 @@ async def update_territory(email: str, req: dict, admin=Depends(get_current_admi
 @app.get("/admin/field/visit-plans")
 async def get_plans_for_approval(status: str = "submitted", admin=Depends(get_current_admin)):
     """List visit plans pending approval."""
-    plans = await visit_plans_collection.find({"status": status}).to_list(length=100)
+    query = {"status": status}
+    if admin.organization_id and admin.role != "superadmin":
+        query["organization_id"] = admin.organization_id
+    plans = await visit_plans_collection.find(query).to_list(length=100)
     
     # Enrichment: Add employee names
     enriched_plans = []
     for plan in plans:
-        emp = await employees_collection.find_one({"employee_id": plan["employee_id"]})
+        emp = await employees_collection.find_one({
+            "$or": [
+                {"email": plan.get("employee_id")},
+                {"employee_id": plan.get("employee_id")}
+            ]
+        })
         plan["_id"] = str(plan["_id"])
-        plan["full_name"] = emp["full_name"] if emp else "Unknown"
+        plan["full_name"] = emp["full_name"] if emp else plan.get("employee_id", "Unknown")
         enriched_plans.append(plan)
         
     return enriched_plans
@@ -3807,62 +3818,7 @@ async def get_field_live_status(admin=Depends(get_current_admin)):
 
 
 
-# -----------------------------------------------------------------------------
-# FIELD LEADERBOARD
-# -----------------------------------------------------------------------------
-
-@app.get("/api/field/leaderboard")
-async def get_field_leaderboard(employee=Depends(get_current_employee)):
-    """Get the live leaderboard for field agents for the current week."""
-    try:
-        now = datetime.now(timezone.utc)
-        start_of_week = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
-        end_of_week = start_of_week + timedelta(days=6, hours=23, minutes=59, seconds=59)
-
-        employees_cursor = employees_collection.find({
-            "organization_id": employee["organization_id"],
-            "employee_type": EmployeeType.FIELD
-        })
-        
-        leaderboard = []
-        async for emp in employees_cursor:
-            visits_count = await visit_logs_collection.count_documents({
-                "employee_id": emp["email"],
-                "timestamp": {"$gte": start_of_week, "$lte": end_of_week},
-                "action": "check_in"
-            })
-            
-            claims_cursor = km_reimbursements_collection.find({
-                "employee_id": emp["email"],
-                "date": {"$gte": start_of_week.strftime("%Y-%m-%d"), "$lte": end_of_week.strftime("%Y-%m-%d")}
-            })
-            total_km = 0
-            async for claim in claims_cursor:
-                total_km += float(claim.get("total_km", 0))
-                
-            leaderboard.append({
-                "employee_id": emp["email"],
-                "name": emp.get("full_name", "Unknown"),
-                "designation": emp.get("designation", "Field Agent"),
-                "visits_completed": visits_count,
-                "leads_captured": 0,
-                "distance_km": round(total_km, 1),
-                "is_me": emp["email"] == employee["email"]
-            })
-            
-        leaderboard.sort(key=lambda x: x["visits_completed"], reverse=True)
-        
-        for i, entry in enumerate(leaderboard):
-            entry["rank"] = i + 1
-            
-        return {
-            "week_start": start_of_week.strftime("%b %d"),
-            "week_end": end_of_week.strftime("%b %d"),
-            "leaderboard": leaderboard
-        }
-    except Exception as e:
-        logger.error(f"Failed to fetch leaderboard: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Failed to load leaderboard data")
+# (Legacy duplicate /api/field/leaderboard removed; see full implementation at AREA 3: LEADERBOARD below)
 
 # -----------------------------------------------------------------------------
 # EXPENSE CLAIM MANAGEMENT
