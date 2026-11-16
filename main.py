@@ -287,14 +287,6 @@ async def startup_event():
         except Exception as e:
             logger.warning(f"Index '{name}' skipped (non-fatal): {type(e).__name__}: {str(e)[:60]}")
 
-    # Scheduler startup
-    try:
-        if not scheduler.running:
-            scheduler.start()
-        logger.info("Scheduler started successfully.")
-    except Exception as e:
-        logger.warning(f"Scheduler startup failed (non-fatal): {e}")
-
     logger.info(f"Application startup complete. ENV={APP_ENV}")
 
 # --- HEALTH CHECK ENDPOINT ---
@@ -481,47 +473,66 @@ async def delete_file_from_storage(image_url: str):
                 logger.error(f"Failed to delete {s3_key} from S3/R2 bucket {S3_BUCKET_NAME}: {e}")
 
 
-async def check_missed_visits():
+async def check_missed_visits(force: bool = False):
     """
     Scheduled job to check for missed visits.
-    A visit is considered missed if it was approved for today but not checked in.
+    A visit is considered missed if it was approved for today but not checked in by 12:00 PM UTC (~5:30 PM IST).
     """
-    logger.info("Running scheduled job: check_missed_visits")
-    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    
-    # Find all approved plans for today
-    approved_plans_cursor = visit_plans_collection.find({
-        "date": today_str,
-        "status": PlanStatus.APPROVED
-    })
-    
-    async for plan in approved_plans_cursor:
-        employee_id = plan["employee_id"]
-        organization_id = plan["organization_id"]
-        
-        for stop in plan.get("stops", []):
-            stop_id = stop.get("sequence_order") # Assuming sequence_order is the unique stop identifier
-            
-            # Check if a visit log exists for this employee, date, and stop_id
-            existing_log = await visit_logs_collection.find_one({
-                "employee_id": employee_id,
-                "date": today_str,
-                "visit_plan_stop_id": stop_id
-            })
-            
-            if not existing_log:
-                # This stop was planned but not checked in
-                detail = f"Missed visit: Employee {employee_id} did not check in to planned stop '{stop.get('place_name')}' (Stop ID: {stop_id})."
-                await trigger_alert(
-                    "Productivity",
-                    employee_id,
-                    organization_id,
-                    detail,
-                    "medium",
-                    {"plan_id": str(plan["_id"]), "stop_id": stop_id, "place_name": stop.get("place_name")}
-                )
-                logger.warning(detail)
-    logger.info("Finished scheduled job: check_missed_visits")
+    try:
+        now = datetime.now(timezone.utc)
+        if not force and now.hour < 12:
+            return
+
+        logger.info("Running scheduled job: check_missed_visits")
+        today_str = now.strftime("%Y-%m-%d")
+        day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+        approved_plans_cursor = visit_plans_collection.find({
+            "date": today_str,
+            "status": {"$in": [PlanStatus.APPROVED, "approved"]}
+        })
+
+        async for plan in approved_plans_cursor:
+            employee_id = plan["employee_id"]
+            organization_id = plan["organization_id"]
+            missed_stops = []
+
+            for idx, stop in enumerate(plan.get("stops", [])):
+                if stop.get("status") in ["completed", "visited", "checked_in"]:
+                    continue
+                stop_id = stop.get("sequence_order", idx + 1)
+                existing_log = await visit_logs_collection.find_one({
+                    "employee_id": employee_id,
+                    "date": today_str,
+                    "$or": [
+                        {"visit_plan_stop_id": stop_id},
+                        {"visit_id": str(plan["_id"]), "sequence_order": stop_id}
+                    ]
+                })
+                if not existing_log:
+                    missed_stops.append(stop)
+
+            if missed_stops:
+                existing_alert = await alerts_collection.find_one({
+                    "employee_id": employee_id,
+                    "type": "Productivity",
+                    "detail": {"$regex": "SLA Breach|Missed visit"},
+                    "timestamp": {"$gte": day_start}
+                })
+                if not existing_alert:
+                    detail = f"SLA Breach: {len(missed_stops)} planned visit(s) missed for today."
+                    await trigger_alert(
+                        "Productivity",
+                        employee_id,
+                        organization_id,
+                        detail,
+                        "medium",
+                        {"plan_id": str(plan["_id"]), "missed_count": len(missed_stops)}
+                    )
+                    logger.warning(detail)
+        logger.info("Finished scheduled job: check_missed_visits")
+    except Exception as e:
+        logger.error(f"SLA Check failed: {e}")
 
 
 async def purge_old_screenshots():
@@ -737,7 +748,7 @@ async def discover_organization(slug: str):
 
 
 @app.get("/settings/{slug}")
-async def get_public_settings(slug: str):
+async def get_public_settings_by_slug(slug: str):
     """Public endpoint for apps to fetch organization settings by slug."""
     # Handle "null" or "undefined" string from frontend JS
     if not slug or slug in ["null", "undefined", "generic"]:
@@ -4891,8 +4902,12 @@ async def get_admin_stats(admin: dict = Depends(get_current_admin)):
         "end_date": {"$gte": today_str}
     }
     if "manager_id" in filter_query:
-        # Only count leaves for my team
-        leave_query["employee_email"] = {"$in": [e.get("email") for e in org_employees]}
+        # Only count leaves for my team (support both employee_id and employee_email fields)
+        team_emails = [e.get("email") for e in org_employees if e.get("email")]
+        leave_query["$or"] = [
+            {"employee_id": {"$in": team_emails}},
+            {"employee_email": {"$in": team_emails}}
+        ]
 
     on_leave_count = await leave_requests_collection.count_documents(leave_query)
 
@@ -6459,20 +6474,6 @@ async def admin_get_employee_leave_balance(
     return balance
 
 
-@app.get("/api/leave/balance")
-async def employee_get_leave_balance(
-    year: Optional[int] = None,
-    month: Optional[str] = None,
-    employee: dict = Depends(get_current_employee)
-):
-    """Fetch live calculated leave balance for the logged-in employee."""
-    org_id = employee.get("organization_id", "system_org")
-    clean_email = employee["email"]
-    balance = await calculate_leave_balance(clean_email, org_id, year, month)
-    return balance
-
-
-
 @app.get("/admin/field/live-status")
 async def get_field_live_status(admin=Depends(get_current_admin)):
     """Live operational data for the War Room map."""
@@ -6796,49 +6797,10 @@ async def get_heatmap_data(admin=Depends(get_current_admin)):
     return heatmap_data
 
 
-async def check_missed_visits():
-    """Background check to flag missed visits for productivity alerts."""
-    try:
-        now = datetime.now(timezone.utc)
-        # Using a simple check: if it's after 12:00 PM UTC (around 5:30 PM IST), run the check.
-        if now.hour < 12:
-            return
-            
-        today_str = now.strftime("%Y-%m-%d")
-        # Find approved plans for today
-        plans = await visit_plans_collection.find({"date": today_str, "status": "approved"}).to_list(length=1000)
-        
-        for plan in plans:
-            pending_stops = [s for s in plan.get("stops", []) if s.get("status", "pending") == "pending"]
-            if pending_stops:
-                # Trigger alert for each agent with pending visits
-                detail = f"SLA Breach: {len(pending_stops)} visits missed for today."
-                
-                # Deduplication: check if we already alerted today
-                day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-                existing = await alerts_collection.find_one({
-                    "employee_id": plan["employee_id"],
-                    "type": "Productivity",
-                    "detail": {"$regex": "SLA Breach"},
-                    "timestamp": {"$gte": day_start}
-                })
-                
-                if not existing:
-                    await trigger_alert(
-                        "Productivity",
-                        plan["employee_id"],
-                        plan["organization_id"],
-                        detail,
-                        "medium"
-                    )
-    except Exception as e:
-        logger.error(f"SLA Check failed: {e}")
-
-
 @app.post("/admin/field/trigger-sla-check")
 async def trigger_sla_check_manual(admin=Depends(get_current_admin)):
     """Manually trigger the SLA check for debugging."""
-    await check_missed_visits()
+    await check_missed_visits(force=True)
     return {"status": "success", "message": "Manual SLA check triggered"}
 
 
@@ -6905,9 +6867,13 @@ async def attendance_report(
 @app.get("/admin/reports/expenses")
 async def expense_report(admin=Depends(get_current_admin)):
     """Generate expense summary report."""
-    query = {}
     scoped_emails = await get_scoped_employee_emails(admin)
-    query["employee_email"] = {"$in": scoped_emails}
+    query = {
+        "$or": [
+            {"employee_id": {"$in": scoped_emails}},
+            {"employee_email": {"$in": scoped_emails}}
+        ]
+    }
     
     claims = await expense_claims_collection.find(query).to_list(length=1000)
     
@@ -6951,15 +6917,21 @@ async def agent_performance_report(
             start_dt = datetime.strptime(start_date, "%Y-%m-%d")
             end_dt = datetime.strptime(end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
     scoped_emp_ids = await get_scoped_employee_employee_ids(admin)
+    scoped_emails = await get_scoped_employee_emails(admin)
+    scoped_obj_ids = await get_scoped_employee_ids(admin)
+    all_identifiers = list(set(scoped_emp_ids + scoped_emails + scoped_obj_ids))
 
     pipeline = [
         {"$match": {
             "organization_id": org_id,
-            "employee_id": {"$in": scoped_emp_ids},
+            "$or": [
+                {"employee_id": {"$in": all_identifiers}},
+                {"employee_email": {"$in": scoped_emails}}
+            ],
             "check_in_time": {"$gte": start_dt, "$lte": end_dt}
         }},
         {"$group": {
-            "_id": "$employee_id",
+            "_id": {"$ifNull": ["$employee_email", "$employee_id"]},
             "total_visits": {"$sum": 1},
             "leads": {"$sum": {"$cond": ["$lead_captured", 1, 0]}},
             "orders": {"$sum": {"$cond": ["$order_captured", 1, 0]}}
@@ -6982,9 +6954,13 @@ async def agent_performance_report(
     perf_map = {}
     for stat in visit_stats:
         eid = stat["_id"]
-        emp = await employees_collection.find_one({"employee_id": eid}, {"full_name": 1})
-        perf_map[eid] = {
-            "employee_id": eid,
+        emp = await employees_collection.find_one(
+            {"$or": [{"employee_id": eid}, {"email": eid}]},
+            {"full_name": 1, "email": 1, "employee_id": 1}
+        )
+        canonical_key = emp["email"] if emp and emp.get("email") else eid
+        perf_map[canonical_key] = {
+            "employee_id": emp.get("employee_id", eid) if emp else eid,
             "full_name": emp["full_name"] if emp else "Unknown",
             "total_visits": stat["total_visits"],
             "leads": stat["leads"],
@@ -6994,12 +6970,16 @@ async def agent_performance_report(
     
     for kstat in km_stats:
         eid = kstat["_id"]
-        if eid in perf_map:
-            perf_map[eid]["total_km"] = round(kstat["total_km"], 2)
+        emp = await employees_collection.find_one(
+            {"$or": [{"employee_id": eid}, {"email": eid}]},
+            {"full_name": 1, "email": 1, "employee_id": 1}
+        )
+        canonical_key = emp["email"] if emp and emp.get("email") else eid
+        if canonical_key in perf_map:
+            perf_map[canonical_key]["total_km"] = round(kstat["total_km"], 2)
         else:
-            emp = await employees_collection.find_one({"employee_id": eid}, {"full_name": 1})
-            perf_map[eid] = {
-                "employee_id": eid,
+            perf_map[canonical_key] = {
+                "employee_id": emp.get("employee_id", eid) if emp else eid,
                 "full_name": emp["full_name"] if emp else "Unknown",
                 "total_visits": 0,
                 "leads": 0,
@@ -7017,9 +6997,13 @@ async def leave_report(
     admin=Depends(get_current_admin)
 ):
     """Generate leave analytics report."""
-    query = {}
     scoped_emails = await get_scoped_employee_emails(admin)
-    query["employee_email"] = {"$in": scoped_emails}
+    query = {
+        "$or": [
+            {"employee_id": {"$in": scoped_emails}},
+            {"employee_email": {"$in": scoped_emails}}
+        ]
+    }
     
     if start_date and end_date:
         query["start_date"] = {"$gte": start_date, "$lte": end_date}
@@ -7076,11 +7060,17 @@ async def conversion_funnel_report(
         start_dt = datetime.fromisoformat(start_date.replace("Z", "+00:00"))
         end_dt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
     scoped_emp_ids = await get_scoped_employee_employee_ids(admin)
+    scoped_emails = await get_scoped_employee_emails(admin)
+    scoped_obj_ids = await get_scoped_employee_ids(admin)
+    all_identifiers = list(set(scoped_emp_ids + scoped_emails + scoped_obj_ids))
 
     pipeline = [
         {"$match": {
             "organization_id": org_id,
-            "employee_id": {"$in": scoped_emp_ids},
+            "$or": [
+                {"employee_id": {"$in": all_identifiers}},
+                {"employee_email": {"$in": scoped_emails}}
+            ],
             "check_in_time": {"$gte": start_dt, "$lte": end_dt}
         }},
         {"$group": {
@@ -7119,11 +7109,17 @@ async def visit_frequency_report(
         end_dt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
 
     scoped_emp_ids = await get_scoped_employee_employee_ids(admin)
+    scoped_emails = await get_scoped_employee_emails(admin)
+    scoped_obj_ids = await get_scoped_employee_ids(admin)
+    all_identifiers = list(set(scoped_emp_ids + scoped_emails + scoped_obj_ids))
 
     pipeline_daily = [
         {"$match": {
             "organization_id": org_id,
-            "employee_id": {"$in": scoped_emp_ids},
+            "$or": [
+                {"employee_id": {"$in": all_identifiers}},
+                {"employee_email": {"$in": scoped_emails}}
+            ],
             "check_in_time": {"$gte": start_dt, "$lte": end_dt}
         }},
         {"$group": {
@@ -8463,53 +8459,45 @@ async def verify_wfh_device(employee_id: str, org_id: str, device_id: str):
     })
 
     if not device:
-        if AUTO_APPROVE:
-            from bson import ObjectId
-            employee = await employees_collection.find_one({"_id": ObjectId(employee_id)})
-            now = datetime.now(timezone.utc)
-            device_doc = {
-                "employee_id": employee_id,
-                "employee_email": employee.get("email") if employee else "",
-                "employee_name": employee.get("full_name", "") if employee else "",
-                "organization_id": org_id,
-                "device_id": device_id,
-                "status": "approved",
-                "registered_at": now,
-                "approved_at": now,
-                "approved_by": "auto-approved",
-                "last_seen": now,
-                "updated_at": now
-            }
-            await wfh_device_info_collection.insert_one(device_doc)
-            return device_doc
-
-        # Auto approve authenticated employee devices
         from bson import ObjectId
         employee = await employees_collection.find_one({"_id": ObjectId(employee_id)})
         now = datetime.now(timezone.utc)
+        initial_status = "approved" if AUTO_APPROVE else "pending"
         device_doc = {
             "employee_id": employee_id,
             "employee_email": employee.get("email") if employee else "",
             "employee_name": employee.get("full_name", "") if employee else "",
             "organization_id": org_id,
             "device_id": device_id,
-            "status": "approved",
+            "status": initial_status,
             "registered_at": now,
-            "approved_at": now,
-            "approved_by": "auto-approved",
+            "approved_at": now if AUTO_APPROVE else None,
+            "approved_by": "auto-approved" if AUTO_APPROVE else None,
             "last_seen": now,
             "updated_at": now
         }
         await wfh_device_info_collection.insert_one(device_doc)
+        if not AUTO_APPROVE:
+            raise HTTPException(
+                status_code=403,
+                detail="WFH device registered and pending admin approval."
+            )
         return device_doc
 
-    if device.get("status") != "approved":
-        await wfh_device_info_collection.update_one(
-            {"_id": device["_id"]},
-            {"$set": {"status": "approved", "approved_at": datetime.now(timezone.utc), "approved_by": "auto-approved"}}
+    if device.get("status") == "revoked":
+        raise HTTPException(
+            status_code=403,
+            detail="WFH device has been revoked by administrator. Please contact admin."
         )
-        device["status"] = "approved"
-        return device
+
+    if device.get("status") != "approved":
+        if AUTO_APPROVE:
+            await wfh_device_info_collection.update_one(
+                {"_id": device["_id"]},
+                {"$set": {"status": "approved", "approved_at": datetime.now(timezone.utc), "approved_by": "auto-approved"}}
+            )
+            device["status"] = "approved"
+            return device
 
         raise HTTPException(
             status_code=403,

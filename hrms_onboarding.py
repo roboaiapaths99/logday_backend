@@ -1168,6 +1168,7 @@ async def upload_my_onboarding_document(
         raise HTTPException(status_code=404, detail="Onboarding profile not found")
 
     file_url = None
+    filepath = None
     if file:
         ext = file.filename.split(".")[-1] if "." in file.filename else "jpg"
         filename = f"{clean_email}_{doc_type}_{uuid.uuid4().hex[:8]}.{ext}"
@@ -1187,15 +1188,26 @@ async def upload_my_onboarding_document(
             f.write(base64.b64decode(image_b64))
         file_url = f"/uploads/onboarding_docs/{filename}"
 
+    is_verified = False
+    verification_msg = None
+    extracted_details = {}
+    if filepath and os.path.exists(filepath):
+        try:
+            is_verified, verification_msg, extracted_details = await auto_verify_document_file(filepath, doc_type, employee)
+        except Exception as e:
+            logger.warning(f"Auto-verify skipped for {doc_type}: {e}")
+
     docs_submitted = onb.get("documents_submitted", [])
     existing = next((d for d in docs_submitted if d["type"] == doc_type), None)
     
     doc_entry = {
         "type": doc_type,
-        "verified": False,
-        "status": "pending_review",
+        "verified": is_verified,
+        "status": "verified" if is_verified else "pending_review",
         "verification_source": "mobile_upload",
         "file_url": file_url,
+        "extracted_details": extracted_details,
+        "verification_message": verification_msg,
         "submitted_at": datetime.now(timezone.utc).isoformat(),
         "rejection_reason": None
     }
