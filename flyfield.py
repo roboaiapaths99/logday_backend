@@ -420,17 +420,25 @@ async def upload_flyfield_media(
     folder_dir = os.path.join("uploads", "flyfield", str(org_id), today_str)
     os.makedirs(folder_dir, exist_ok=True)
 
-    # Determine extension
+    # Determine extension & validate allowed media formats
+    ALLOWED_MEDIA_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".m4a", ".aac", ".mp3", ".wav", ".ogg"}
+    MAX_MEDIA_BYTES = 15 * 1024 * 1024  # 15 MB
+
     ext = ".jpg"
     if media_type == "voice_note":
         ext = ".m4a" if "m4a" in (target_file.filename or "") else ".aac"
     elif target_file.filename and "." in target_file.filename:
         ext = "." + target_file.filename.rsplit(".", 1)[1].lower()
 
+    if ext not in ALLOWED_MEDIA_EXTS:
+        raise HTTPException(status_code=400, detail=f"Unsupported media file format '{ext}'.")
+
     filename = f"{uuid.uuid4().hex[:16]}{ext}"
     file_path = os.path.join(folder_dir, filename)
 
     content = await target_file.read()
+    if len(content) > MAX_MEDIA_BYTES:
+        raise HTTPException(status_code=413, detail="Uploaded media file exceeds 15 MB limit.")
     with open(file_path, "wb") as f:
         f.write(content)
 
@@ -776,8 +784,13 @@ async def get_admin_flyfield_live(admin = Depends(get_current_admin)):
 
 @router.get("/admin/flyfield/employee/{email}/timeline")
 async def get_admin_employee_timeline(email: str, date: Optional[str] = None, admin = Depends(get_current_admin)):
-    """Admin timeline view for a specific FlyField employee"""
-    return await build_daily_timeline(email, date)
+    """Admin timeline view for a specific FlyField employee (Organization-scoped)"""
+    clean_email = email.strip().lower()
+    if admin.organization_id and admin.organization_id != "system_org" and getattr(admin, "role", "") != "superadmin":
+        emp = await employees_collection.find_one({"email": clean_email, "organization_id": admin.organization_id})
+        if not emp:
+            raise HTTPException(status_code=404, detail="Employee not found in your organization")
+    return await build_daily_timeline(clean_email, date)
 
 
 @router.get("/admin/flyfield/visits")
@@ -819,7 +832,10 @@ async def admin_close_stuck_visit(visit_id: str, admin = Depends(get_current_adm
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid visit ID")
 
-    visit = await visit_logs_collection.find_one({"_id": obj_id})
+    query = {"_id": obj_id}
+    if admin.organization_id and admin.organization_id != "system_org" and getattr(admin, "role", "") != "superadmin":
+        query["organization_id"] = admin.organization_id
+    visit = await visit_logs_collection.find_one(query)
     if not visit:
         raise HTTPException(status_code=404, detail="Visit not found")
 

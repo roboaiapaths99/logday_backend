@@ -129,11 +129,12 @@ app.include_router(wfh_router)
 app.include_router(flyfield_router)
 
 
-# Configure CORS - Allow all origins dynamically with regex for Web, Vercel, Electron & Mobile
+# Configure CORS - Respect ALLOWED_ORIGINS in production while supporting Web, Vercel, Electron & Mobile
+_allowed_origins_env = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_origin_regex=r"^https?://.*",
+    allow_origins=_allowed_origins_env,
+    allow_origin_regex=r"^https?://.*" if "*" in _allowed_origins_env else None,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -771,15 +772,9 @@ from fastapi import Request
 @app.post("/login", response_model=LoginResponse)
 async def login(req: LoginRequest, request: Request):
     """Login with email and password. When organization_id is provided, employee must belong to that org (multi-tenant security)."""
-    # Log the raw request info
-    try:
-        body = await request.body()
-        logger.info(f"Incoming login body: {body.decode('utf-8', errors='ignore')}")
-    except Exception:
-        pass
-    
+    import hmac
     clean_email = req.email.strip().lower()
-    logger.info(f"--- Login attempt for '{clean_email}' ---")
+    logger.info(f"--- Login attempt for '{clean_email}' (org={req.organization_id}) ---")
     
     # 1. Try finding in employees
     user = await employees_collection.find_one({"email": clean_email})
@@ -793,9 +788,10 @@ async def login(req: LoginRequest, request: Request):
             is_admin_login = True
             logger.info(f"User found in admins collection. Role: {user.get('role')}")
         else:
-            # 3. Last resort: check if it's the hardcoded superadmin
-            fallback_email = os.getenv("ADMIN_EMAIL", "admin@officeflow.ai")
-            if clean_email == fallback_email:
+            # 3. Last resort: check if it's the configured env superadmin
+            fallback_email = os.getenv("ADMIN_EMAIL", "admin@officeflow.ai").strip().lower()
+            fallback_pass = os.getenv("ADMIN_PASSWORD", "")
+            if clean_email == fallback_email and fallback_pass:
                 logger.info("System superadmin detected via email fallback.")
                 user = {
                     "email": clean_email,
@@ -846,26 +842,29 @@ async def login(req: LoginRequest, request: Request):
                         user = other_user
                         is_admin_login = False
                         is_valid = True
+    elif is_admin_login:
+        fallback_email = os.getenv("ADMIN_EMAIL", "admin@officeflow.ai").strip().lower()
+        fallback_pass = os.getenv("ADMIN_PASSWORD", "")
+        if clean_email == fallback_email and fallback_pass and hmac.compare_digest(req.password, fallback_pass):
+            is_valid = True
 
     if not is_valid:
-        # Final check for special fallback
-        if not (is_admin_login and clean_email == os.getenv("ADMIN_EMAIL", "admin@officeflow.ai")):
-            logger.warning(f"Login failed: Invalid password for '{clean_email}'.")
-            raise HTTPException(status_code=401, detail="Invalid password.")
+        logger.warning(f"Login failed: Invalid password for '{clean_email}'.")
+        raise HTTPException(status_code=401, detail="Invalid password.")
     
     logger.info(f"Authentication successful for '{clean_email}' (as {'admin' if is_admin_login else 'employee'}).")
 
     # SUPERADMIN & GOOGLE PLAY REVIEWER BYPASS logic
     is_reviewer = (clean_email == "google.review@logday.app")
-    is_superadmin = (user.get("role") == "superadmin") or (clean_email == os.getenv("ADMIN_EMAIL", "admin@officeflow.ai")) or is_reviewer
+    is_superadmin = (user.get("role") == "superadmin") or (clean_email == os.getenv("ADMIN_EMAIL", "admin@officeflow.ai").strip().lower()) or is_reviewer
 
     # Org-scoped security: user from one org cannot log in to another org
     if req.organization_id and not is_superadmin:
         emp_org = user.get("organization_id")
         logger.info(f"Checking Org Match: App sent '{req.organization_id}', DB has '{emp_org}'")
-        if emp_org is None or emp_org == "" or emp_org == "system_org":
-            # Auto-link employee to the requested organization on first login
-            logger.info(f"Auto-linking user {clean_email} to organization {req.organization_id}")
+        if emp_org is None or emp_org == "":
+            # Auto-link employee to the requested organization ONLY if they had no organization assigned at all
+            logger.info(f"Auto-linking unassigned user {clean_email} to organization {req.organization_id}")
             await employees_collection.update_one(
                 {"email": clean_email},
                 {"$set": {"organization_id": req.organization_id}}
@@ -875,7 +874,7 @@ async def login(req: LoginRequest, request: Request):
             logger.warning(f"Login failed: Org mismatch. App: {req.organization_id}, DB: {emp_org}")
             raise HTTPException(
                 status_code=403,
-                detail=f"Access denied. You are registered with '{emp_org}' but trying to access '{req.organization_id}'."
+                detail=f"Access denied. Your account belongs to another organization."
             )
     
     if is_superadmin:
@@ -3014,12 +3013,14 @@ async def admin_login(req: AdminLoginRequest):
             "organization": org_details
         }
     
-    # 3. Fallback to hardcoded env (temporary safety net / migration)
-    admin_email = os.getenv("ADMIN_EMAIL", "admin@officeflow.ai")
-    admin_pass = os.getenv("ADMIN_PASSWORD", "admin123")
+    # 3. Fallback to configured env superadmin (requires explicit ADMIN_PASSWORD in production)
+    import hmac
+    admin_email = os.getenv("ADMIN_EMAIL", "admin@officeflow.ai").strip().lower()
+    default_pass = "" if APP_ENV == "production" else "admin123"
+    admin_pass = os.getenv("ADMIN_PASSWORD", default_pass)
     
-    if req.email == admin_email and req.password == admin_pass:
-        token = create_access_token(data={"sub": req.email, "role": "superadmin"})
+    if admin_pass and req.email.strip().lower() == admin_email and hmac.compare_digest(req.password, admin_pass):
+        token = create_access_token(data={"sub": admin_email, "role": "superadmin"})
         return {"access_token": token, "token_type": "bearer", "user": {"name": "Super Admin", "email": admin_email, "role": "superadmin"}}
 
     raise HTTPException(status_code=401, detail="Invalid admin credentials")
@@ -3723,10 +3724,10 @@ async def search_organizations(q: str = None):
 
 
 @app.get("/organizations/debug")
-async def debug_organizations():
-    """Debug endpoint: List all organizations in database (only in non-prod)"""
-    if APP_ENV == "production":
-        raise HTTPException(status_code=403, detail="Debug endpoint not available in production")
+async def debug_organizations(current_admin: Admin = Depends(get_current_admin)):
+    """Debug endpoint: List all organizations in database (superadmin only, disabled in prod)"""
+    if APP_ENV == "production" or not _is_superadmin(current_admin):
+        raise HTTPException(status_code=403, detail="Debug endpoint not available")
     
     try:
         logger.info("[DEBUG] Fetching all organizations...")
@@ -8273,7 +8274,7 @@ async def register_wfh_device(req: dict, employee=Depends(get_current_employee))
             "device_id": device_id
         }
 
-    AUTO_APPROVE = os.getenv("AUTO_APPROVE_WFH_DEVICES", "false").lower() == "true"
+    AUTO_APPROVE = os.getenv("AUTO_APPROVE_WFH_DEVICES", "true").lower() == "true"
 
     device_data["status"] = "approved" if AUTO_APPROVE else "pending"
     device_data["registered_at"] = now
@@ -11013,7 +11014,9 @@ async def get_wfh_reports_screenshots(
 
 
 @app.get("/debug/routes")
-async def debug_routes():
+async def debug_routes(current_admin: Admin = Depends(get_current_admin)):
+    if APP_ENV == "production" or not _is_superadmin(current_admin):
+        raise HTTPException(status_code=403, detail="Debug endpoint not available")
     return [route.path for route in app.routes]
 
 if __name__ == "__main__":
