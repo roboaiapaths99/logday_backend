@@ -1,12 +1,25 @@
 from fastapi import FastAPI, HTTPException, File, Depends, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.concurrency import run_in_threadpool
+from starlette.responses import StreamingResponse
+from starlette import status
 import uvicorn
+import asyncio
 from datetime import datetime, timezone, timedelta
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import os
+import calendar
 import math
-import pandas as pd
+import re
 import io
+import time
+import random
+import traceback
+import zipfile
+import tempfile
+import urllib.request
+from urllib.parse import unquote
+import pandas as pd
 from bson import ObjectId
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from reportlab.lib.pagesizes import letter, landscape
@@ -20,6 +33,11 @@ import base64
 import uuid
 from fastapi.staticfiles import StaticFiles
 import requests
+import httpx
+try:
+    from PIL import Image as PILImage  # type: ignore[import-not-found]  # optional: Pillow
+except ImportError:
+    PILImage = None  # type: ignore[assignment,misc]
 
 # Configure Logging
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -48,22 +66,41 @@ from database import (
     organizations_collection, visit_plans_collection, visit_logs_collection, 
     location_pings_collection, km_reimbursements_collection, expense_claims_collection, otps_collection,
     alerts_collection, leave_requests_collection,
-    visit_plan_templates_collection, nudge_logs_collection
+    visit_plan_templates_collection, nudge_logs_collection,
+    wfh_sessions_collection,
+    wfh_screenshots_collection,
+    wfh_activity_collection,
+    wfh_app_usage_collection,
+    wfh_productivity_collection,
+    wfh_alerts_collection,
+    wfh_meetings_collection,
+    wfh_device_info_collection,
+    wfh_signals_collection,
+    wfh_commands_collection,
+    wfh_face_checks_collection,
+    wfh_requests_collection,
+    ensure_employee_indexes,
+    onboardings_collection,
+    payrolls_collection,
+    exit_managements_collection,
+    salary_structures_collection,
+    holidays_collection,
+    leave_policies_collection
 )
 from models import (
     RegisterRequest, LoginRequest, VerifyPresenceRequest, Token, LoginResponse, EmployeeProfile, UpdateFaceRequest,
     AdminLoginRequest, EmployeeUpdate, SystemSettings, Admin, AdminRole, Organization, OrganizationRegisterRequest, SubAdminCreate,
     EmployeeType, TerritoryType, AttendanceType, CheckInMethod, PlanStatus, VisitPlan, Visit, LocationPing, ExpenseClaim,
-    LeaveType, LeaveStatus, DiscussionMessage, LeaveRequest, SyncBatchRequest, ChangePasswordRequest
+    LeaveType, LeaveStatus, DiscussionMessage, LeaveRequest, SyncBatchRequest, ChangePasswordRequest, SalaryStructure,
+    HolidayCreateRequest, HolidayBulkCreateRequest, LeavePolicyUpdateRequest, EmployeeLeaveQuotaUpdateRequest, ConvertAbsentToLeaveRequest
 )
 from auth import (
     get_password_hash, verify_password, create_access_token, 
     get_current_admin, get_current_employee, admin_oauth2_scheme, employee_oauth2_scheme,
     SECRET_KEY, ALGORITHM
 )
-from face_utils import get_face_embedding, verify_face, compare_faces
+from face_utils import get_face_embedding, verify_face, compare_faces, is_dummy_embedding
 from sheets_sync import sync_to_google_sheets, sync_visit_to_google_sheets
-from fastapi import BackgroundTasks
 
 APP_ENV = os.getenv("APP_ENV", "development")
 
@@ -74,41 +111,57 @@ app = FastAPI(
     redoc_url="/redoc" if APP_ENV != "production" else None,
 )
 
-# Configure CORS
-_raw_origins = os.getenv("ALLOWED_ORIGINS", "")
-if not _raw_origins:
-    # Default to development origins
-    _allowed_origins = [
-        "http://localhost:5173",
-        "http://localhost:5174",
-        "http://127.0.0.1:5173",
-        "http://127.0.0.1:5174",
-        "http://192.168.1.6:5173",
-        "http://192.168.1.6:5174",
-        "http://localhost:3000",
-        "https://attendence-inofice-admin-desk-bza5cuwtz.vercel.app",
-        "https://attendence-inofice-admin-desk.vercel.app",
-    ]
-elif _raw_origins == "*":
-    _allowed_origins = ["*"]
-else:
-    _allowed_origins = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+# HRMS Routers
+from hrms_onboarding import router as onboarding_router, employee_onboarding_router
+from hrms_payroll import router as payroll_router
+from hrms_exit import router as exit_router, employee_exit_router
+from hrms_employee import router as employee_router
+from hrms_wfh import router as wfh_router
+from flyfield import router as flyfield_router
 
+app.include_router(onboarding_router)
+app.include_router(employee_onboarding_router)
+app.include_router(payroll_router)
+app.include_router(exit_router)
+app.include_router(employee_exit_router)
+app.include_router(employee_router)
+app.include_router(wfh_router)
+app.include_router(flyfield_router)
+
+
+# Configure CORS - Allow all origins dynamically with regex for Web, Vercel, Electron & Mobile
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_allowed_origins + [
-        "http://localhost",
-        "http://10.0.2.2", # Android emulator
-    ],
-    # allow_origin_regex=r"https?://.*", # Very permissive for debugging, will narrow later
+    allow_origins=["*"],
+    allow_origin_regex=r"^https?://.*",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["*"],
 )
+
 @app.middleware("http")
-async def add_cache_control_header(request: Request, call_next):
+async def add_cors_and_cache_headers(request: Request, call_next):
+    # Handle preflight OPTIONS requests directly with full CORS headers
+    origin = request.headers.get("origin") or "*"
+    if request.method == "OPTIONS":
+        from fastapi.responses import Response
+        response = Response(status_code=200)
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS, PATCH"
+        response.headers["Access-Control-Allow-Headers"] = request.headers.get("access-control-request-headers", "*")
+        response.headers["Access-Control-Max-Age"] = "86400"
+        return response
+
     response = await call_next(request)
+    
+    # Ensure CORS headers are present even on errors
+    response.headers["Access-Control-Allow-Origin"] = origin
+    response.headers["Access-Control-Allow-Credentials"] = "true"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS, PATCH"
+    response.headers["Access-Control-Allow-Headers"] = "*"
+    
     # Prevent caching of API responses to ensure real-time data accuracy
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     response.headers["Pragma"] = "no-cache"
@@ -118,23 +171,36 @@ async def add_cache_control_header(request: Request, call_next):
 # (Health check consolidated at line 340)
 
 # --- GEOCODING PROXY ---
+
+GEOCODE_CACHE = {}
+
 @app.get("/api/geocoding/reverse")
 async def reverse_geocode(lat: float, lon: float):
     """
     Proxy for Nominatim reverse geocoding to bypass CORS and 429 errors.
     Uses a server-side User-Agent to comply with Nominatim's policy.
+    Uses an in-memory cache and runs in threadpool to prevent event-loop blockages.
     """
+    cache_key = (round(lat, 4), round(lon, 4))
+    if cache_key in GEOCODE_CACHE:
+        return GEOCODE_CACHE[cache_key]
+
     try:
         url = f"https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat={lat}&lon={lon}"
         headers = {
             "User-Agent": "LogDayAttendanceApp/1.0 (contact: roboaiapaths99@gmail.com)"
         }
-        response = requests.get(url, headers=headers, timeout=10)
+        # Run blocking requests.get in threadpool to keep event loop unblocked
+        response = await run_in_threadpool(
+            requests.get, url, headers=headers, timeout=5
+        )
         response.raise_for_status()
-        return response.json()
+        data = response.json()
+        GEOCODE_CACHE[cache_key] = data
+        return data
     except Exception as e:
         logger.error(f"Geocoding proxy error: {str(e)}")
-        # Fail gracefully with coordinatess if geocoding fails
+        # Fail gracefully with coordinates if geocoding fails
         return {"display_name": f"{lat:.4f}, {lon:.4f}", "address": {}}
 
 # --- API PREFIX MIDDLEWARE ---
@@ -158,9 +224,10 @@ async def api_prefix_handler(request: Request, call_next):
 
 # --- GLOBAL EXCEPTION HANDLERS ---
 @app.exception_handler(HTTPException)
-async def http_exception_handler(request, exc):
-    """Standardize HTTP exception responses for frontend mapping."""
-    return JSONResponse(
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """Standardize HTTP exception responses for frontend mapping with CORS headers."""
+    origin = request.headers.get("origin")
+    response = JSONResponse(
         status_code=exc.status_code,
         content={
             "status": "error",
@@ -169,12 +236,21 @@ async def http_exception_handler(request, exc):
             "type": "standard_error"
         },
     )
+    if origin and origin != "*":
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+    else:
+        response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Headers"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "*"
+    return response
 
 @app.exception_handler(Exception)
-async def general_exception_handler(request, exc):
-    """Catch-all for internal server errors to avoid leaking tracebacks in production."""
+async def general_exception_handler(request: Request, exc: Exception):
+    """Catch-all for internal server errors to avoid leaking tracebacks in production with CORS headers."""
     logger.exception(f"Unhandled error: {str(exc)}")
-    return JSONResponse(
+    origin = request.headers.get("origin")
+    response = JSONResponse(
         status_code=500,
         content={
             "status": "error",
@@ -183,6 +259,14 @@ async def general_exception_handler(request, exc):
             "type": "system_error"
         },
     )
+    if origin and origin != "*":
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+    else:
+        response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Headers"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "*"
+    return response
 
 # --- STARTUP EVENT ---
 @app.on_event("startup")
@@ -251,9 +335,151 @@ async def trigger_alert(alert_type: str, employee_id: str, organization_id: str,
 UPLOAD_DIR = "uploads"
 if not os.path.exists(UPLOAD_DIR):
     os.makedirs(UPLOAD_DIR)
+os.makedirs("uploads/wfh_view", exist_ok=True)
 
 # Serve static files
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
+
+# Hybrid S3/MinIO & Local File Storage
+import boto3
+from botocore.exceptions import NoCredentialsError
+
+S3_ENDPOINT_URL = os.getenv("S3_ENDPOINT_URL")
+S3_ACCESS_KEY_ID = os.getenv("S3_ACCESS_KEY_ID") or os.getenv("AWS_ACCESS_KEY_ID")
+S3_SECRET_ACCESS_KEY = os.getenv("S3_SECRET_ACCESS_KEY") or os.getenv("AWS_SECRET_ACCESS_KEY")
+S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME") or os.getenv("AWS_STORAGE_BUCKET_NAME", "logday-wfh-screenshots")
+S3_REGION_NAME = os.getenv("S3_REGION_NAME", "us-east-1")
+S3_PUBLIC_URL_PREFIX = os.getenv("S3_PUBLIC_URL_PREFIX") or os.getenv("R2_PUBLIC_URL_PREFIX")
+
+def get_s3_key_from_url(url: str) -> str:
+    for folder in ["wfh_view", "wfh_face_checks"]:
+        marker = f"/{folder}/"
+        if marker in url:
+            idx = url.find(marker)
+            return url[idx+1:]
+    return ""
+
+def get_screenshot_display_url(url: str, request: Request = None) -> str:
+    if not url:
+        return ""
+    if url.startswith("/uploads/"):
+        if request:
+            return build_static_upload_url(request, url)
+        return url
+    
+    # Generate Presigned URL for private S3/R2 storage
+    if S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY:
+        s3_key = get_s3_key_from_url(url)
+        if s3_key:
+            try:
+                from botocore.client import Config
+                s3_client = boto3.client(
+                    "s3",
+                    endpoint_url=S3_ENDPOINT_URL,
+                    aws_access_key_id=S3_ACCESS_KEY_ID,
+                    aws_secret_access_key=S3_SECRET_ACCESS_KEY,
+                    region_name=S3_REGION_NAME,
+                    config=Config(signature_version='s3v4')
+                )
+                presigned_url = s3_client.generate_presigned_url(
+                    'get_object',
+                    Params={'Bucket': S3_BUCKET_NAME, 'Key': s3_key},
+                    ExpiresIn=3600 # 1 hour
+                )
+                return presigned_url
+            except Exception as e:
+                logger.error(f"Failed to generate presigned URL for key {s3_key}: {e}")
+    return url
+
+async def upload_file_to_storage(image_bytes: bytes, filename: str, folder: str = "wfh_view") -> str:
+    """
+    Enterprise hybrid storage: Uploads to S3/MinIO/R2 if configured, otherwise falls back to local disk.
+    """
+    if S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY:
+        try:
+            s3_client = boto3.client(
+                "s3",
+                endpoint_url=S3_ENDPOINT_URL,
+                aws_access_key_id=S3_ACCESS_KEY_ID,
+                aws_secret_access_key=S3_SECRET_ACCESS_KEY,
+                region_name=S3_REGION_NAME
+            )
+            # Ensure bucket exists (gracefully ignore failures since Cloudflare R2 has different bucket creation rules)
+            try:
+                s3_client.head_bucket(Bucket=S3_BUCKET_NAME)
+            except Exception:
+                try:
+                    if S3_REGION_NAME == "us-east-1":
+                        s3_client.create_bucket(Bucket=S3_BUCKET_NAME)
+                    else:
+                        s3_client.create_bucket(
+                            Bucket=S3_BUCKET_NAME,
+                            CreateBucketConfiguration={"LocationConstraint": S3_REGION_NAME}
+                        )
+                except Exception as bucket_err:
+                    logger.warning(f"Could not verify/create bucket {S3_BUCKET_NAME}, proceeding anyway: {bucket_err}")
+            
+            s3_key = f"{folder}/{filename}"
+            s3_client.put_object(
+                Bucket=S3_BUCKET_NAME,
+                Key=s3_key,
+                Body=image_bytes,
+                ContentType="image/png" if filename.endswith(".png") else "image/jpeg"
+            )
+            
+            if S3_PUBLIC_URL_PREFIX:
+                url = f"{S3_PUBLIC_URL_PREFIX.rstrip('/')}/{s3_key}"
+            elif S3_ENDPOINT_URL:
+                url = f"{S3_ENDPOINT_URL.rstrip('/')}/{S3_BUCKET_NAME}/{s3_key}"
+            else:
+                url = f"https://{S3_BUCKET_NAME}.s3.amazonaws.com/{s3_key}"
+            logger.info(f"Successfully uploaded screenshot {filename} to S3/MinIO bucket {S3_BUCKET_NAME}")
+            return url
+        except Exception as e:
+            logger.error(f"S3/MinIO upload failed, falling back to local storage: {e}")
+
+    # Local filesystem fallback
+    filepath = os.path.join(UPLOAD_DIR, folder, filename)
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+    with open(filepath, "wb") as f:
+        f.write(image_bytes)
+    return f"/uploads/{folder}/{filename}"
+
+
+async def delete_file_from_storage(image_url: str):
+    """
+    Deletes the file from S3/R2 or local filesystem.
+    """
+    if not image_url:
+        return
+
+    if image_url.startswith("/uploads/"):
+        local_path = image_url.lstrip("/")
+        if os.path.exists(local_path):
+            try:
+                os.remove(local_path)
+                logger.info(f"Deleted local file: {local_path}")
+            except Exception as delete_err:
+                logger.error(f"Failed to delete local screenshot file: {delete_err}")
+        return
+
+    if S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY:
+        key_start = image_url.find("/wfh_view/")
+        if key_start != -1:
+            s3_key = image_url[key_start + 1:]
+            try:
+                s3_client = boto3.client(
+                    "s3",
+                    endpoint_url=S3_ENDPOINT_URL,
+                    aws_access_key_id=S3_ACCESS_KEY_ID,
+                    aws_secret_access_key=S3_SECRET_ACCESS_KEY,
+                    region_name=S3_REGION_NAME
+                )
+                s3_client.delete_object(Bucket=S3_BUCKET_NAME, Key=s3_key)
+                logger.info(f"Successfully deleted {s3_key} from S3/R2 bucket {S3_BUCKET_NAME}")
+            except Exception as e:
+                logger.error(f"Failed to delete {s3_key} from S3/R2 bucket {S3_BUCKET_NAME}: {e}")
+
 
 async def check_missed_visits():
     """
@@ -298,10 +524,48 @@ async def check_missed_visits():
     logger.info("Finished scheduled job: check_missed_visits")
 
 
+async def purge_old_screenshots():
+    """Daily clean-up of expired screenshots from DB and local storage based on organization retention policy."""
+    logger.info("Starting scheduled job: purge_old_screenshots")
+    try:
+        import os
+        from bson import ObjectId
+        orgs = await organizations_collection.find({}).to_list(length=1000)
+        purged_count = 0
+        now = datetime.now(timezone.utc)
+        
+        for org in orgs:
+            org_id = str(org["_id"])
+            policy = org.get("wfh_policy", {}) or {}
+            retention_days = policy.get("screenshot_retention_days", 5)
+            
+            cutoff_date = now - timedelta(days=retention_days)
+            query = {
+                "organization_id": org_id,
+                "timestamp": {"$lt": cutoff_date}
+            }
+            
+            cursor = wfh_screenshots_collection.find(query)
+            expired_screens = await cursor.to_list(length=1000)
+            
+            for screen in expired_screens:
+                image_url = screen.get("image_url", "")
+                await delete_file_from_storage(image_url)
+                await wfh_screenshots_collection.delete_one({"_id": screen["_id"]})
+                purged_count += 1
+                
+        logger.info(f"Finished scheduled job: purge_old_screenshots. Purged {purged_count} screenshots.")
+    except Exception as e:
+        logger.error(f"Error running purge_old_screenshots: {e}")
+
+
 @app.on_event("startup")
 async def startup_db_client():
     """Create indexes on startup (non-fatal if DB is temporarily unreachable)."""
     try:
+        # WFH & Employee indexes
+        await ensure_employee_indexes()
+        
         # Core Indexes
         await employees_collection.create_index("email", unique=True)
         await employees_collection.create_index("employee_id")
@@ -325,8 +589,9 @@ async def startup_db_client():
     try:
         if not scheduler.running:
             scheduler.add_job(check_missed_visits, 'interval', hours=1)
+            scheduler.add_job(purge_old_screenshots, 'cron', hour=2, minute=0)
             scheduler.start()
-        logger.info("APScheduler started: check_missed_visits scheduled hourly.")
+        logger.info("APScheduler started: check_missed_visits scheduled hourly, purge_old_screenshots daily at 2 AM.")
     except Exception as e:
         logger.warning(f"Scheduler already running or failed to start: {e}")
     
@@ -484,7 +749,10 @@ async def get_public_settings(slug: str):
         return SystemSettings().dict()
     
     settings_doc = await settings_collection.find_one({"organization_id": str(org["_id"])})
-    return settings_doc if settings_doc else SystemSettings().dict()
+    if settings_doc:
+        settings_doc["_id"] = str(settings_doc["_id"])
+        return settings_doc
+    return SystemSettings().dict()
 
 
 from fastapi import Request
@@ -532,6 +800,14 @@ async def login(req: LoginRequest, request: Request):
     
     logger.info(f"User identified. Stored Org ID: {user.get('organization_id')}, Is Admin: {is_admin_login}")
     
+    if not is_admin_login:
+        if user.get("status") == "Inactive" or user.get("is_active") is False:
+            logger.warning(f"Login blocked: Employee account is deactivated for '{clean_email}'.")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Your account has been deactivated. Access denied."
+            )
+
     # Password check
     stored_hash = user.get("hashed_password")
     is_valid = False
@@ -568,8 +844,9 @@ async def login(req: LoginRequest, request: Request):
     
     logger.info(f"Authentication successful for '{clean_email}' (as {'admin' if is_admin_login else 'employee'}).")
 
-    # SUPERADMIN BYPASS logic
-    is_superadmin = (user.get("role") == "superadmin") or (clean_email == os.getenv("ADMIN_EMAIL", "admin@officeflow.ai"))
+    # SUPERADMIN & GOOGLE PLAY REVIEWER BYPASS logic
+    is_reviewer = (clean_email == "google.review@logday.app")
+    is_superadmin = (user.get("role") == "superadmin") or (clean_email == os.getenv("ADMIN_EMAIL", "admin@officeflow.ai")) or is_reviewer
 
     # Org-scoped security: user from one org cannot log in to another org
     if req.organization_id and not is_superadmin:
@@ -606,14 +883,75 @@ async def login(req: LoginRequest, request: Request):
                 detail="Security Alert: This account is locked to another device. Please contact Admin to reset your device binding."
             )
     
-    # Auto-bind on first login if not set
+    # Auto-bind on first login if not set (Skip for Google Reviewer)
     if not user.get("device_id") and req.device_id:
-        logger.info(f"Binding user {clean_email} to device {req.device_id}")
-        if is_admin_login:
-            await admins_collection.update_one({"email": clean_email}, {"$set": {"device_id": req.device_id}})
+        if is_reviewer:
+            logger.info("Google Reviewer login: Bypassing device auto-bind to keep the account un-bound.")
         else:
-            await employees_collection.update_one({"email": clean_email}, {"$set": {"device_id": req.device_id}})
+            logger.info(f"Binding user {clean_email} to device {req.device_id}")
+            if is_admin_login:
+                await admins_collection.update_one({"email": clean_email}, {"$set": {"device_id": req.device_id}})
+            else:
+                await employees_collection.update_one({"email": clean_email}, {"$set": {"device_id": req.device_id}})
+            
+    # Auto-register WFH device in wfh_device_info_collection for all WFH logins
+    emp_type_val = user.get("employee_type", "")
     
+    # WFH Desktop Authorization Gate: If request comes from WFH desktop app, check permission
+    client_type = getattr(req, "client_type", None)
+    if client_type in ["wfh_desktop", "desktop"] and not is_admin_login and not is_superadmin:
+        is_allowed_wfh = emp_type_val in ["wfh", "hybrid", EmployeeType.WFH, EmployeeType.HYBRID]
+        if not is_allowed_wfh:
+            # Check if they have an approved WFH request for today
+            tz_offset_mins = 330  # default IST
+            try:
+                org_settings = await settings_collection.find_one({"organization_id": user.get("organization_id")})
+                if org_settings:
+                    tz_offset_mins = org_settings.get("timezone_offset", 330)
+            except Exception:
+                pass
+            local_now = datetime.now(timezone.utc) + timedelta(minutes=tz_offset_mins)
+            today_str = local_now.strftime("%Y-%m-%d")
+            
+            wfh_approved = await wfh_requests_collection.find_one({
+                "employee_email": clean_email,
+                "date": today_str,
+                "status": "approved"
+            })
+            if not wfh_approved:
+                logger.warning(f"Login blocked: Office employee '{clean_email}' has no approved WFH request for today.")
+                raise HTTPException(
+                    status_code=403,
+                    detail="Access denied. You do not have an approved Work From Home (WFH) request for today, and your policy is set to Office-only."
+                )
+
+    if not is_admin_login and emp_type_val in ["wfh", EmployeeType.WFH] and req.device_id:
+        # Check if exists to avoid duplicates
+        exists = await wfh_device_info_collection.find_one({"employee_id": str(user["_id"]), "device_id": req.device_id})
+        if not exists:
+            emp_full_name = user.get("full_name") or user.get("name") or "Unknown"
+            device_doc = {
+                "employee_id": str(user["_id"]),
+                "organization_id": str(user.get("organization_id", "")),
+                "employee_name": emp_full_name,
+                "employee_email": user.get("email", clean_email),
+                "device_id": req.device_id,
+                "mac_address": req.device_id,  # Using device_id as fallback
+                "hostname": f"{emp_full_name}'s PC",
+                "os_info": "Windows",  # Generic fallback
+                "status": "pending",  # Requires admin approval
+                "registered_at": datetime.now(timezone.utc),
+                "approved_by": None,
+                "approved_at": None,
+                "revoked_by": None,
+                "revoked_at": None,
+                "revoke_reason": None
+            }
+            await wfh_device_info_collection.insert_one(device_doc)
+            logger.info(f"Registered new WFH device for {clean_email} (type={emp_type_val}), pending admin approval.")
+        else:
+            logger.info(f"WFH device already registered for {clean_email}, device_id={req.device_id}")
+
     logger.info("Login process complete. Generating token.")
     access_token = create_access_token(data={"sub": clean_email})
     
@@ -621,8 +959,8 @@ async def login(req: LoginRequest, request: Request):
     subordinates_count = await employees_collection.count_documents({"manager_id": clean_email})
     is_manager = subordinates_count > 0
     
-    # Check if user needs face enrollment (no face_embedding)
-    needs_enrollment = user.get("face_embedding") is None
+    # Check if user needs face enrollment (no face_embedding or dummy/mock embedding)
+    needs_enrollment = (user.get("face_embedding") is None) or is_dummy_embedding(user.get("face_embedding"))
     
     # Return full profile with defaults for legacy accounts
     response_data = {
@@ -649,6 +987,65 @@ async def login(req: LoginRequest, request: Request):
     except Exception as e:
         logger.error(f"Login Response Validation Failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Login Validation Error: {str(e)}")
+@app.post("/auth/check")
+async def auth_check(employee=Depends(get_current_employee)):
+    """Return current check‑in status and session info without modifying them."""
+    emp = await employees_collection.find_one({"email": employee["email"]})
+    if not emp:
+        raise HTTPException(status_code=404, detail="Employee not found")
+        
+    # 1. Check active WFH session
+    active_session = await wfh_sessions_collection.find_one({
+        "employee_id": str(emp["_id"]),
+        "status": "active"
+    })
+    
+    checked_in = emp.get("checked_in", False)
+    session_id = emp.get("session_id")
+    
+    if active_session:
+        checked_in = True
+        session_id = str(active_session["_id"])
+
+    # 2. Check today's attendance logs (Desk / Field / General check-in)
+    org_id = emp.get("organization_id")
+    tz_offset = 330
+    if org_id:
+        try:
+            org_settings = await settings_collection.find_one({"organization_id": str(org_id) if ObjectId.is_valid(str(org_id)) else org_id})
+            if org_settings:
+                tz_offset = org_settings.get("timezone_offset", 330)
+        except Exception:
+            pass
+
+    today_start_utc = get_today_start(tz_offset)
+    user_id_str = str(emp["_id"])
+    emp_email = emp.get("email", "")
+
+    latest_log = await attendance_logs_collection.find_one(
+        {
+            "$or": [
+                {"user_id": user_id_str},
+                {"user_id": emp_email},
+                {"email": emp_email}
+            ],
+            "timestamp": {"$gte": today_start_utc}
+        },
+        sort=[("timestamp", -1)]
+    )
+
+    if latest_log:
+        if latest_log.get("type") == "check-in":
+            checked_in = True
+        elif latest_log.get("type") == "check-out":
+            checked_in = False
+        
+    return {
+        "status": "success",
+        "checked_in": checked_in,
+        "session_id": session_id
+    }
+
 
 
 @app.get("/me", response_model=EmployeeProfile)
@@ -691,12 +1088,364 @@ async def change_password(req: ChangePasswordRequest, employee=Depends(get_curre
     )
     
     # Check if face enrollment is still needed
-    needs_enrollment = user.get("face_embedding") is None
+    needs_enrollment = (user.get("face_embedding") is None) or is_dummy_embedding(user.get("face_embedding"))
     
     return {
         "status": "success", 
         "message": "Password updated successfully",
         "needs_face_enrollment": needs_enrollment
+    }
+
+
+async def get_effective_org_settings(org_id: Optional[str]) -> dict:
+    """
+    Unified settings loader that combines:
+    1. Base organization settings from `settings_collection` (Office Times, Geofence, Timezone)
+    2. Active Leave & Attendance policy from `leave_policies_collection` (Cutoffs, Grace, Min hours, Quotas)
+    Ensures that configurations saved across any admin panel tab apply consistently across backend and apps.
+    """
+    if not org_id:
+        return {}
+    
+    org_str = str(org_id).strip()
+    query = {"$or": [{"organization_id": org_str}]}
+    if ObjectId.is_valid(org_str):
+        query["$or"].append({"organization_id": ObjectId(org_str)})
+    
+    merged = {}
+    try:
+        base_settings = await settings_collection.find_one(query)
+        if base_settings:
+            merged.update(base_settings)
+            merged["_id"] = str(base_settings["_id"])
+    except Exception as e:
+        logger.warning(f"Error loading base settings for org {org_str}: {e}")
+
+    try:
+        current_year = datetime.now(timezone.utc).year
+        policy = await leave_policies_collection.find_one({
+            "$or": [
+                {"organization_id": org_str, "year": current_year},
+                {"organization_id": org_str}
+            ]
+        }, sort=[("year", -1), ("updated_at", -1)])
+        
+        if policy:
+            keys_to_merge = [
+                "office_start_time", "office_end_time", "late_grace_mins",
+                "short_leave_cutoff_time", "late_to_short_leave_mins",
+                "half_day_late_cutoff_time", "half_day_early_exit_cutoff_time",
+                "early_leave_short_mins", "half_day_min_hours", "full_day_min_hours",
+                "required_hours", "short_leave_max_hours", "short_leave_monthly_limit",
+                "short_leave_penalty_rule", "lunch_start_time", "lunch_end_time",
+                "max_lunch_duration_mins", "allocation_cycle", "carry_forward"
+            ]
+            for k in keys_to_merge:
+                if k in policy and policy[k] is not None:
+                    merged[k] = policy[k]
+    except Exception as e:
+        logger.warning(f"Error loading leave policy for org {org_str}: {e}")
+
+    return merged
+
+
+def classify_attendance_day(
+    first_checkin_local: Optional[datetime],
+    last_checkout_local: Optional[datetime],
+    worked_hours: float,
+    settings: Optional[dict] = None,
+    employee_type: str = "desk",
+    approved_leave: Optional[dict] = None
+) -> dict:
+    """
+    Central enterprise classification engine for an employee's attendance day.
+    Evaluates:
+    - Office/Shift timings (desk vs field configurable by admin)
+    - Late grace & late threshold
+    - Late -> Short Leave threshold (mins or time)
+    - Late -> Half Day threshold (time, e.g. after 11:30 or lunch)
+    - Early Exit -> Half Day threshold (time, e.g. before 14:00)
+    - Early Exit -> Short Leave threshold (mins before shift end)
+    - Min Half-Day hours & Min Full-Day hours
+    - Split off-hours: late deficit vs early exit deficit
+    - Applied Short Leave / Half Day vs Attendance-triggered Short Leave / Half Day
+    """
+    settings = settings or {}
+    emp_type = str(employee_type).lower().strip()
+    is_field = (emp_type == "field") and settings.get("custom_field_rules_enabled", True)
+
+    def _parse_t(t_str, def_h, def_m):
+        try:
+            if t_str and ":" in str(t_str):
+                parts = str(t_str).strip().split(":")
+                return int(parts[0]), int(parts[1])
+        except Exception:
+            pass
+        return def_h, def_m
+
+    # 1. Timings & thresholds from admin configuration
+    if is_field:
+        start_h, start_m = _parse_t(settings.get("field_office_start_time") or settings.get("office_start_time"), 10, 0)
+        end_h, end_m = _parse_t(settings.get("field_office_end_time") or settings.get("office_end_time"), 19, 0)
+        late_grace_mins = int(settings.get("field_late_grace_mins") if settings.get("field_late_grace_mins") is not None else settings.get("late_grace_mins", 30))
+        late_to_short_mins = int(settings.get("field_late_to_short_leave_mins") if settings.get("field_late_to_short_leave_mins") is not None else settings.get("late_to_short_leave_mins", 45))
+        late_half_h, late_half_m = _parse_t(settings.get("field_late_to_half_day_time") or settings.get("late_to_half_day_time"), 12, 30)
+        early_half_h, early_half_m = _parse_t(settings.get("field_early_leave_half_day_time") or settings.get("early_leave_half_day_time"), 15, 0)
+        early_short_mins = int(settings.get("field_early_leave_short_mins") if settings.get("field_early_leave_short_mins") is not None else settings.get("early_leave_short_mins", 45))
+        half_day_min_hours = float(settings.get("field_half_day_min_hours") if settings.get("field_half_day_min_hours") is not None else settings.get("half_day_min_hours", 4.0))
+        full_day_min_hours = float(settings.get("field_full_day_min_hours") if settings.get("field_full_day_min_hours") is not None else settings.get("full_day_min_hours", 8.0))
+        required_hours = float(settings.get("field_required_hours") if settings.get("field_required_hours") is not None else settings.get("required_hours", 9.0))
+        short_leave_max_hours = float(settings.get("field_short_leave_max_hours") if settings.get("field_short_leave_max_hours") is not None else settings.get("short_leave_max_hours", 2.0))
+    else:
+        start_h, start_m = _parse_t(settings.get("office_start_time"), 9, 0)
+        end_h, end_m = _parse_t(settings.get("office_end_time"), 18, 0)
+        late_grace_mins = int(settings.get("late_grace_mins") if settings.get("late_grace_mins") is not None else settings.get("late_threshold_mins", 15))
+        
+        # Support either exact cutoff time or relative mins for late-to-short-leave
+        if settings.get("short_leave_cutoff_time"):
+            sl_h, sl_m = _parse_t(settings.get("short_leave_cutoff_time"), 10, 15)
+            late_to_short_mins = max(0, (sl_h * 60 + sl_m) - (start_h * 60 + start_m))
+        else:
+            late_to_short_mins = int(settings.get("late_to_short_leave_mins", 45))
+
+        late_half_h, late_half_m = _parse_t(settings.get("half_day_late_cutoff_time") or settings.get("late_to_half_day_time"), 11, 30)
+        early_half_h, early_half_m = _parse_t(settings.get("half_day_early_exit_cutoff_time") or settings.get("early_leave_half_day_time"), 14, 0)
+        early_short_mins = int(settings.get("early_leave_short_mins", 45))
+        half_day_min_hours = float(settings.get("half_day_min_hours", 4.0))
+        full_day_min_hours = float(settings.get("full_day_min_hours", 8.0))
+        required_hours = float(settings.get("required_hours", 8.0))
+        short_leave_max_hours = float(settings.get("short_leave_max_hours", 2.0))
+
+    # Format strings for explanations
+    late_half_str = f"{late_half_h:02d}:{late_half_m:02d}"
+    early_half_str = f"{early_half_h:02d}:{early_half_m:02d}"
+
+    # Handle No Check-in Case
+    if not first_checkin_local:
+        if approved_leave:
+            dur_type = str(approved_leave.get("duration_type", "")).lower().strip()
+            l_type = str(approved_leave.get("leave_type", "leave")).title()
+            if dur_type == "short_leave":
+                return {
+                    "status": "Short Leave",
+                    "is_late": False,
+                    "is_early_leave": False,
+                    "is_short_leave": True,
+                    "is_half_day": False,
+                    "short_leave_type": "applied",
+                    "half_day_type": None,
+                    "late_mins": 0,
+                    "early_exit_mins": 0,
+                    "late_off_hours": 0.0,
+                    "early_off_hours": 0.0,
+                    "off_hours": 0.0,
+                    "worked_hours": 0.0,
+                    "required_hours": required_hours,
+                    "effective_days": 1.0,
+                    "classification_reason": f"Approved Short Leave ({l_type})",
+                    "is_applied_leave": True
+                }
+            elif dur_type in ["first_half", "second_half", "half_day"] or approved_leave.get("duration") == 0.5:
+                return {
+                    "status": "Half Day",
+                    "is_late": False,
+                    "is_early_leave": False,
+                    "is_short_leave": False,
+                    "is_half_day": True,
+                    "short_leave_type": None,
+                    "half_day_type": f"{dur_type}_applied",
+                    "late_mins": 0,
+                    "early_exit_mins": 0,
+                    "late_off_hours": 0.0,
+                    "early_off_hours": 0.0,
+                    "off_hours": 0.0,
+                    "worked_hours": 0.0,
+                    "required_hours": required_hours,
+                    "effective_days": 0.5,
+                    "classification_reason": f"Approved Half Day ({dur_type})",
+                    "is_applied_leave": True
+                }
+            else:
+                return {
+                    "status": f"Leave ({l_type})",
+                    "is_late": False,
+                    "is_early_leave": False,
+                    "is_short_leave": False,
+                    "is_half_day": False,
+                    "short_leave_type": None,
+                    "half_day_type": None,
+                    "late_mins": 0,
+                    "early_exit_mins": 0,
+                    "late_off_hours": 0.0,
+                    "early_off_hours": 0.0,
+                    "off_hours": 0.0,
+                    "worked_hours": 0.0,
+                    "required_hours": required_hours,
+                    "effective_days": 0.0,
+                    "classification_reason": f"Approved Leave ({l_type})",
+                    "is_applied_leave": True
+                }
+
+        return {
+            "status": "Absent",
+            "is_late": False,
+            "is_early_leave": False,
+            "is_short_leave": False,
+            "is_half_day": False,
+            "short_leave_type": None,
+            "half_day_type": None,
+            "late_mins": 0,
+            "early_exit_mins": 0,
+            "late_off_hours": 0.0,
+            "early_off_hours": 0.0,
+            "off_hours": 0.0,
+            "worked_hours": 0.0,
+            "required_hours": required_hours,
+            "effective_days": 0.0,
+            "classification_reason": "No check-in recorded",
+            "is_applied_leave": False
+        }
+
+    # Reference datetimes for shift evaluation
+    shift_start = first_checkin_local.replace(hour=start_h, minute=start_m, second=0, microsecond=0)
+    shift_end = first_checkin_local.replace(hour=end_h, minute=end_m, second=0, microsecond=0)
+    grace_cutoff = shift_start + timedelta(minutes=late_grace_mins)
+    short_leave_late_cutoff = shift_start + timedelta(minutes=late_to_short_mins)
+    half_day_late_cutoff = first_checkin_local.replace(hour=late_half_h, minute=late_half_m, second=0, microsecond=0)
+    half_day_early_cutoff = first_checkin_local.replace(hour=early_half_h, minute=early_half_m, second=0, microsecond=0)
+    short_leave_early_cutoff = shift_end - timedelta(minutes=early_short_mins)
+
+    # 2. Late Arrival Evaluation
+    late_mins = 0
+    late_off_hours = 0.0
+    is_late = False
+    if first_checkin_local > shift_start:
+        diff_sec = (first_checkin_local - shift_start).total_seconds()
+        raw_late_mins = max(0, int(diff_sec / 60))
+        if first_checkin_local > grace_cutoff:
+            is_late = True
+            late_mins = raw_late_mins
+            late_off_hours = round(late_mins / 60.0, 2)
+        else:
+            # Arrival within grace is fully ON-TIME: zero penalty, zero deficit
+            is_late = False
+            late_mins = 0
+            late_off_hours = 0.0
+
+    # 3. Early Departure Evaluation
+    early_exit_mins = 0
+    early_off_hours = 0.0
+    is_early_leave = False
+    if last_checkout_local:
+        if last_checkout_local < shift_end:
+            diff_sec = (shift_end - last_checkout_local).total_seconds()
+            raw_early_mins = max(0, int(diff_sec / 60))
+            if raw_early_mins > 10:  # 10 mins early checkout grace
+                is_early_leave = True
+                early_exit_mins = raw_early_mins
+                early_off_hours = round(early_exit_mins / 60.0, 2)
+
+    # Total off-hours: waived / zeroed out across the app
+    total_off_hours = 0.0
+    late_off_hours = 0.0
+    early_off_hours = 0.0
+
+    # 4. Status Determination
+    status = "Present"
+    is_short_leave = False
+    is_half_day = False
+    short_leave_type = None
+    half_day_type = None
+    effective_days = 1.0
+    classification_reason = "On-time full day"
+    is_applied_leave = False
+
+    # A) Check if approved applied leave exists for today
+    if approved_leave:
+        dur_type = str(approved_leave.get("duration_type", "")).lower().strip()
+        slot = str(approved_leave.get("short_leave_slot", "")).lower().strip()
+        if dur_type == "short_leave":
+            is_short_leave = True
+            short_leave_type = "applied"
+            is_applied_leave = True
+            status = "Short Leave"
+            slot_label = f" ({slot.title()})" if slot else ""
+            classification_reason = f"Approved Short Leave{slot_label}"
+            if slot == "morning":
+                is_late = False
+                late_mins = 0
+            elif slot == "evening":
+                is_early_leave = False
+                early_exit_mins = 0
+        elif dur_type in ["first_half", "second_half", "half_day"] or approved_leave.get("duration") == 0.5:
+            is_half_day = True
+            half_day_type = f"{dur_type}_applied"
+            is_applied_leave = True
+            status = "Half Day"
+            effective_days = 0.5
+            classification_reason = f"Approved Half Day ({dur_type.replace('_', ' ').title()})"
+            if "first" in dur_type:
+                is_late = False
+                late_mins = 0
+            elif "second" in dur_type:
+                is_early_leave = False
+                early_exit_mins = 0
+
+    # B) Evaluate Half Day thresholds if not already half day or approved leave
+    if not is_half_day and not is_short_leave:
+        if first_checkin_local >= half_day_late_cutoff:
+            is_half_day = True
+            half_day_type = "late_arrival"
+            status = "Half Day"
+            effective_days = 0.5
+            classification_reason = f"Check-in at {first_checkin_local.strftime('%H:%M')} (after Half-Day limit {late_half_str})"
+        elif last_checkout_local and last_checkout_local <= half_day_early_cutoff:
+            is_half_day = True
+            half_day_type = "early_departure"
+            status = "Half Day"
+            effective_days = 0.5
+            classification_reason = f"Check-out at {last_checkout_local.strftime('%H:%M')} (before Half-Day limit {early_half_str})"
+        elif last_checkout_local and 0 < worked_hours < half_day_min_hours:
+            is_half_day = True
+            half_day_type = "low_hours"
+            status = "Half Day"
+            effective_days = 0.5
+            classification_reason = f"Worked {worked_hours:.1f}h (< min half-day requirement {half_day_min_hours:.1f}h)"
+
+    # C) Short Leave is strictly for approved leave applications (never automatic)
+    # D) Fallback states for standard working day
+    if not is_half_day and not is_short_leave:
+        if last_checkout_local and worked_hours >= (full_day_min_hours - 1.0):
+            status = "Present"
+            classification_reason = f"Full day attendance (worked {worked_hours:.1f}h)" if is_late else "On-time full day"
+        elif is_early_leave:
+            status = "Early Leave"
+            classification_reason = f"Left {early_exit_mins} mins early"
+        elif is_late:
+            status = "Late"
+            classification_reason = f"Late check-in by {late_mins} mins"
+        else:
+            status = "Present"
+            classification_reason = "On-time attendance"
+
+    return {
+        "status": status,
+        "is_late": is_late,
+        "is_early_leave": is_early_leave,
+        "is_short_leave": is_short_leave,
+        "is_half_day": is_half_day,
+        "short_leave_type": short_leave_type,
+        "half_day_type": half_day_type,
+        "late_mins": late_mins,
+        "early_exit_mins": early_exit_mins,
+        "late_off_hours": 0.0,
+        "early_off_hours": 0.0,
+        "off_hours": 0.0,
+        "worked_hours": round(worked_hours, 2),
+        "required_hours": round(required_hours, 2),
+        "effective_days": effective_days,
+        "classification_reason": classification_reason,
+        "is_applied_leave": is_applied_leave
     }
 
 
@@ -763,34 +1512,54 @@ async def verify_presence(req: VerifyPresenceRequest):
         )
 
     if emp_type != "field":
-        if target_ssid and req.wifi_ssid and req.wifi_ssid.strip().lower() != target_ssid.strip().lower():
+        clean_req_ssid = req.wifi_ssid.strip().strip('"').strip("'").lower() if req.wifi_ssid else ""
+        clean_target_ssid = target_ssid.strip().strip('"').strip("'").lower() if target_ssid else ""
+        if clean_target_ssid and clean_req_ssid and clean_req_ssid != clean_target_ssid:
              raise HTTPException(status_code=403, detail=f"Must be connected to Office WiFi: {target_ssid}")
         if target_bssid and req.wifi_bssid and req.wifi_bssid.strip().lower() != target_bssid.strip().lower():
              raise HTTPException(status_code=403, detail="Must be connected to Office WiFi Access Point (BSSID mismatch).")
 
     # 5. Determine check-in or check-out (Localized)
     today_start_utc = get_today_start(tz_offset)
+    user_id_str = str(user["_id"])
+    emp_email = user.get("email", req.email)
     last_log = await attendance_logs_collection.find_one(
-        {"user_id": str(user["_id"]), "timestamp": {"$gte": today_start_utc}},
+        {
+            "$or": [
+                {"user_id": user_id_str},
+                {"user_id": emp_email},
+                {"email": emp_email}
+            ],
+            "timestamp": {"$gte": today_start_utc}
+        },
         sort=[("timestamp", -1)]
     )
     attendance_type = "check-out" if (last_log and last_log.get("type") == "check-in") else "check-in"
 
     # 6. Log Attendance
     log = {
-        "user_id": str(user["_id"]),
-        "email": req.email,
+        "user_id": user_id_str,
+        "email": emp_email,
         "timestamp": datetime.now(timezone.utc),
         "type": attendance_type,
         "status": "SUCCESS",
-        "location": {"lat": req.lat, "long": req.long},
+        "location": {"lat": req.get_lat(), "long": req.get_long()},
         "location_name": req.address or "Verified Zone",
         "distance_meters": dist_meters,
         "wifi_info": {"bssid": req.wifi_bssid, "strength": req.wifi_strength},
         "face_confidence": float(distance),
-        "device_id": req.device_id
+        "device_id": req.device_id,
+        "organization_id": str(user.get("organization_id")) if user.get("organization_id") else None,
     }
     await attendance_logs_collection.insert_one(log)
+    await employees_collection.update_one(
+        {"_id": user["_id"]},
+        {"$set": {
+            "checked_in": (attendance_type == "check-in"),
+            "last_attendance_type": attendance_type,
+            "last_attendance_time": log["timestamp"]
+        }}
+    )
 
     return {
         "status": "success",
@@ -803,7 +1572,7 @@ async def verify_presence(req: VerifyPresenceRequest):
 
 
 @app.post("/smart-attendance")
-async def smart_attendance(req: VerifyPresenceRequest, background_tasks: BackgroundTasks):
+async def smart_attendance(req: VerifyPresenceRequest, request: Request, background_tasks: BackgroundTasks):
     """
     Unified endpoint for Enterprise Smart Attendance:
     - DESK: Strict WiFi (80%) + Office Geofence (4m).
@@ -820,36 +1589,64 @@ async def smart_attendance(req: VerifyPresenceRequest, background_tasks: Backgro
         office_wifi_ssid = None
         
         # 1. Identity & Role Fetch
-        clean_email = req.email.strip().lower()
-        user = await employees_collection.find_one({"email": clean_email})
+        clean_email = req.email.strip().lower() if req.email else ""
+        user = await employees_collection.find_one({"email": clean_email}) if clean_email else None
         is_admin_user = False
         
         if not user:
-             # Try 1:N face search if email is unknown/auto
-            new_embedding = get_face_embedding(req.image)
-            if new_embedding is not None:
-                employees = await employees_collection.find({}, {"_id": 1, "face_embedding": 1, "email": 1, "employee_type": 1, "organization_id": 1}).to_list(length=5000)
-                for emp in employees:
-                    if emp.get("face_embedding") and compare_faces(new_embedding, emp["face_embedding"]):
-                        user = emp
-                        break
+            # Try 1:N face search ONLY if email is blank/generic AND embedding is non-dummy
+            if req.image and (not clean_email or clean_email in ["unknown", "auto", ""]):
+                new_embedding = get_face_embedding(req.image)
+                if new_embedding is not None and not is_dummy_embedding(new_embedding):
+                    emp_query = {"face_embedding": {"$ne": None}}
+                    if req.organization_id:
+                        emp_query["organization_id"] = req.organization_id
+                    employees = await employees_collection.find(emp_query, {"_id": 1, "face_embedding": 1, "email": 1, "employee_type": 1, "organization_id": 1}).to_list(length=5000)
+                    for emp in employees:
+                        if emp.get("face_embedding") and not is_dummy_embedding(emp["face_embedding"]) and compare_faces(new_embedding, emp["face_embedding"]):
+                            user = emp
+                            clean_email = emp.get("email", "")
+                            break
             
-            if not user:
+            if not user and clean_email:
                 # Try Admin collection (Admins might be marking attendance for themselves)
                 user = await admins_collection.find_one({"email": clean_email})
                 if user:
                     is_admin_user = True
                     logger.info(f"Admin '{clean_email}' found in admins collection for attendance.")
-                else:
-                    raise HTTPException(status_code=404, detail="Identity not recognized. Please sign in or register.")
+
+            # JWT Bearer Token Fallback: If user still not resolved (blank/generic email from app cold-start),
+            # extract identity from the Authorization header that the mobile app's Axios interceptor always attaches.
+            if not user:
+                auth_header = request.headers.get("authorization", "")
+                if auth_header.startswith("Bearer "):
+                    try:
+                        token = auth_header.split(" ", 1)[1]
+                        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+                        token_email = payload.get("sub", "").strip().lower()
+                        if token_email:
+                            logger.info(f"JWT fallback: Resolved email '{token_email}' from Bearer token (original email was '{clean_email}')")
+                            user = await employees_collection.find_one({"email": token_email})
+                            if not user:
+                                user = await admins_collection.find_one({"email": token_email})
+                                if user:
+                                    is_admin_user = True
+                            if user:
+                                clean_email = token_email
+                    except Exception as jwt_err:
+                        logger.warning(f"JWT fallback failed: {jwt_err}")
+
+            if not user:
+                raise HTTPException(status_code=404, detail="Identity not recognized. Please sign in or register.")
 
         # Identity identified.
-        is_superadmin = (user.get("role") == "superadmin") or (clean_email == os.getenv("ADMIN_EMAIL", "admin@officeflow.ai"))
+        is_reviewer = (clean_email == "google.review@logday.app")
+        is_superadmin = (user.get("role") == "superadmin") or (clean_email == os.getenv("ADMIN_EMAIL", "admin@officeflow.ai")) or is_reviewer
         
         # Fetch settings.
         org_id = user.get("organization_id")
-        org_settings = await settings_collection.find_one({"organization_id": org_id}) if org_id else None
-        settings = org_settings or {}
+        settings = await get_effective_org_settings(org_id)
+        org_settings = settings
         
         emp_type = user.get("employee_type", "desk")
         
@@ -874,8 +1671,14 @@ async def smart_attendance(req: VerifyPresenceRequest, background_tasks: Backgro
         db_wifi_bssid = settings.get("office_wifi_bssid")
         office_wifi_bssid = str(db_wifi_bssid).strip() if (db_wifi_bssid and str(db_wifi_bssid).strip() != "") else os.getenv("OFFICE_WIFI_BSSID", "")
 
-        role = user.get("employee_type", "desk")
-        attendance_type = req.intended_type or "check-in"
+        role = str(user.get("employee_type") or user.get("role") or "desk").lower()
+        attendance_type = "check-in"
+        if req.punch_type in ["out", "check-out", "checkout"] or req.intended_type in ["check-out", "out", "checkout"]:
+            attendance_type = "check-out"
+        elif req.intended_type:
+            attendance_type = req.intended_type
+        elif req.punch_type:
+            attendance_type = req.punch_type
         logger.info(f"Processing {attendance_type.replace('-', ' ').title()} for {user['email']} (Role: {role}, Superadmin: {is_superadmin})")
 
         # Session Validation
@@ -883,25 +1686,40 @@ async def smart_attendance(req: VerifyPresenceRequest, background_tasks: Backgro
         if org_settings:
             tz_offset = org_settings.get("timezone_offset", 330)
         today_start_utc = get_today_start(tz_offset)
-        
-        last_log = await attendance_logs_collection.find_one(
-            {"user_id": str(user["_id"])},
+        user_id_str = str(user["_id"])
+        emp_email = user.get("email", clean_email)
+
+        # --- Query 1: All-time last log (used ONLY for auto-closing stale sessions) ---
+        alltime_last_log = await attendance_logs_collection.find_one(
+            {
+                "$or": [
+                    {"user_id": user_id_str},
+                    {"user_id": emp_email},
+                    {"email": emp_email}
+                ]
+            },
             sort=[("timestamp", -1)]
         )
 
-        # AUTO-CLOSE STALE SESSIONS
-        if last_log and last_log.get("type") == "check-in":
-            last_ts = last_log.get("timestamp")
+        # AUTO-CLOSE STALE SESSIONS (uses all-time log to detect yesterday's open session)
+        if alltime_last_log and alltime_last_log.get("type") == "check-in":
+            last_ts = alltime_last_log.get("timestamp")
             if last_ts and last_ts.tzinfo is None:
                 last_ts = last_ts.replace(tzinfo=timezone.utc)
             if last_ts and last_ts < today_start_utc:
-                auto_checkout_time = last_ts.replace(hour=23, minute=59, second=59) if last_ts.hour < 23 else last_ts + timedelta(seconds=1)
+                local_ts = last_ts + timedelta(minutes=tz_offset)
+                if local_ts.hour < 23:
+                    local_end = local_ts.replace(hour=23, minute=59, second=59, microsecond=0)
+                    auto_checkout_time = local_end - timedelta(minutes=tz_offset)
+                else:
+                    auto_checkout_time = last_ts + timedelta(seconds=1)
                 auto_checkout_log = {
-                    "user_id": str(user["_id"]),
+                    "user_id": user_id_str,
+                    "email": emp_email,
                     "type": "check-out",
                     "timestamp": auto_checkout_time,
-                    "lat": last_log.get("lat", 0),
-                    "long": last_log.get("long", 0),
+                    "lat": alltime_last_log.get("lat", 0),
+                    "long": alltime_last_log.get("long", 0),
                     "location_name": "Auto-closed (missed checkout)",
                     "wifi_bssid": "",
                     "wifi_ssid": "",
@@ -909,9 +1727,24 @@ async def smart_attendance(req: VerifyPresenceRequest, background_tasks: Backgro
                     "organization_id": str(org_id) if org_id else None,
                 }
                 await attendance_logs_collection.insert_one(auto_checkout_log)
-                last_log = auto_checkout_log
+                logger.info(f"[AutoClose] Stale session closed for {user['email']}")
 
-        # State Machine Validation
+        # --- Query 2: Today-only last log (used for state machine validation) ---
+        # This is SEPARATE from the all-time query above so that yesterday's logs
+        # never cause a false "already checked in" error today.
+        last_log = await attendance_logs_collection.find_one(
+            {
+                "$or": [
+                    {"user_id": user_id_str},
+                    {"user_id": emp_email},
+                    {"email": emp_email}
+                ],
+                "timestamp": {"$gte": today_start_utc}
+            },
+            sort=[("timestamp", -1)]
+        )
+
+        # State Machine Validation (only uses today's logs)
         if attendance_type == "check-in":
             if last_log and last_log.get("type") == "check-in":
                 raise HTTPException(status_code=400, detail="You are already checked in. Please check out first.")
@@ -925,7 +1758,7 @@ async def smart_attendance(req: VerifyPresenceRequest, background_tasks: Backgro
                 trigger_alert, "Territory", user.get("email"), user.get("organization_id"), 
                 "Mock Location detected during attendance.", "high", {"lat": req.lat, "long": req.long}
             )
-            raise HTTPException(status_code=403, detail="Security violation: Mock location detected. Attendance rejected.")
+            raise HTTPException(status_code=403, detail="Security violation: Location spoofing/virtualization detected. Attendance rejected.")
 
         # Device Binding Check (Bypass for Superadmin)
         if user.get("device_id") and req.device_id and user["device_id"] != req.device_id:
@@ -938,12 +1771,30 @@ async def smart_attendance(req: VerifyPresenceRequest, background_tasks: Backgro
             else:
                 logger.info(f"Superadmin bypass: Device mismatch ignored.")
 
-        if not user.get("face_embedding") and not is_superadmin:
-            raise HTTPException(status_code=400, detail="Face biometric not enrolled for this user.")
+        has_valid_face = bool(user.get("face_embedding")) and not is_dummy_embedding(user.get("face_embedding"))
+        if not has_valid_face and not is_superadmin and req.image:
+            try:
+                new_emb = get_face_embedding(req.image)
+                if new_emb is not None and not is_dummy_embedding(new_emb):
+                    await employees_collection.update_one(
+                        {"_id": user["_id"]},
+                        {"$set": {
+                            "face_embedding": new_emb,
+                            "needs_face_enrollment": False
+                        }}
+                    )
+                    user["face_embedding"] = new_emb
+                    has_valid_face = True
+                    logger.info(f"Auto-enrolled face biometric for {user.get('email')}")
+            except Exception as emb_err:
+                logger.warning(f"Face auto-enrollment attempt failed: {emb_err}")
+            
+            if not has_valid_face and not is_superadmin and req.client_type != "flyfield":
+                raise HTTPException(status_code=400, detail="Face biometric not enrolled for this user.")
         
-        # Face Verification (Bypass for Superadmin or if no embedding)
+        # Face Verification (Bypass for Superadmin, checkout, or if no image provided)
         distance = 0.0
-        if user.get("face_embedding"):
+        if req.image and user.get("face_embedding") and attendance_type != "check-out":
             is_match, distance = verify_face(req.image, user["face_embedding"])
             if not is_match and not is_superadmin:
                 background_tasks.add_task(
@@ -951,31 +1802,57 @@ async def smart_attendance(req: VerifyPresenceRequest, background_tasks: Backgro
                     f"Face verification failed with confidence distance {distance:.3f}", "medium"
                 )
                 raise HTTPException(status_code=400, detail="Face verification failed. Please ensure your face is clearly visible.")
-
         # 3. Geofence/Territory Logic
         check_in_method = CheckInMethod.GPS_TERRITORY
         is_at_office = False
         office_dist = 9999999
+        req_lat = req.get_lat()
+        req_long = req.get_long()
         if abs(office_lat) > 0.01 or abs(office_long) > 0.01:
-            office_dist = calculate_haversine(req.lat, req.long, float(office_lat), float(office_long))
+            office_dist = calculate_haversine(req_lat, req_long, float(office_lat), float(office_long))
             if office_dist <= float(radius):
                 is_at_office = True
 
-        # GEOFENCE BYPASS for Superadmin
-        if is_superadmin:
-            logger.info("Superadmin bypass: Geofence and Territory checks skipped.")
+        # Check if employee has approved WFH for today
+        now_utc = datetime.now(timezone.utc)
+        local_now = now_utc + timedelta(minutes=tz_offset)
+        today_str = local_now.strftime("%Y-%m-%d")
+        today_date_str = today_str
+
+        wfh_approved = False
+        wfh_req = await wfh_requests_collection.find_one({
+            "employee_email": clean_email,
+            "date": today_str,
+            "status": "approved"
+        })
+        if wfh_req:
+            wfh_approved = True
+
+        is_wfh_or_hybrid = role in ["wfh", "hybrid", EmployeeType.WFH, EmployeeType.HYBRID]
+
+        # GEOFENCE BYPASS for Superadmin or approved WFH or permanent WFH/hybrid
+        if is_superadmin or wfh_approved or is_wfh_or_hybrid:
+            logger.info(f"Geofence bypass: superadmin={is_superadmin}, wfh_approved={wfh_approved}, is_wfh_or_hybrid={is_wfh_or_hybrid}")
             wifi_pct = 100
-            check_in_method = CheckInMethod.WIFI_GEOFENCE
+            check_in_method = CheckInMethod.GPS_TERRITORY
+            # Check WFH device status if permanent WFH or hybrid and device_id is provided
+            if (role in ["wfh", "hybrid", EmployeeType.WFH, EmployeeType.HYBRID]) and req.device_id and not is_superadmin:
+                try:
+                    await verify_wfh_device(str(user["_id"]), str(org_id), req.device_id)
+                except Exception as e:
+                    logger.warning(f"WFH device verification failed: {e}")
         else:
             if role == "desk" or role == EmployeeType.DESK:
                 if not is_at_office:
                      raise HTTPException(
-                         status_code=403, 
-                         detail=f"Location error. You are {office_dist:.1f}m away from office (Limit: {radius}m)."
+                          status_code=403, 
+                          detail=f"Location error. You are {office_dist:.1f}m away from office (Limit: {radius}m)."
                      )
                 
                 is_wifi_ok = True
-                if office_wifi_ssid and (not req.wifi_ssid or req.wifi_ssid.strip().lower() != office_wifi_ssid.strip().lower()):
+                clean_req_ssid = req.wifi_ssid.strip().strip('"').strip("'").lower() if req.wifi_ssid else ""
+                clean_office_ssid = office_wifi_ssid.strip().strip('"').strip("'").lower() if office_wifi_ssid else ""
+                if clean_office_ssid and (not clean_req_ssid or clean_req_ssid != clean_office_ssid):
                     is_wifi_ok = False
                 if office_wifi_bssid and (not req.wifi_bssid or req.wifi_bssid.strip().lower() != office_wifi_bssid.strip().lower()):
                     is_wifi_ok = False
@@ -998,116 +1875,374 @@ async def smart_attendance(req: VerifyPresenceRequest, background_tasks: Backgro
                     await employees_collection.update_one({"_id": user["_id"]}, {"$set": {"gps_otp": None, "gps_otp_expiry": None}})
                     check_in_method = CheckInMethod.OTP_FALLBACK
                 else:
-                    # Territory verification
+                    # Multi-Tier Territory & Plan verification for Field Agents
+                    territory_verified = False
+                    verification_reason = ""
+                    min_distance = 9999999
+
+                    # Check 0: FlyField Mode (Dynamic on-the-fly field staff bypass fixed plan/territory)
+                    if user.get("field_mode") == "flyfield" or req.client_type == "flyfield":
+                        territory_verified = True
+                        verification_reason = "FlyField dynamic agent — location recorded"
+
+                    # Check 1: Polygon Territory (if configured)
+                    t_poly = user.get("territory_polygon")
+                    if user.get("territory_type") == "polygon" and t_poly and len(t_poly) >= 3:
+                        if is_point_in_polygon(req.lat, req.long, t_poly):
+                            territory_verified = True
+                            verification_reason = "Within assigned polygon zone"
+
+                    # Check 2: Circular Radius Territory (if configured)
                     t_lat_val = user.get("territory_center_lat")
                     t_lng_val = user.get("territory_center_lng")
-                    t_lat = float(t_lat_val) if t_lat_val is not None else 0.0
-                    t_lng = float(t_lng_val) if t_lng_val is not None else 0.0
-                    if abs(t_lat) < 0.01 and abs(office_lat) > 0.01:
-                        t_lat, t_lng = office_lat, office_long
-                    t_radius_val = user.get("territory_radius_meters")
-                    t_radius = float(t_radius_val) if t_radius_val is not None else 500.0
-                    dist = calculate_haversine(req.lat, req.long, t_lat, t_lng)
-                    if dist > t_radius:
-                        raise HTTPException(status_code=403, detail=f"Territory Breach. You are {dist:.0f}m away from your assigned zone.")
+                    if not territory_verified and t_lat_val is not None and t_lng_val is not None:
+                        t_lat = float(t_lat_val)
+                        t_lng = float(t_lng_val)
+                        if abs(t_lat) > 0.001 or abs(t_lng) > 0.001:
+                            t_radius = float(user.get("territory_radius_meters") or 5000.0)
+                            dist = calculate_haversine(req.lat, req.long, t_lat, t_lng)
+                            min_distance = min(min_distance, dist)
+                            if dist <= t_radius:
+                                territory_verified = True
+                                verification_reason = f"Within territory radius ({dist:.0f}m from center)"
+
+                    # Check 3: Today's Approved Visit Plan Stops
+                    if not territory_verified:
+                        plan = await visit_plans_collection.find_one({
+                            "$or": [
+                                {"employee_id": clean_email},
+                                {"employee_id": user.get("employee_id")}
+                            ],
+                            "date": today_date_str,
+                            "status": {"$in": ["approved", "submitted"]}
+                        })
+
+                        if plan and plan.get("stops"):
+                            for stop in plan["stops"]:
+                                s_lat = float(stop.get("place_lat", 0) or 0)
+                                s_lng = float(stop.get("place_lng", 0) or 0)
+                                if abs(s_lat) > 0.001:
+                                    s_dist = calculate_haversine(req.lat, req.long, s_lat, s_lng)
+                                    min_distance = min(min_distance, s_dist)
+                                    # Allow within 1000m of any approved stop for Start of Day
+                                    if s_dist <= 1000:
+                                        territory_verified = True
+                                        verification_reason = f"At scheduled visit stop '{stop.get('place_name')}' ({s_dist:.0f}m away)"
+                                        break
+
+                    # Check 4: Office Fallback (if employee territory is not set up at all)
+                    if not territory_verified and (t_lat_val is None or abs(float(t_lat_val)) < 0.001):
+                        if abs(office_lat) > 0.001 or abs(office_long) > 0.001:
+                            dist = calculate_haversine(req.lat, req.long, office_lat, office_long)
+                            min_distance = min(min_distance, dist)
+                            if dist <= float(radius):
+                                territory_verified = True
+                                verification_reason = f"At registered office location ({dist:.0f}m away)"
+
+                    if not territory_verified:
+                        dist_msg = f"{min_distance:.0f}m away" if min_distance < 9000000 else "Outside assigned area"
+                        raise HTTPException(
+                            status_code=403,
+                            detail=f"Territory Breach. You are {dist_msg} from your assigned zone or visit stops. Contact admin for a GPS OTP to bypass."
+                        )
+
+                    logger.info(f"Field agent {clean_email} attendance verified: {verification_reason}")
                     check_in_method = CheckInMethod.GPS_TERRITORY
 
 
-        # 4. Log Attendance (Consolidated)
+
+        # 4. Log Attendance (Consolidated Enterprise Classification)
         attendance_type = req.intended_type or "check-in" # Default or provided
-        
-        is_early_leave = False
-        is_late = False
-        late_mins = 0
-        
+        settings = org_settings or SystemSettings().dict()
+        tz_offset = int(settings.get("timezone_offset", 330))
+        log_time_utc = datetime.now(timezone.utc)
+        current_time_local = log_time_utc + timedelta(minutes=tz_offset)
+        today_date_str = current_time_local.strftime("%Y-%m-%d")
+
+        # Check for approved leave for today (applied short leave, half day, etc.)
+        approved_leave = None
+        try:
+            approved_leave = await leave_requests_collection.find_one({
+                "$or": [
+                    {"employee_id": clean_email},
+                    {"email": clean_email},
+                    {"employee_id": str(user["_id"])}
+                ],
+                "status": {"$regex": "^approved$", "$options": "i"},
+                "start_date": {"$lte": today_date_str},
+                "end_date": {"$gte": today_date_str}
+            })
+        except Exception as e:
+            logger.warning(f"Leave lookup error in attendance: {e}")
+
+        today_start_utc = get_today_start(tz_offset)
+
         if attendance_type == "check-in":
-            # Use org_settings which was fetched at line 833
-            settings = org_settings or SystemSettings().dict()
-            
-            if role == "field":
-                start_time_str = settings.get("field_office_start_time", "10:00")
-                threshold_mins = settings.get("field_late_threshold_mins", 30)
-                tz_offset = settings.get("timezone_offset", 330)
+            classification = classify_attendance_day(
+                first_checkin_local=current_time_local,
+                last_checkout_local=None,
+                worked_hours=0.0,
+                settings=settings,
+                employee_type=role,
+                approved_leave=approved_leave
+            )
+        else: # check-out
+            # Fetch all attendance logs for this employee today (in chronological order)
+            today_logs = await attendance_logs_collection.find(
+                {
+                    "$or": [
+                        {"user_id": user_id_str},
+                        {"user_id": emp_email},
+                        {"email": emp_email}
+                    ],
+                    "timestamp": {"$gte": today_start_utc}
+                }
+            ).sort("timestamp", 1).to_list(100)
+
+            checkin_logs = [l for l in today_logs if l.get("type") in ["check-in", "IN"]]
+            today_first_checkin = checkin_logs[0] if checkin_logs else None
+
+            # Calculate paired worked hours across all sessions today plus this checkout
+            worked_sec = 0.0
+            last_in = None
+            for l in today_logs:
+                l_ts = l["timestamp"]
+                if l_ts.tzinfo is None: l_ts = l_ts.replace(tzinfo=timezone.utc)
+                l_type = l.get("type")
+                if l_type in ["check-in", "IN"]:
+                    last_in = l_ts
+                elif l_type in ["check-out", "OUT"] and last_in:
+                    worked_sec += max(0.0, (l_ts - last_in).total_seconds())
+                    last_in = None
+
+            # Add current checkout session
+            if last_in:
+                worked_sec += max(0.0, (log_time_utc - last_in).total_seconds())
+            elif today_first_checkin:
+                # Fallback if intermediate in/out was missing
+                f_ts = today_first_checkin["timestamp"]
+                if f_ts.tzinfo is None: f_ts = f_ts.replace(tzinfo=timezone.utc)
+                worked_sec = max(0.0, (log_time_utc - f_ts).total_seconds())
+
+            if today_first_checkin:
+                f_ts = today_first_checkin["timestamp"]
+                if f_ts.tzinfo is None: f_ts = f_ts.replace(tzinfo=timezone.utc)
+                first_checkin_local = f_ts + timedelta(minutes=tz_offset)
             else:
-                # Desk: Dynamic from Database with defaults
-                start_time_str = settings.get("office_start_time", "10:00")
-                threshold_mins = settings.get("late_threshold_mins", 15)
-                tz_offset = settings.get("timezone_offset", 330)
-            
-            try:
-                log_time_utc = datetime.now(timezone.utc)
-                current_time_local = log_time_utc + timedelta(minutes=tz_offset)
-                
-                # Limit time for today
-                start_h, start_m = map(int, start_time_str.split(":"))
-                limit_time = current_time_local.replace(hour=start_h, minute=start_m, second=0, microsecond=0) + timedelta(minutes=threshold_mins)
-                
-                if current_time_local > limit_time:
-                    is_late = True
-                    diff = current_time_local - current_time_local.replace(hour=start_h, minute=start_m, second=0, microsecond=0)
-                    late_mins = int(diff.total_seconds() / 60)
-            except Exception as e:
-                logger.error(f"Error calculating lateness: {e}")
-                
-        elif attendance_type == "check-out":
-            # Check for early leave
-            settings = org_settings or SystemSettings().dict()
-            if role == "field":
-                end_time_str = settings.get("field_office_end_time", "18:00")
-                tz_offset = settings.get("timezone_offset", 330)
+                first_checkin_local = current_time_local
+
+            worked_hours = round(worked_sec / 3600.0, 2)
+
+            classification = classify_attendance_day(
+                first_checkin_local=first_checkin_local,
+                last_checkout_local=current_time_local,
+                worked_hours=worked_hours,
+                settings=settings,
+                employee_type=role,
+                approved_leave=approved_leave
+            )
+
+            # Retroactively update today's first check-in log with final status metadata without corrupting check-in reason
+            if today_first_checkin:
+                checkin_upd = {
+                    "is_half_day": classification["is_half_day"],
+                    "half_day_type": classification["half_day_type"],
+                    "off_hours": 0.0,
+                    "late_off_hours": 0.0,
+                    "early_off_hours": 0.0,
+                    "is_short_leave": classification["is_short_leave"],
+                    "short_leave_type": classification["short_leave_type"],
+                    "effective_days": classification["effective_days"]
+                }
+                if classification.get("is_applied_leave"):
+                    checkin_upd["attendance_status"] = classification["status"]
+                    checkin_upd["is_applied_leave"] = True
+                await attendance_logs_collection.update_one(
+                    {"_id": today_first_checkin["_id"]},
+                    {"$set": checkin_upd}
+                )
+
+        # Determine unified attendance type
+        att_type_val = AttendanceType.REMOTE_FIELD
+        if wfh_approved or role == EmployeeType.WFH or role == "wfh":
+            att_type_val = AttendanceType.WFH
+        elif role == EmployeeType.DESK or role == "desk":
+            att_type_val = AttendanceType.OFFICE
+
+        # Location name & real physical address resolution
+        loc_name_val = req.address
+        if not loc_name_val or not any(c.isalpha() for c in str(loc_name_val)):
+            if role == EmployeeType.DESK and not wfh_approved:
+                loc_name_val = "Office Zone"
+            elif wfh_approved or role in [EmployeeType.WFH, "wfh"]:
+                loc_name_val = "Remote Workspace"
             else:
-                # Desk: Dynamic from Database with defaults
-                end_time_str = settings.get("office_end_time", "18:00")
-                tz_offset = settings.get("timezone_offset", 330)
-                
-            try:
-                log_time_utc = datetime.now(timezone.utc)
-                current_time_local = log_time_utc + timedelta(minutes=tz_offset)
-                end_h, end_m = map(int, end_time_str.split(":"))
-                
-                # Assume grace of 10 minutes (e.g. 17:50)
-                early_limit_time = current_time_local.replace(hour=end_h, minute=end_m, second=0, microsecond=0) - timedelta(minutes=10)
-                
-                if current_time_local < early_limit_time:
-                    is_early_leave = True
-            except Exception as e:
-                logger.error(f"Error calculating early checkout: {e}")
+                from flyfield import resolve_real_address
+                loc_name_val = await resolve_real_address(req.lat, req.long, req.address)
+
+        wfh_session_id = None
+        if wfh_approved or role == EmployeeType.WFH or role == "wfh":
+            if attendance_type == "check-in":
+                active_session = await wfh_sessions_collection.find_one({
+                    "employee_id": str(user["_id"]),
+                    "organization_id": org_id,
+                    "status": "active"
+                })
+                if not active_session:
+                    now_val = datetime.now(timezone.utc)
+                    today_val = now_val.strftime("%Y-%m-%d")
+                    session_doc = {
+                        "employee_id": str(user["_id"]),
+                        "employee_email": clean_email,
+                        "employee_name": user.get("full_name", ""),
+                        "organization_id": org_id,
+                        "device_id": req.device_id,
+                        "date": today_val,
+                        "check_in_time": now_val,
+                        "check_out_time": None,
+                        "status": "active",
+                        "check_in_face_verified": True,
+                        "face_distance": float(distance),
+                        "total_active_seconds": 0,
+                        "total_idle_seconds": 0,
+                        "productivity_score": 0,
+                        "created_at": now_val,
+                        "updated_at": now_val,
+                        "metadata": {}
+                    }
+                    result = await wfh_sessions_collection.insert_one(session_doc)
+                    wfh_session_id = str(result.inserted_id)
+                else:
+                    wfh_session_id = str(active_session["_id"])
+            elif attendance_type == "check-out":
+                session = await wfh_sessions_collection.find_one({
+                    "employee_id": str(user["_id"]),
+                    "organization_id": org_id,
+                    "status": "active"
+                })
+                if session:
+                    now_val = datetime.now(timezone.utc)
+                    check_in_time_val = session.get("check_in_time")
+                    total_seconds_val = 0
+                    if check_in_time_val:
+                        if check_in_time_val.tzinfo is None:
+                            check_in_time_val = check_in_time_val.replace(tzinfo=timezone.utc)
+                        total_seconds_val = int((now_val - check_in_time_val).total_seconds())
+                    await wfh_sessions_collection.update_one(
+                        {"_id": session["_id"]},
+                        {
+                            "$set": {
+                                "status": "completed",
+                                "check_out_time": now_val,
+                                "total_active_seconds": total_seconds_val,
+                                "updated_at": now_val
+                            }
+                        }
+                    )
+                    wfh_session_id = str(session["_id"])
 
         log = {
             "user_id": str(user["_id"]),
             "email": user["email"],
             "organization_id": user.get("organization_id"),
-            "timestamp": datetime.now(timezone.utc),
+            "timestamp": log_time_utc,
             "type": attendance_type,
-            "attendance_type": AttendanceType.OFFICE if role == EmployeeType.DESK else AttendanceType.REMOTE_FIELD,
+            "attendance_type": att_type_val,
+            "attendance_status": classification["status"],
+            "is_late": classification["is_late"],
+            "is_early_leave": classification["is_early_leave"],
+            "is_short_leave": classification["is_short_leave"],
+            "is_half_day": classification["is_half_day"],
+            "short_leave_type": classification["short_leave_type"],
+            "half_day_type": classification["half_day_type"],
+            "late_mins": classification["late_mins"],
+            "early_exit_mins": classification["early_exit_mins"],
+            "late_off_hours": classification["late_off_hours"],
+            "early_off_hours": classification["early_off_hours"],
+            "off_hours": classification["off_hours"],
+            "worked_hours": classification["worked_hours"],
+            "required_hours": classification["required_hours"],
+            "effective_days": classification["effective_days"],
+            "classification_reason": classification["classification_reason"],
+            "is_applied_leave": classification["is_applied_leave"],
             "location": {"lat": req.lat, "long": req.long},
             "check_in_method": check_in_method,
-            "is_late": is_late,
-            "is_early_leave": is_early_leave,
-            "late_mins": max(0, late_mins),
             "wifi_confidence": wifi_pct if role == EmployeeType.DESK else 0,
             "confidence_score": float(distance),
             "status": "SUCCESS",
-            "location_name": req.address or ("Office Zone" if role == EmployeeType.DESK else "Field Location"),
+            "location_name": loc_name_val,
+            "address": loc_name_val,
+            "field_mode": user.get("field_mode"),
             "selfie_verified": True,
             "device_id": req.device_id,
             "mock_location_detected": req.mock_detected
         }
+        if wfh_session_id:
+            log["wfh_session_id"] = wfh_session_id
         
         await attendance_logs_collection.insert_one(log)
-        
+        await employees_collection.update_one(
+            {"_id": user["_id"]},
+            {"$set": {
+                "checked_in": (attendance_type == "check-in"),
+                "last_attendance_type": attendance_type,
+                "last_attendance_time": log["timestamp"],
+                "last_attendance_status": classification["status"]
+            }}
+        )
+
         # Trigger Background Sync to Google Sheets
         background_tasks.add_task(sync_to_google_sheets, log)
         
+        policy = None
+        if (role == EmployeeType.WFH or role == "wfh") and attendance_type == "check-in":
+            try:
+                org = await organizations_collection.find_one({"_id": ObjectId(org_id)})
+                if org:
+                    policy = org.get("wfh_policy")
+            except Exception as e:
+                logger.error(f"Error fetching policy in smart checkin: {e}")
+                
+            if not policy:
+                policy = {
+                    "screenshot_interval_minutes": 10,
+                    "face_check_interval_minutes": 30,
+                    "max_idle_minutes": 20,
+                    "productivity_threshold_percent": 60,
+                    "working_hours_start": "09:00",
+                    "working_hours_end": "18:00",
+                    "screenshot_retention_days": 5,
+                    "require_face_verification": True,
+                    "productive_apps": [],
+                    "unproductive_apps": []
+                }
+                
         return {
             "status": "success",
             "type": attendance_type,
             "current_status": attendance_type, # Provide immediate state for UI sync
-            "message": f"Attendance {attendance_type.replace('-', ' ').title()} Successful. Verified via {check_in_method.value.replace('_', ' ').title()}.",
+            "attendance_status": classification["status"],
+            "is_late": classification["is_late"],
+            "is_early_leave": classification["is_early_leave"],
+            "is_short_leave": classification["is_short_leave"],
+            "is_half_day": classification["is_half_day"],
+            "short_leave_type": classification["short_leave_type"],
+            "half_day_type": classification["half_day_type"],
+            "late_mins": classification["late_mins"],
+            "early_exit_mins": classification["early_exit_mins"],
+            "late_off_hours": classification["late_off_hours"],
+            "early_off_hours": classification["early_off_hours"],
+            "off_hours": classification["off_hours"],
+            "worked_hours": classification["worked_hours"],
+            "required_hours": classification["required_hours"],
+            "effective_days": classification["effective_days"],
+            "classification_reason": classification["classification_reason"],
+            "is_applied_leave": classification["is_applied_leave"],
+            "message": f"Attendance {attendance_type.replace('-', ' ').title()} Recorded: {classification['status']} ({classification['classification_reason']})",
             "time": log["timestamp"].isoformat(),
-            "is_late": is_late,
-            "is_early_leave": is_early_leave,
-            "wifi_confidence": wifi_pct
+            "wifi_confidence": wifi_pct,
+            "wfh_session_id": wfh_session_id,
+            "wfh_policy": policy
         }
 
     except HTTPException:
@@ -1141,19 +2276,35 @@ def calculate_haversine(lat1, lon1, lat2, lon2):
 
 
 def is_point_in_polygon(lat: float, lng: float, polygon: list) -> bool:
-    """Ray-casting algorithm to check if a point is inside a polygon.
-    polygon: list of dicts with 'lat' and 'lng' keys.
-    """
-    n = len(polygon)
-    inside = False
-    j = n - 1
-    for i in range(n):
-        xi, yi = polygon[i]["lat"], polygon[i]["lng"]
-        xj, yj = polygon[j]["lat"], polygon[j]["lng"]
-        if ((yi > lng) != (yj > lng)) and (lat < (xj - xi) * (lng - yi) / (yj - yi) + xi):
-            inside = not inside
-        j = i
-    return inside
+    """Ray-casting algorithm to check if a point is inside a polygon."""
+    if not polygon or len(polygon) < 3:
+        return False
+    try:
+        lat = float(lat)
+        lng = float(lng)
+        n = len(polygon)
+        inside = False
+        j = n - 1
+        for i in range(n):
+            pi = polygon[i]
+            pj = polygon[j]
+            if isinstance(pi, (list, tuple)):
+                xi, yi = float(pi[0]), float(pi[1])
+            else:
+                xi = float(pi.get("lat", pi.get("latitude", 0)))
+                yi = float(pi.get("lng", pi.get("longitude", 0)))
+            if isinstance(pj, (list, tuple)):
+                xj, yj = float(pj[0]), float(pj[1])
+            else:
+                xj = float(pj.get("lat", pj.get("latitude", 0)))
+                yj = float(pj.get("lng", pj.get("longitude", 0)))
+            if ((yi > lng) != (yj > lng)) and (abs(yj - yi) > 1e-9) and (lat < (xj - xi) * (lng - yi) / (yj - yi) + xi):
+                inside = not inside
+            j = i
+        return inside
+    except Exception as e:
+        logger.warning(f"Polygon point test error: {e}")
+        return False
 
 
 def attendance_type_str(val):
@@ -1165,14 +2316,26 @@ def attendance_type_str(val):
 @app.get("/api/logs/{email}")
 async def get_logs(email: str, page: int = 1, limit: int = 50, start_date: Optional[str] = None, end_date: Optional[str] = None, current_user: dict = Depends(get_current_employee)):
     """Get attendance logs for a user with date filters and pagination (JWT Protected)."""
-    if current_user["email"] != email:
+    if current_user["email"].strip().lower() != email.strip().lower():
         raise HTTPException(status_code=403, detail="Forbidden: You can only access your own logs.")
 
-    user = await employees_collection.find_one({"email": email})
+    user = await employees_collection.find_one({
+        "$or": [
+            {"email": email.strip().lower()},
+            {"email": email.strip()}
+        ]
+    })
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    query = {"user_id": str(user["_id"])}
+    user_id_str = str(user["_id"])
+    query = {
+        "$or": [
+            {"user_id": user_id_str},
+            {"user_id": email},
+            {"email": email}
+        ]
+    }
     
     if start_date or end_date:
         time_filter = {}
@@ -1229,9 +2392,16 @@ async def get_employee_profile(current_user: dict = Depends(get_current_employee
             tz_offset = org_settings.get("timezone_offset", 330)
 
     today_start_utc = get_today_start(tz_offset)
+    user_id_str = str(user["_id"])
+    emp_email = user.get("email", "")
+
     last_log = await attendance_logs_collection.find_one(
         {
-            "user_id": str(user["_id"]),
+            "$or": [
+                {"user_id": user_id_str},
+                {"user_id": emp_email},
+                {"email": emp_email}
+            ],
             "timestamp": {"$gte": today_start_utc}
         },
         sort=[("timestamp", -1)]
@@ -1247,8 +2417,8 @@ async def get_employee_profile(current_user: dict = Depends(get_current_employee
         "designation": user.get("designation"),
         "employee_type": user.get("employee_type"),
         "profile_image": user.get("profile_image"),
-        "has_face_data": bool(user.get("face_embedding")),
-        "needs_face_enrollment": user.get("face_embedding") is None,
+        "has_face_data": bool(user.get("face_embedding")) and not is_dummy_embedding(user.get("face_embedding")),
+        "needs_face_enrollment": (user.get("face_embedding") is None) or is_dummy_embedding(user.get("face_embedding")),
         "organization_id": str(user.get("organization_id", "")),
         "is_manager": user.get("is_manager", False),
         "status": user.get("status", "Active"),
@@ -1279,7 +2449,13 @@ async def get_my_analytics(current_user: dict = Depends(get_current_employee)):
 
         # 1. Determine Status FIRST (Highest Priority for UI Sync)
         latest_log = await attendance_logs_collection.find_one(
-            {"user_id": user_id_str},
+            {
+                "$or": [
+                    {"user_id": user_id_str},
+                    {"user_id": user_email},
+                    {"email": user_email}
+                ]
+            },
             sort=[("timestamp", -1)]
         )
         
@@ -1294,17 +2470,17 @@ async def get_my_analytics(current_user: dict = Depends(get_current_employee)):
                     current_status = "check-in"
             else:
                 current_status = "check-out"
-            org_settings = await settings_collection.find_one({"organization_id": str(org_id) if ObjectId.is_valid(str(org_id)) else org_id})
-            if org_settings:
-                tz_offset = org_settings.get("timezone_offset", 330)
 
-        today_start = get_today_start(tz_offset)
         week_start = today_start - timedelta(days=today_start.weekday())
         month_start = today_start.replace(day=1)
 
         # Get logs for calculation
         all_logs = await attendance_logs_collection.find({
-            "user_id": str(user["_id"]),
+            "$or": [
+                {"user_id": user_id_str},
+                {"user_id": user_email},
+                {"email": user_email}
+            ],
             "timestamp": {"$gte": week_start}
         }).sort("timestamp", 1).to_list(length=1000)
 
@@ -1344,24 +2520,33 @@ async def get_my_analytics(current_user: dict = Depends(get_current_employee)):
         
         # Month hours (Separate query for performance)
         month_logs = await attendance_logs_collection.find({
-            "user_id": str(user["_id"]),
+            "$or": [
+                {"user_id": user_id_str},
+                {"user_id": user_email},
+                {"email": user_email}
+            ],
             "timestamp": {"$gte": month_start}
         }).to_list(length=2000)
         month_hours = await calculate_hours(month_logs)
 
         # On-time count
         on_time_count = 0
+        user_type = user.get("employee_type", "desk")
+        org_doc = None
+        if org_id:
+            try:
+                org_doc = await settings_collection.find_one({"organization_id": str(org_id) if ObjectId.is_valid(str(org_id)) else org_id})
+            except Exception: pass
+
+        if user_type == "field":
+            start_time_str = (org_doc or {}).get("field_office_start_time", "10:00")
+            threshold_mins = int((org_doc or {}).get("field_late_grace_mins") or (org_doc or {}).get("field_late_threshold_mins", 30))
+        else:
+            start_time_str = (org_doc or {}).get("office_start_time", "09:00")
+            threshold_mins = int((org_doc or {}).get("late_grace_mins") or (org_doc or {}).get("late_threshold_mins", 15))
+
         for log in aware_logs:
             if "in" in log.get("type", "").lower():
-                user_type = user.get("employee_type", "desk")
-                start_time_str = "10:00"
-                threshold_mins = 15
-                if user_type == "field" and org_id:
-                    org_doc = await settings_collection.find_one({"organization_id": str(org_id) if ObjectId.is_valid(str(org_id)) else org_id})
-                    if org_doc:
-                        start_time_str = org_doc.get("field_office_start_time", "10:00")
-                        threshold_mins = org_doc.get("field_late_threshold_mins", 30)
-                
                 try:
                     start_h, start_m = map(int, start_time_str.split(":"))
                     local_log_time = log["aware_ts"] + timedelta(minutes=tz_offset)
@@ -1372,7 +2557,13 @@ async def get_my_analytics(current_user: dict = Depends(get_current_employee)):
 
         # Latest history
         history_cursor = attendance_logs_collection.find(
-            {"user_id": str(user["_id"])}
+            {
+                "$or": [
+                    {"user_id": user_id_str},
+                    {"user_id": user_email},
+                    {"email": user_email}
+                ]
+            }
         ).sort("timestamp", -1).limit(5)
         history = await history_cursor.to_list(length=5)
         for h in history:
@@ -1380,26 +2571,77 @@ async def get_my_analytics(current_user: dict = Depends(get_current_employee)):
             if "timestamp" in h and isinstance(h["timestamp"], datetime):
                 h["timestamp"] = h["timestamp"].isoformat()
 
-        # Absolute Status Sync
-        latest_log = await attendance_logs_collection.find_one(
-            {"user_id": str(user["_id"])},
-            sort=[("timestamp", -1)]
+
+        # NOTE: current_status was already determined by the first latest_log query above.
+        # The previous "Absolute Status Sync" block here was a redundant duplicate DB query
+        # that re-fetched latest_log and overwrote current_status — removed to save one DB round-trip.
+        
+
+        # Resolve per-org WiFi SSID from DB (fallback to global env var)
+        # Bug fix: was always returning global OFFICE_WIFI_SSID env var, ignoring per-org DB value
+        org_wifi_ssid = os.getenv("OFFICE_WIFI_SSID", "")
+        if org_id:
+            try:
+                _wifi_settings = await settings_collection.find_one(
+                    {"organization_id": str(org_id) if ObjectId.is_valid(str(org_id)) else org_id},
+                    {"office_wifi_ssid": 1}
+                )
+                if _wifi_settings and _wifi_settings.get("office_wifi_ssid"):
+                    org_wifi_ssid = str(_wifi_settings["office_wifi_ssid"]).strip()
+            except Exception:
+                pass  # Fallback to env var is fine
+
+        # Upcoming Holidays
+        today_str = (datetime.now(timezone.utc) + timedelta(minutes=tz_offset)).strftime("%Y-%m-%d")
+        holiday_cursor = holidays_collection.find({
+            "$or": [
+                {"organization_id": org_id, "date": {"$gte": today_str}},
+                {"organization_id": "system_org", "date": {"$gte": today_str}}
+            ]
+        }).sort("date", 1).limit(5)
+        upcoming_holidays_raw = await holiday_cursor.to_list(length=5)
+        upcoming_holidays = [
+            {"date": h.get("date"), "name": h.get("name"), "type": h.get("holiday_type", "festival")}
+            for h in upcoming_holidays_raw
+        ]
+
+        # Leave balance
+        leave_balance = await calculate_leave_balance(user_email, org_id or "system_org")
+
+        # Today's attendance classification
+        today_first_checkin = next((l for l in today_logs if l.get("type") == "check-in"), None)
+        today_last_checkout = next((l for l in reversed(today_logs) if l.get("type") == "check-out"), None)
+        
+        first_in_local = (today_first_checkin["aware_ts"] + timedelta(minutes=tz_offset)) if today_first_checkin else None
+        last_out_local = (today_last_checkout["aware_ts"] + timedelta(minutes=tz_offset)) if today_last_checkout else None
+
+        # Check if user has approved leave for today
+        today_approved_leave = None
+        try:
+            today_approved_leave = await leave_requests_collection.find_one({
+                "$or": [
+                    {"employee_id": user_email.lower().strip()},
+                    {"email": user_email.lower().strip()},
+                    {"employee_id": str(user["_id"])}
+                ],
+                "status": {"$regex": "^approved$", "$options": "i"},
+                "start_date": {"$lte": today_str},
+                "end_date": {"$gte": today_str}
+            })
+        except Exception:
+            pass
+
+        org_settings_doc = await get_effective_org_settings(org_id) if org_id else {}
+
+        today_classification = classify_attendance_day(
+            first_checkin_local=first_in_local,
+            last_checkout_local=last_out_local,
+            worked_hours=today_hours,
+            settings=org_settings_doc or {},
+            employee_type=user.get("employee_type", "desk"),
+            approved_leave=today_approved_leave
         )
-        
-        current_status = "check-out"
-        if latest_log:
-            log_type = latest_log.get("type", "check-out")
-            if log_type == "check-in":
-                l_ts = latest_log["timestamp"]
-                if l_ts.tzinfo is None: l_ts = l_ts.replace(tzinfo=timezone.utc)
-                if l_ts < today_start:
-                    current_status = "check-out" # Stale
-                    logger.info(f"[Analytics] Stale session auto-closed for {user['email']}")
-                else:
-                    current_status = "check-in"
-            else:
-                current_status = log_type
-        
+
         return {
             "email": user["email"],
             "today_hours": today_hours,
@@ -1407,8 +2649,22 @@ async def get_my_analytics(current_user: dict = Depends(get_current_employee)):
             "month_total": month_hours,
             "on_time_count": on_time_count,
             "current_status": current_status,
+            "today_attendance_status": today_classification["status"],
+            "is_short_leave": today_classification["is_short_leave"],
+            "is_half_day": today_classification["is_half_day"],
+            "is_late": today_classification["is_late"],
+            "is_early_leave": today_classification["is_early_leave"],
+            "late_mins": today_classification["late_mins"],
+            "early_exit_mins": today_classification["early_exit_mins"],
+            "late_off_hours": today_classification["late_off_hours"],
+            "early_off_hours": today_classification["early_off_hours"],
+            "off_hours": today_classification["off_hours"],
+            "classification_reason": today_classification["classification_reason"],
+            "is_applied_leave": today_classification["is_applied_leave"],
             "history": history,
-            "office_wifi_ssid": os.getenv("OFFICE_WIFI_SSID", "")
+            "office_wifi_ssid": org_wifi_ssid,
+            "upcoming_holidays": upcoming_holidays,
+            "leave_balance": leave_balance
         }
     except Exception as e:
         logger.error(f"Analytics Error: {str(e)}", exc_info=True)
@@ -1827,7 +3083,7 @@ async def list_sub_admins(current_admin: Admin = Depends(get_current_admin)):
     if current_admin.role not in ["owner", "superadmin", "admin"]:
         raise HTTPException(status_code=403, detail="Only organization owners/admins can manage the admin team.")
     
-    query = {"organization_id": current_admin.organization_id}
+    query = {} if _is_superadmin(current_admin) else {"organization_id": current_admin.organization_id}
     cursor = admins_collection.find(query, {"hashed_password": 0})
     admins = await cursor.to_list(length=100)
     for a in admins:
@@ -1854,7 +3110,7 @@ async def create_sub_admin(req: SubAdminCreate, current_admin: Admin = Depends(g
         "hashed_password": hashed_password,
         "full_name": req.full_name,
         "role": req.role if hasattr(req, 'role') and req.role else "admin",
-        "organization_id": current_admin.organization_id,
+        "organization_id": req.organization_id if (req.organization_id and _is_superadmin(current_admin)) else current_admin.organization_id,
         "created_at": datetime.now(timezone.utc),
         "allowed_features": ["dashboard", "employees", "attendance", "leaves", "expenses", "reports", "war_room", "territory", "nudge", "leaderboard"]
     }
@@ -1871,15 +3127,18 @@ async def delete_sub_admin(email: str, current_admin: Admin = Depends(get_curren
     if email == current_admin.email:
         raise HTTPException(status_code=400, detail="You cannot delete yourself.")
         
-    # Security: Ensure we only delete admins from the same organization and who are NOT owners
-    result = await admins_collection.delete_one({
-        "email": email,
-        "organization_id": current_admin.organization_id,
-        "role": "admin" # Can only delete sub-admins, not owners
-    })
-    
-    if result.deleted_count == 0:
-        raise HTTPException(status_code=404, detail="Sub-admin not found, or you don't have permission to delete this account.")
+    # Security: Ensure we only delete admins from the same organization and who are NOT owners/superadmins
+    target_admin = await admins_collection.find_one({"email": email})
+    if not target_admin:
+        raise HTTPException(status_code=404, detail="Sub-admin not found.")
+        
+    if not _is_superadmin(current_admin) and target_admin.get("organization_id") != current_admin.organization_id:
+        raise HTTPException(status_code=403, detail="You do not have permission to delete this account.")
+        
+    if target_admin.get("role") in ["owner", "superadmin"]:
+        raise HTTPException(status_code=403, detail="You cannot delete an owner or superadmin account.")
+        
+    await admins_collection.delete_one({"_id": target_admin["_id"]})
         
     return {"message": f"Admin {email} removed successfully."}
 
@@ -1914,8 +3173,11 @@ async def update_sub_admin_permissions(email: str, req: dict, current_admin: Adm
     if role:
         update_fields["role"] = role
     
+    perm_query = {"email": email}
+    if not _is_superadmin(current_admin):
+        perm_query["organization_id"] = current_admin.organization_id
     result = await admins_collection.update_one(
-        {"email": email, "organization_id": current_admin.organization_id},
+        perm_query,
         {"$set": update_fields}
     )
     if result.matched_count == 0:
@@ -1962,7 +3224,36 @@ async def admin_update_employee(email: str, req: EmployeeUpdate, current_admin: 
     return {"message": "Employee updated successfully"}
 
 
+@app.get("/admin/hrms/stats")
+async def get_hrms_stats(current_admin: Admin = Depends(get_current_admin)):
+    org_id = current_admin.organization_id
+    org_filter = {"organization_id": org_id} if (org_id and not _is_superadmin(current_admin)) else {}
+    
+    current_month = datetime.now(timezone.utc).strftime("%Y-%m")
+    
+    onboarding_active = await onboardings_collection.count_documents({
+        **org_filter,
+        "status": {"$in": ["pending", "in_progress"]}
+    })
+    payroll_pending = await payrolls_collection.count_documents({
+        **org_filter,
+        "status": "draft",
+        "payroll_month": current_month
+    })
+    exits_active = await exit_managements_collection.count_documents({
+        **org_filter,
+        "status": {"$in": ["pending", "in_progress"]}
+    })
+    
+    return {
+        "onboarding_active": onboarding_active,
+        "payroll_pending": payroll_pending,
+        "exits_active": exits_active
+    }
+
+
 @app.post("/admin/employees/bulk-update-type")
+
 async def admin_bulk_update_employee_type(req: dict, current_admin: Admin = Depends(get_current_admin)):
     """Bulk update employee work type (desk/field/office)"""
     emails = [e.lower().strip() for e in req.get("employee_emails", [])]
@@ -1971,8 +3262,11 @@ async def admin_bulk_update_employee_type(req: dict, current_admin: Admin = Depe
     if not emails or not new_type:
         raise HTTPException(status_code=400, detail="employee_emails and employee_type are required")
         
+    bulk_query = {"email": {"$in": emails}}
+    if not _is_superadmin(current_admin):
+        bulk_query["organization_id"] = current_admin.organization_id
     result = await employees_collection.update_many(
-        {"email": {"$in": emails}, "organization_id": current_admin.organization_id},
+        bulk_query,
         {"$set": {"employee_type": new_type}}
     )
     
@@ -1983,7 +3277,7 @@ async def admin_bulk_update_employee_type(req: dict, current_admin: Admin = Depe
 async def admin_delete_employee(email: str, current_admin: Admin = Depends(get_current_admin)):
     """Remove an employee and their logs."""
     query = {"email": email}
-    if current_admin.organization_id:
+    if current_admin.organization_id and not _is_superadmin(current_admin):
         query["organization_id"] = current_admin.organization_id
         
     user = await employees_collection.find_one(query)
@@ -2015,7 +3309,8 @@ async def admin_all_logs(
     else:
         # For non-manager admins, we still need to filter by org usually
         # but our helper handles that mapping based on roles
-        org_employees = await employees_collection.find({"organization_id": current_admin.organization_id}, {"_id": 1}).to_list(None)
+        log_emp_filter = get_employee_filter(current_admin)
+        org_employees = await employees_collection.find(log_emp_filter, {"_id": 1}).to_list(None)
         org_emp_ids = [str(emp["_id"]) for emp in org_employees]
         log_query = {"user_id": {"$in": org_emp_ids}}
 
@@ -2084,8 +3379,10 @@ async def admin_create_employee(req: RegisterRequest, current_admin: Admin = Dep
         "created_at": datetime.now(timezone.utc),
         "needs_face_enrollment": True if not embedding else False,
         "employee_type": req.employee_type,
-        "organization_id": current_admin.organization_id, # Bind to admin's org
+        "field_mode": getattr(req, "field_mode", "planned") or "planned",
+        "organization_id": req.organization_id if (req.organization_id and _is_superadmin(current_admin)) else current_admin.organization_id,  # Superadmin can target any org
         "force_password_change": True,  # Employee must set their own password on first desk login
+        "status": "Active"
     }
 
     await employees_collection.insert_one(employee_dict)
@@ -2158,11 +3455,15 @@ async def admin_clear_binding(email: str, current_admin: Admin = Depends(get_cur
 
 
 # --- HELPER FUNCTIONS ---
+def _is_superadmin(admin: Admin) -> bool:
+    """Check if admin is a superadmin (by role or system_org binding)."""
+    return admin.role == AdminRole.SUPERADMIN or admin.organization_id == "system_org"
+
 def get_employee_filter(current_admin: Admin):
     """Returns a MongoDB filter based on admin role for multi-tenant segmenting."""
     org_id = current_admin.organization_id
-    if not org_id:
-        # Fallback for superadmin without org
+    if not org_id or _is_superadmin(current_admin):
+        # Superadmin / system_org sees all organizations
         return {}
     
     role = current_admin.role
@@ -2362,16 +3663,14 @@ async def get_public_settings(request: Request):
 
 
 @app.get("/organizations/search")
-async def search_organizations(q: str = ""):
+async def search_organizations(q: str):
     """Public search for organizations by name or slug."""
-    import re
-    clean_q = q.strip() if q else ""
-    logger.info(f"[SEARCH] Query received: '{clean_q}'")
-    if not clean_q or len(clean_q) < 2:
+    logger.info(f"[SEARCH] Query received: '{q}'")
+    if not q or len(q) < 2:
         return []
         
-    # Case-insensitive partial match (escaped for regex safety)
-    regex_query = {"$regex": re.escape(clean_q), "$options": "i"}
+    # Case-insensitive partial match
+    regex_query = {"$regex": q, "$options": "i"}
     query = {
         "$or": [
             {"name": regex_query},
@@ -2379,20 +3678,17 @@ async def search_organizations(q: str = ""):
         ]
     }
     
-    cursor = organizations_collection.find(query).limit(15)
-    orgs = await cursor.to_list(length=15)
+    cursor = organizations_collection.find(query).limit(5)
+    orgs = await cursor.to_list(length=5)
     
     results = []
     for org in orgs:
-        raw_logo = org.get("logo_url")
-        safe_logo = None if (raw_logo and len(str(raw_logo)) > 500) else raw_logo
         results.append({
             "id": str(org["_id"]),
-            "_id": str(org["_id"]),
-            "name": org.get("name", "Unknown"),
-            "slug": org.get("slug", ""),
-            "logo_url": safe_logo,
-            "primary_color": org.get("primary_color", "#0f172a")
+            "name": org["name"],
+            "slug": org["slug"],
+            "logo_url": org.get("logo_url"),
+            "primary_color": org.get("primary_color")
         })
         
     return results
@@ -2434,23 +3730,27 @@ async def submit_visit_plan(plan: VisitPlan, employee=Depends(get_current_employ
 @app.get("/api/field/plan/{employee_id}")
 async def get_current_plan(employee_id: str, date: Optional[str] = None, current_user=Depends(get_current_employee)):
     """Retrieve the active (approved) plan for today."""
-    # Privacy Enforcement: Can only see own plan (or admin if we added that check)
-    if employee_id != current_user["email"]:
+    user_email = (current_user.get("email") or "").lower().strip()
+    user_emp_code = str(current_user.get("employee_id") or "").strip()
+    req_id = employee_id.lower().strip()
+
+    if req_id != user_email and employee_id.strip() != user_emp_code:
         raise HTTPException(status_code=403, detail="Access denied: Cannot view another agent's plan.")
         
     query_date = date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    plan = await visit_plans_collection.find_one({
-        "employee_id": employee_id,
-        "date": query_date,
-        "status": PlanStatus.APPROVED
-    })
+    plan_filter = {
+        "$or": [
+            {"employee_id": user_email},
+            {"employee_id": employee_id},
+            {"employee_id": user_emp_code}
+        ] if user_emp_code else [{"employee_id": user_email}, {"employee_id": employee_id}],
+        "date": query_date
+    }
+    plan = await visit_plans_collection.find_one({**plan_filter, "status": PlanStatus.APPROVED})
     
     if not plan:
         # Check for submitted/draft if no approved one exists
-        plan = await visit_plans_collection.find_one({
-            "employee_id": employee_id,
-            "date": query_date
-        })
+        plan = await visit_plans_collection.find_one(plan_filter)
         
     if not plan:
         return {"status": "no_plan", "message": "No visit plan found for today."}
@@ -2578,7 +3878,7 @@ async def visit_check_in(req: dict, employee=Depends(get_current_employee)):
                  "high",
                  {"lat": agent_lat, "lng": agent_lng, "place": req.get("place_name")}
              )
-             raise HTTPException(status_code=403, detail="Security Violation: Mock Location detected. Check-in rejected.")
+             raise HTTPException(status_code=403, detail="Security Violation: GPS virtualization/spoofing detected. Check-in rejected.")
 
         # --- GEOFENCE VALIDATION (200m radius) ---
         stop_id = req.get("stop_id")
@@ -2653,6 +3953,15 @@ async def visit_check_in(req: dict, employee=Depends(get_current_employee)):
             except Exception as face_err:
                 logger.warning(f"Face verification skipped during check-in: {face_err}")
 
+        site_photo_url = None
+        if req.get("site_photo_base64"):
+            import uuid as _uuid
+            os.makedirs("uploads/site_photos", exist_ok=True)
+            fname = f"site_photos/checkin_{employee['email'].replace('@','_')}_{_uuid.uuid4().hex[:8]}.jpg"
+            with open(f"uploads/{fname}", "wb") as f:
+                f.write(base64.b64decode(req["site_photo_base64"]))
+            site_photo_url = f"/uploads/{fname}"
+
         log = {
             "employee_id": employee["email"],
             "organization_id": employee["organization_id"],
@@ -2666,11 +3975,16 @@ async def visit_check_in(req: dict, employee=Depends(get_current_employee)):
             "geofence_validated": geofence_validated,
             "geofence_distance_meters": geofence_distance,
             "selfie_url": selfie_url,
+            "site_photo_url": site_photo_url,
             "face_verified": face_verified,
             "status": "ongoing"
         }
         
         result = await visit_logs_collection.insert_one(log)
+        await employees_collection.update_one(
+            {"email": employee["email"]},
+            {"$set": {"checked_in": True, "last_attendance_type": "visit_check_in", "last_attendance_time": log["check_in_time"]}}
+        )
         return {"status": "success", "visit_id": str(result.inserted_id), "geofence_validated": geofence_validated, "distance_meters": geofence_distance}
     except HTTPException:
         raise
@@ -2755,6 +4069,11 @@ async def visit_check_out(req: dict, background_tasks: BackgroundTasks, employee
             {"_id": ObjectId(req["visit_id"])},
             {"$set": update_data}
         )
+        await employees_collection.update_one(
+            {"email": employee["email"]},
+            {"$set": {"checked_in": False, "last_attendance_type": "visit_check_out", "last_attendance_time": update_data["check_out_time"]}}
+        )
+
 
         # Trigger Background Sync to Google Sheets for Visit Data
         background_tasks.add_task(sync_visit_to_google_sheets, {**visit, **update_data})
@@ -2839,6 +4158,9 @@ async def sync_offline_batch(req: SyncBatchRequest, background_tasks: Background
         synced_count = {"attendance": 0, "visits": 0, "pings": 0}
 
         # 1. Sync Attendance Logs
+        org_settings = await get_effective_org_settings(employee.get("organization_id"))
+        tz_offset = int(org_settings.get("timezone_offset", 330))
+
         for att in req.attendance_logs:
             offline_id = att.get("offline_id")
             if not offline_id:
@@ -2846,8 +4168,9 @@ async def sync_offline_batch(req: SyncBatchRequest, background_tasks: Background
             exists = await attendance_logs_collection.find_one({"offline_id": offline_id})
             if not exists:
                 att["synced_at"] = now
-                # Hard link to current user to prevent tampering
                 att["user_id"] = str(employee["_id"]) 
+                att["email"] = employee.get("email")
+                att["full_name"] = employee.get("full_name")
                 att["organization_id"] = employee["organization_id"]
                 # Convert string timestamp to datetime if needed
                 if "timestamp" in att and isinstance(att["timestamp"], str):
@@ -2855,6 +4178,36 @@ async def sync_offline_batch(req: SyncBatchRequest, background_tasks: Background
                         att["timestamp"] = datetime.fromisoformat(att["timestamp"].replace("Z", "+00:00"))
                     except:
                         pass
+
+                # Classify offline attendance log
+                try:
+                    l_ts = att.get("timestamp") or now
+                    if l_ts.tzinfo is None: l_ts = l_ts.replace(tzinfo=timezone.utc)
+                    local_ts = l_ts + timedelta(minutes=tz_offset)
+                    att_type = att.get("type", "check-in")
+
+                    classification = classify_attendance_day(
+                        first_checkin_local=local_ts,
+                        last_checkout_local=None if att_type in ["check-in", "IN"] else local_ts,
+                        worked_hours=0.0,
+                        settings=org_settings or {},
+                        employee_type=employee.get("employee_type", "field"),
+                        approved_leave=None
+                    )
+                    att["attendance_status"] = classification["status"]
+                    att["is_short_leave"] = classification["is_short_leave"]
+                    att["is_half_day"] = classification["is_half_day"]
+                    att["short_leave_type"] = classification["short_leave_type"]
+                    att["half_day_type"] = classification["half_day_type"]
+                    att["late_mins"] = classification["late_mins"]
+                    att["early_exit_mins"] = classification["early_exit_mins"]
+                    att["late_off_hours"] = classification["late_off_hours"]
+                    att["early_off_hours"] = classification["early_off_hours"]
+                    att["off_hours"] = classification["off_hours"]
+                    att["classification_reason"] = classification["classification_reason"]
+                except Exception as ex:
+                    logger.warning(f"Offline sync classification error: {ex}")
+
                 await attendance_logs_collection.insert_one(att)
                 synced_count["attendance"] += 1
 
@@ -2993,13 +4346,16 @@ async def admin_list_km_claims(status: Optional[str] = "pending", admin=Depends(
         query["status"] = status
         
     claims = await km_reimbursements_collection.find(query).sort("created_at", -1).to_list(length=200)
+    
+    emp_emails = list({c["employee_id"] for c in claims if c.get("employee_id")})
+    employees = await employees_collection.find({"email": {"$in": emp_emails}}, {"email": 1, "full_name": 1}).to_list(length=len(emp_emails))
+    emp_map = {e["email"]: e["full_name"] for e in employees}
+
     for c in claims:
         c["_id"] = str(c["_id"])
         if isinstance(c.get("created_at"), datetime):
             c["created_at"] = c["created_at"].isoformat()
-        # Enrich with employee name
-        emp = await employees_collection.find_one({"email": c["employee_id"]})
-        c["full_name"] = emp["full_name"] if emp else "Unknown"
+        c["full_name"] = emp_map.get(c.get("employee_id"), "Unknown")
         
     return claims
 
@@ -3093,24 +4449,97 @@ async def get_field_day_summary(employee_id: str, date: Optional[str] = None, cu
                 total_km += d
         total_km = total_km / 1000.0 # Convert to KM
     
-    # 3. Current Attendance Status (TODAY ONLY)
-    # Only check today's logs to determine status. If the last log is from
-    # a previous day, treat it as a fresh day (check-out / "Start of Day").
-    today_log = await attendance_logs_collection.find_one(
-        {"email": employee_id, "timestamp": {"$gte": today_start}},
-        sort=[("timestamp", -1)]
+    # 3. Current Attendance Status and Classification (TODAY ONLY)
+    today_field_logs = await attendance_logs_collection.find({
+        "$or": [
+            {"email": employee_id},
+            {"user_id": employee_id},
+            {"email": employee_id.lower().strip()},
+            {"user_id": employee_id.lower().strip()}
+        ],
+        "timestamp": {"$gte": today_start}
+    }).sort("timestamp", 1).to_list(length=100)
+
+    first_in_log = next((l for l in today_field_logs if l.get("type") in ["check-in", "IN"]), None)
+    last_out_log = next((l for l in reversed(today_field_logs) if l.get("type") in ["check-out", "OUT"]), None)
+
+    org_id = current_user.get("organization_id")
+    org_settings_doc = await get_effective_org_settings(org_id) if org_id else {}
+    tz_offset = org_settings_doc.get("timezone_offset", current_user.get("timezone_offset", 330))
+
+    first_in_local = (first_in_log["timestamp"] + timedelta(minutes=tz_offset)) if first_in_log else None
+    last_out_local = (last_out_log["timestamp"] + timedelta(minutes=tz_offset)) if last_out_log else None
+
+    # Calculate worked duration today (paired multi-sessions)
+    worked_sec = 0.0
+    last_in_ts = None
+    for l in today_field_logs:
+        l_ts = l["timestamp"]
+        if l_ts.tzinfo is None: l_ts = l_ts.replace(tzinfo=timezone.utc)
+        l_type = l.get("type")
+        if l_type in ["check-in", "IN"]:
+            last_in_ts = l_ts
+        elif l_type in ["check-out", "OUT"] and last_in_ts:
+            worked_sec += max(0.0, (l_ts - last_in_ts).total_seconds())
+            last_in_ts = None
+
+    if last_in_ts:
+        worked_sec += max(0.0, (datetime.now(timezone.utc) - last_in_ts).total_seconds())
+    elif not worked_sec and first_in_log and last_out_log:
+        f_in = first_in_log["timestamp"]
+        l_out = last_out_log["timestamp"]
+        if f_in.tzinfo is None: f_in = f_in.replace(tzinfo=timezone.utc)
+        if l_out.tzinfo is None: l_out = l_out.replace(tzinfo=timezone.utc)
+        worked_sec = max(0.0, (l_out - f_in).total_seconds())
+
+    worked_hours = round(worked_sec / 3600.0, 2)
+
+    # Check for approved leave today
+    today_date_str = (datetime.now(timezone.utc) + timedelta(minutes=tz_offset)).strftime("%Y-%m-%d")
+    approved_leave = None
+    try:
+        approved_leave = await leave_requests_collection.find_one({
+            "$or": [
+                {"employee_id": employee_id.lower().strip()},
+                {"email": employee_id.lower().strip()}
+            ],
+            "status": {"$regex": "^approved$", "$options": "i"},
+            "start_date": {"$lte": today_date_str},
+            "end_date": {"$gte": today_date_str}
+        })
+    except Exception:
+        pass
+
+    classification = classify_attendance_day(
+        first_checkin_local=first_in_local,
+        last_checkout_local=last_out_local,
+        worked_hours=worked_hours,
+        settings=org_settings_doc or {},
+        employee_type="field",
+        approved_leave=approved_leave
     )
-    if today_log:
-        current_status = today_log.get("type", "check-out")
-    else:
-        # No log today → fresh day → user needs to check in
-        current_status = "check-out"
+
+    current_status = today_field_logs[-1].get("type", "check-out") if today_field_logs else "check-out"
             
     return {
         "date": query_date,
         "total_visits": visits,
         "total_km": round(total_km, 2),
         "attendance_status": current_status,
+        "today_attendance_status": classification["status"],
+        "is_short_leave": classification["is_short_leave"],
+        "is_half_day": classification["is_half_day"],
+        "is_late": classification["is_late"],
+        "is_early_leave": classification["is_early_leave"],
+        "late_mins": classification["late_mins"],
+        "early_exit_mins": classification["early_exit_mins"],
+        "late_off_hours": classification["late_off_hours"],
+        "early_off_hours": classification["early_off_hours"],
+        "off_hours": classification["off_hours"],
+        "worked_hours": classification["worked_hours"],
+        "required_hours": classification["required_hours"],
+        "classification_reason": classification["classification_reason"],
+        "is_applied_leave": classification["is_applied_leave"],
         "status": "Active"
     }
 
@@ -3127,7 +4556,10 @@ async def update_territory(email: str, req: dict, admin=Depends(get_current_admi
     
     # Check if employee exists within admin scope
     base_filter = get_employee_filter(admin)
-    query = {"email": clean_email, **base_filter}
+    query = {"$or": [{"email": clean_email}, {"employee_id": clean_email}]}
+    if base_filter:
+        query = {"$and": [query, base_filter]}
+
     user = await employees_collection.find_one(query)
     if not user:
         raise HTTPException(status_code=404, detail="Employee not found or access denied")
@@ -3143,37 +4575,42 @@ async def update_territory(email: str, req: dict, admin=Depends(get_current_admi
         update_fields["territory_center_lng"] = None
         update_fields["territory_radius_meters"] = None
     else:
-        update_fields["territory_center_lat"] = req.get("territory_center_lat")
-        update_fields["territory_center_lng"] = req.get("territory_center_lng")
-        update_fields["territory_radius_meters"] = req.get("territory_radius_meters")
+        lat = req.get("territory_center_lat")
+        lng = req.get("territory_center_lng")
+        rad = req.get("territory_radius_meters")
+        update_fields["territory_center_lat"] = float(lat) if (lat is not None and str(lat).strip() != "") else None
+        update_fields["territory_center_lng"] = float(lng) if (lng is not None and str(lng).strip() != "") else None
+        update_fields["territory_radius_meters"] = float(rad) if (rad is not None and str(rad).strip() != "") else 5000.0
         # Clear polygon fields when switching to radius
         update_fields["territory_polygon"] = None
 
-    result = await employees_collection.update_one(query, {"$set": update_fields})
-    if result.matched_count == 0:
-        raise HTTPException(status_code=404, detail="Employee not found or access denied")
+    result = await employees_collection.update_one({"_id": user["_id"]}, {"$set": update_fields})
     return {"status": "success", "message": f"Territory updated to {req.get('territory_type', 'radius')} for {email}"}
 
 
 @app.get("/admin/field/visit-plans")
 async def get_plans_for_approval(status: str = "submitted", admin=Depends(get_current_admin)):
     """List visit plans pending approval."""
-    query = {"status": status}
-    if admin.organization_id and admin.role != "superadmin":
-        query["organization_id"] = admin.organization_id
-    plans = await visit_plans_collection.find(query).to_list(length=100)
+    plans = await visit_plans_collection.find({"status": status}).to_list(length=100)
     
-    # Enrichment: Add employee names
+    # Group logs by (employee_identifier, date)
+    logs_by_key = defaultdict(list)
+    for vl in visit_logs:
+        vl["_id"] = str(vl["_id"])
+        if "check_in_time" in vl and isinstance(vl["check_in_time"], datetime):
+            vl["check_in_time"] = vl["check_in_time"].isoformat()
+        if "check_out_time" in vl and isinstance(vl["check_out_time"], datetime):
+            vl["check_out_time"] = vl["check_out_time"].isoformat()
+        emp_key = vl.get("employee_id")
+        d_key = vl.get("date")
+        if emp_key and d_key:
+            logs_by_key[(emp_key, d_key)].append(vl)
+
     enriched_plans = []
     for plan in plans:
-        emp = await employees_collection.find_one({
-            "$or": [
-                {"email": plan.get("employee_id")},
-                {"employee_id": plan.get("employee_id")}
-            ]
-        })
+        emp = await employees_collection.find_one({"employee_id": plan["employee_id"]})
         plan["_id"] = str(plan["_id"])
-        plan["full_name"] = emp["full_name"] if emp else plan.get("employee_id", "Unknown")
+        plan["full_name"] = emp["full_name"] if emp else "Unknown"
         enriched_plans.append(plan)
         
     return enriched_plans
@@ -3255,17 +4692,25 @@ async def get_admin_stats(admin: dict = Depends(get_current_admin)):
     tz_offset = org_settings.get("timezone_offset", 330) if org_settings else 330
     today_start = get_today_start(tz_offset)
     
-    # Get relevant employee IDs
-    org_employees = await employees_collection.find(filter_query, {"_id": 1}).to_list(None)
+    # Get relevant employee IDs & emails
+    org_employees = await employees_collection.find(filter_query, {"_id": 1, "email": 1}).to_list(None)
     org_emp_ids = [str(emp["_id"]) for emp in org_employees]
+    org_emp_emails = [emp.get("email") for emp in org_employees if emp.get("email")]
     
     logs_query = {
         "timestamp": {"$gte": today_start},
-        "type": "check-in",
-        "user_id": {"$in": org_emp_ids}
+        "type": {"$in": ["check-in", "IN"]},
+        "$or": [
+            {"user_id": {"$in": org_emp_ids}},
+            {"email": {"$in": org_emp_emails}}
+        ]
     }
          
-    clocked_in_today = await attendance_logs_collection.count_documents(logs_query)
+    today_checkins = await attendance_logs_collection.find(logs_query).to_list(2000)
+    clocked_in_today = len(today_checkins)
+    late_arrivals_today = sum(1 for l in today_checkins if l.get("is_late") or l.get("attendance_status") == "Late")
+    short_leaves_today = sum(1 for l in today_checkins if l.get("is_short_leave") or l.get("attendance_status") == "Short Leave")
+    half_days_today = sum(1 for l in today_checkins if l.get("is_half_day") or l.get("attendance_status") == "Half Day")
     
     # Alerts & Fraud Detection Stats
     alert_query = {
@@ -3292,16 +4737,33 @@ async def get_admin_stats(admin: dict = Depends(get_current_admin)):
 
     on_leave_count = await leave_requests_collection.count_documents(leave_query)
 
+    # Check if today is a configured holiday
+    today_holiday = await holidays_collection.find_one({
+        "$or": [
+            {"organization_id": admin.organization_id, "date": today_str},
+            {"organization_id": "system_org", "date": today_str}
+        ]
+    })
+    is_today_holiday = bool(today_holiday)
+    holiday_name = today_holiday.get("name", "Holiday") if today_holiday else None
+
     # Calculate Absent count (Total - ClockedIn - OnLeave)
-    # This is a simplified dashboard metric
-    absent_count = max(0, total_employees - clocked_in_today - on_leave_count)
+    # If today is a holiday or weekend (Sunday), employees are not absent
+    if is_today_holiday or local_now.weekday() == 6:
+        absent_count = 0
+    else:
+        absent_count = max(0, total_employees - clocked_in_today - on_leave_count)
 
     return {
         "total_employees": total_employees,
         "clocked_in_today": clocked_in_today,
-        "late_arrivals_today": total_alerts_today, 
+        "late_arrivals_today": late_arrivals_today, 
+        "short_leaves_today": short_leaves_today,
+        "half_days_today": half_days_today,
         "on_leave": on_leave_count,
         "absent_today": absent_count,
+        "is_holiday_today": is_today_holiday,
+        "holiday_name": holiday_name,
         "avg_hours": 8.5,
         "alerts_today": total_alerts_today,
         "critical_alerts": critical_alerts_today,
@@ -3387,7 +4849,7 @@ async def get_admin_live_feed(skip: int = 0, limit: int = 50, admin: dict = Depe
 
 @app.post("/api/leave/request")
 async def create_leave_request(req: dict, employee=Depends(get_current_employee)):
-    """Submit a new Leave or On-Duty (OD) request with optional proof (base64 image)."""
+    """Submit a new Leave or On-Duty (OD) request with optional duration (full_day, half_day, short_leave) and proof."""
     try:
         proof_file_url = None
         if req.get("proof_url") and req["proof_url"].startswith("data:image"):
@@ -3413,22 +4875,52 @@ async def create_leave_request(req: dict, employee=Depends(get_current_employee)
                 logger.info(f"Proof uploaded and saved to {proof_file_url}")
             except Exception as upload_err:
                 logger.error(f"Failed to process proof upload: {upload_err}")
-                # We'll continue without the proof if it fails, or we could raise an error
+                # We'll continue without the proof if it fails
         
+        start_date = normalize_date_str(req.get("start_date", ""))
+        end_date = normalize_date_str(req.get("end_date", start_date))
+        duration_type = str(req.get("duration_type", "full_day")).lower().strip()
+        
+        if duration_type in ["first_half", "second_half", "half_day"]:
+            duration = 0.5
+        elif duration_type == "short_leave":
+            duration = 0.0
+        else:
+            duration_type = "full_day"
+            duration = float(count_days_between(start_date, end_date))
+
+        # Check live quota to flag if this request exceeds current available quota
+        org_id = employee.get("organization_id", "system_org")
+        target_month = start_date[:7] if start_date else None
+        live_balance = await calculate_leave_balance(employee["email"], org_id, month=target_month)
+        rem_tl = live_balance.get("total_leave", {}).get("remaining", 0.0)
+        exceeds_quota = (duration > rem_tl) and (req.get("leave_type") not in ["on_duty", "duty"])
+
         new_request = {
             "employee_id": employee["email"],
-            "organization_id": employee.get("organization_id", "system_org"),
-            "leave_type": req["leave_type"], # sick, casual, on_duty, other
-            "start_date": req["start_date"],
-            "end_date": req["end_date"],
+            "organization_id": org_id,
+            "leave_type": req["leave_type"],  # sick, casual, on_duty, other, unpaid
+            "start_date": start_date,
+            "end_date": end_date,
+            "duration_type": duration_type,
+            "duration": duration,
+            "short_leave_hours": float(req.get("short_leave_hours", 2.0)) if duration_type == "short_leave" else None,
             "reason": req["reason"],
+            "is_paid": req.get("is_paid"),  # None = auto, True = Paid, False = LOP
+            "exceeds_quota": exceeds_quota,
             "status": "pending",
             "proof_url": proof_file_url or req.get("proof_url"),
             "discussion": [],
             "created_at": datetime.now(timezone.utc)
         }
         result = await leave_requests_collection.insert_one(new_request)
-        return {"status": "success", "request_id": str(result.inserted_id), "proof_url": proof_file_url}
+        return {
+            "status": "success",
+            "request_id": str(result.inserted_id),
+            "proof_url": proof_file_url,
+            "exceeds_quota": exceeds_quota,
+            "duration": duration
+        }
     except Exception as e:
         logger.error(f"Failed to create leave request: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to submit request")
@@ -3442,6 +4934,23 @@ async def get_my_leave_requests(employee=Depends(get_current_employee)):
         if isinstance(r.get("created_at"), datetime):
             r["created_at"] = r["created_at"].isoformat()
     return requests
+
+@app.get("/api/leave/my-balance")
+@app.get("/api/leave/balance")
+async def get_my_leave_balance(
+    year: Optional[int] = None,
+    month: Optional[str] = None,
+    employee=Depends(get_current_employee)
+):
+    """Retrieve live computed leave quotas, balances, and carry-forward for the authenticated employee."""
+    org_id = employee.get("organization_id", "system_org")
+    balance = await calculate_leave_balance(
+        email=employee["email"],
+        org_id=org_id,
+        year=year,
+        month=month
+    )
+    return balance
 
 # --- Manager Endpoints ---
 @app.get("/api/manager/team-attendance")
@@ -3478,57 +4987,63 @@ async def get_team_attendance(manager=Depends(get_current_employee)):
 
 @app.get("/api/manager/pending-leaves")
 async def get_pending_leaves(manager=Depends(get_current_employee)):
-    """Fetch pending leave requests from my team members."""
-    subordinates = await employees_collection.find({"manager_id": manager["email"]}).to_list(length=100)
+    """Fetch pending leave requests for subordinates."""
+    cursor = employees_collection.find({"manager_id": manager["email"]})
+    subordinates = await cursor.to_list(length=100)
     sub_emails = [s["email"] for s in subordinates]
     
-    cursor = leave_requests_collection.find({
+    requests = await leave_requests_collection.find({
         "employee_id": {"$in": sub_emails},
         "status": "pending"
-    }).sort("created_at", -1)
+    }).sort("created_at", -1).to_list(length=100)
     
-    requests = await cursor.to_list(length=100)
-    results = []
-    for req in requests:
-        emp = next((s for s in subordinates if s["email"] == req["employee_id"]), None)
-        emp_name = emp["full_name"] if emp else req["employee_id"]
-        
-        results.append({
-            "id": str(req["_id"]),
-            "full_name": emp_name,
-            "employee_id": req["employee_id"],
-            "reason": req["reason"],
-            "start_date": req["start_date"],
-            "end_date": req["end_date"],
-            "status": req["status"],
-            "proof_url": req.get("proof_url")
-        })
-    return results
+    for r in requests:
+        r["_id"] = str(r["_id"])
+        if isinstance(r.get("created_at"), datetime):
+            r["created_at"] = r["created_at"].isoformat()
+    return requests
 
-@app.post("/api/leave/request/{request_id}/approve")
-async def manager_approve_leave(request_id: str, payload: dict, manager=Depends(get_current_employee)):
-    """Allow a manager to approve/reject leave for their team."""
-    status = payload.get("status")
-    if status not in ["approved", "rejected"]:
-        raise HTTPException(status_code=400, detail="Invalid status. Use 'approved' or 'rejected'.")
+@app.post("/api/manager/leave-decision")
+async def leave_decision(payload: dict, manager=Depends(get_current_employee)):
+    """Approve or reject a leave request (Manager level)."""
+    try:
+        req_id = payload.get("request_id")
+        action = payload.get("action") # "approve" or "reject"
+        is_paid = payload.get("is_paid")
+        admin_notes = payload.get("admin_notes")
         
-    leave_req = await leave_requests_collection.find_one({"_id": ObjectId(request_id)})
-    if not leave_req:
-        raise HTTPException(status_code=404, detail="Leave request not found")
-        
-    emp = await employees_collection.find_one({"email": leave_req["employee_id"], "manager_id": manager["email"]})
-    if not emp:
-         raise HTTPException(status_code=403, detail="Forbidden: You can only manage leaves for your direct reports.")
-         
-    await leave_requests_collection.update_one(
-        {"_id": ObjectId(request_id)},
-        {"$set": {
+        if action not in ["approve", "reject"]:
+            raise HTTPException(status_code=400, detail="Invalid action")
+            
+        obj_id = ObjectId(req_id)
+        leave_req = await leave_requests_collection.find_one({"_id": obj_id})
+        if not leave_req:
+            raise HTTPException(status_code=404, detail="Request not found")
+            
+        # Verify manager owns this subordinate
+        emp = await employees_collection.find_one({"email": leave_req["employee_id"], "manager_id": manager["email"]})
+        if not emp:
+            raise HTTPException(status_code=403, detail="Unauthorized")
+            
+        status = "approved" if action == "approve" else "rejected"
+        update_doc = {
             "status": status,
             "processed_at": datetime.now(timezone.utc),
             "processed_by": manager["email"]
-        }}
-    )
-    return {"status": "success", "new_status": status}
+        }
+        if is_paid is not None:
+            update_doc["is_paid"] = bool(is_paid)
+        if admin_notes:
+            update_doc["admin_notes"] = admin_notes
+            
+        await leave_requests_collection.update_one(
+            {"_id": obj_id},
+            {"$set": update_doc}
+        )
+        return {"status": "success", "new_status": status}
+    except Exception as e:
+        logger.error(f"Failed to process leave decision: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/admin/leave/requests")
 async def admin_get_leave_requests(status: Optional[str] = None, admin: dict = Depends(get_current_admin)):
@@ -3551,16 +5066,16 @@ async def admin_get_leave_requests(status: Optional[str] = None, admin: dict = D
         leave_query["status"] = status
         
     requests = await leave_requests_collection.find(leave_query).sort("created_at", -1).to_list(length=100)
+    
+    emp_emails = list({r.get("employee_id") for r in requests if r.get("employee_id")})
+    employees = await employees_collection.find({"email": {"$in": emp_emails}}, {"email": 1, "full_name": 1, "name": 1}).to_list(length=len(emp_emails))
+    emp_map = {e["email"]: e.get("full_name", e.get("name", "Unknown")) for e in employees}
+
     enriched = []
     for r in requests:
         r["_id"] = str(r["_id"])
         emp_id = r.get("employee_id")
-        if emp_id:
-            emp = await employees_collection.find_one({"email": emp_id})
-            r["full_name"] = emp.get("full_name", emp.get("name", "Unknown")) if emp else "Unknown"
-        else:
-            r["full_name"] = "Unknown"
-            
+        r["full_name"] = emp_map.get(emp_id, "Unknown")
         if isinstance(r.get("created_at"), datetime):
             r["created_at"] = r["created_at"].isoformat()
         enriched.append(r)
@@ -3648,8 +5163,8 @@ async def post_leave_message(request_id: str, payload: dict, auth_data=Depends(g
     return {"status": "success"}
 
 @app.post("/admin/leave/requests/{request_id}/{action}")
-async def handle_leave_request(request_id: str, action: str, admin: dict = Depends(get_current_admin)):
-    """Handle (Approve/Reject/Cancel) a leave request (Role Scoped)."""
+async def handle_leave_request(request_id: str, action: str, req_body: Optional[dict] = None, admin: dict = Depends(get_current_admin)):
+    """Handle (Approve/Reject/Cancel) a leave request with optional is_paid flag."""
     try:
         obj_id = ObjectId(request_id)
     except Exception:
@@ -3679,16 +5194,1123 @@ async def handle_leave_request(request_id: str, action: str, admin: dict = Depen
         raise HTTPException(status_code=403, detail="Access denied: This request belongs to another organization.")
 
     # 3. Update Request
-    result = await leave_requests_collection.update_one(
+    update_fields = {
+        "status": status_map[action],
+        "processed_at": datetime.now(timezone.utc),
+        "processed_by": admin.email
+    }
+    if req_body and isinstance(req_body, dict):
+        if "is_paid" in req_body and req_body["is_paid"] is not None:
+            update_fields["is_paid"] = bool(req_body["is_paid"])
+        if "admin_notes" in req_body and req_body["admin_notes"]:
+            update_fields["admin_notes"] = str(req_body["admin_notes"])
+
+    await leave_requests_collection.update_one(
+        {"_id": obj_id},
+        {"$set": update_fields}
+    )
+
+    # 4. Retroactively reclassify attendance logs for this employee across the leave period
+    if action == "approve":
+        try:
+            l_start = str(leave_req.get("start_date", ""))
+            l_end = str(leave_req.get("end_date", l_start))
+            if l_start:
+                s_dt = datetime.strptime(l_start[:10], "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                e_dt = datetime.strptime(l_end[:10], "%Y-%m-%d").replace(tzinfo=timezone.utc) + timedelta(days=1)
+                emp_id_str = str(leave_req.get("employee_id", ""))
+                emp_email = str(leave_req.get("email", emp_id_str))
+
+                org_settings = await get_effective_org_settings(leave_req.get("organization_id"))
+                tz_offset = int((org_settings or {}).get("timezone_offset", 330))
+
+                date_logs = await attendance_logs_collection.find({
+                    "$or": [
+                        {"email": emp_email},
+                        {"user_id": emp_id_str},
+                        {"email": emp_id_str},
+                        {"user_id": emp_email}
+                    ],
+                    "timestamp": {"$gte": s_dt, "$lt": e_dt}
+                }).sort("timestamp", 1).to_list(100)
+
+                if date_logs:
+                    updated_leave_req = {**leave_req, **update_fields}
+                    checkins = [l for l in date_logs if l.get("type") in ["check-in", "IN"]]
+                    checkouts = [l for l in date_logs if l.get("type") in ["check-out", "OUT"]]
+                    
+                    if checkins:
+                        f_in = checkins[0]["timestamp"]
+                        if f_in.tzinfo is None: f_in = f_in.replace(tzinfo=timezone.utc)
+                        f_in_local = f_in + timedelta(minutes=tz_offset)
+                        
+                        l_out_local = None
+                        worked_hours = 0.0
+                        if checkouts:
+                            l_out = checkouts[-1]["timestamp"]
+                            if l_out.tzinfo is None: l_out = l_out.replace(tzinfo=timezone.utc)
+                            l_out_local = l_out + timedelta(minutes=tz_offset)
+                            worked_hours = round(max(0.0, (l_out - f_in).total_seconds()) / 3600.0, 2)
+
+                        new_class = classify_attendance_day(
+                            first_checkin_local=f_in_local,
+                            last_checkout_local=l_out_local,
+                            worked_hours=worked_hours,
+                            settings=org_settings or {},
+                            employee_type=leave_req.get("employee_type", "desk"),
+                            approved_leave=updated_leave_req
+                        )
+
+                        await attendance_logs_collection.update_one(
+                            {"_id": checkins[0]["_id"]},
+                            {"$set": {
+                                "attendance_status": new_class["status"],
+                                "is_short_leave": new_class["is_short_leave"],
+                                "is_half_day": new_class["is_half_day"],
+                                "short_leave_type": new_class["short_leave_type"],
+                                "half_day_type": new_class["half_day_type"],
+                                "off_hours": new_class["off_hours"],
+                                "late_off_hours": new_class["late_off_hours"],
+                                "early_off_hours": new_class["early_off_hours"],
+                                "classification_reason": new_class["classification_reason"],
+                                "is_applied_leave": True
+                            }}
+                        )
+        except Exception as ex:
+            logger.warning(f"Leave approval reclassification error: {ex}")
+        
+    return {"status": "success", "new_status": status_map[action]}
+
+@app.put("/admin/leave/requests/{request_id}/payment-status")
+async def toggle_leave_payment_status(request_id: str, req_body: dict, admin: dict = Depends(get_current_admin)):
+    """Toggle whether an approved leave is Paid or Loss of Pay (LOP) for payroll."""
+    try:
+        obj_id = ObjectId(request_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid request ID")
+
+    leave_req = await leave_requests_collection.find_one({"_id": obj_id})
+    if not leave_req:
+        raise HTTPException(status_code=404, detail="Leave request not found")
+
+    is_paid = req_body.get("is_paid")
+    if is_paid is None:
+        raise HTTPException(status_code=400, detail="is_paid (boolean) is required")
+
+    await leave_requests_collection.update_one(
         {"_id": obj_id},
         {"$set": {
-            "status": status_map[action],
-            "processed_at": datetime.now(timezone.utc),
-            "processed_by": admin.email
+            "is_paid": bool(is_paid),
+            "payment_status_updated_by": admin.email,
+            "payment_status_updated_at": datetime.now(timezone.utc)
         }}
     )
+    return {"status": "success", "is_paid": bool(is_paid), "message": f"Leave marked as {'Paid' if is_paid else 'Loss of Pay (LOP)'}"}
+
+
+@app.post("/admin/attendance/convert-absent-to-leave")
+async def convert_absent_to_leave(req: ConvertAbsentToLeaveRequest, admin: Admin = Depends(get_current_admin)):
+    """Admin regularization: Convert an Absent day into an Approved Leave (e.g. informed via Email/WhatsApp)."""
+    clean_email = req.employee_email.strip().lower()
+    clean_date = normalize_date_str(req.date)
+    if not clean_date:
+        raise HTTPException(status_code=400, detail="Invalid date format. Expected YYYY-MM-DD or DD/MM/YYYY")
+
+    emp = await employees_collection.find_one({"email": clean_email})
+    if not emp:
+        # Try finding by employee_id or other fields
+        emp = await employees_collection.find_one({"employee_id": req.employee_email.strip()})
+        if not emp:
+            raise HTTPException(status_code=404, detail="Employee not found")
+        clean_email = emp["email"]
+
+    org_id = emp.get("organization_id") or admin.organization_id or "system_org"
+
+    # Check if there is already an approved leave for this date
+    existing = await leave_requests_collection.find_one({
+        "employee_id": clean_email,
+        "start_date": {"$lte": clean_date},
+        "end_date": {"$gte": clean_date},
+        "status": "approved"
+    })
+
+    if existing:
+        return {
+            "status": "already_exists",
+            "message": f"An approved leave ({existing.get('leave_type')}) already exists for this date.",
+            "request_id": str(existing["_id"])
+        }
+
+    duration_type = req.duration_type or "full_day"
+    duration = float(req.duration) if req.duration else (0.5 if duration_type in ["first_half", "second_half"] else 1.0)
+
+    # Insert approved leave record
+    new_leave = {
+        "employee_id": clean_email,
+        "organization_id": org_id,
+        "leave_type": req.leave_type,
+        "start_date": clean_date,
+        "end_date": clean_date,
+        "duration_type": duration_type,
+        "duration": duration,
+        "reason": req.reason or "Regularized by Admin (Informed via Email / WhatsApp)",
+        "is_paid": req.is_paid if req.is_paid is not None else True,
+        "exceeds_quota": False,
+        "status": "approved",
+        "admin_notes": req.admin_notes or f"Converted from Absent on {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} by {admin.email}",
+        "processed_at": datetime.now(timezone.utc),
+        "processed_by": admin.email,
+        "created_at": datetime.now(timezone.utc)
+    }
+    result = await leave_requests_collection.insert_one(new_leave)
+
+    # Also calculate updated leave balance for the month
+    target_month = clean_date[:7]
+    balance = await calculate_leave_balance(clean_email, org_id, month=target_month)
+
+    return {
+        "status": "success",
+        "message": f"Absent day ({clean_date}) successfully converted to Approved {req.leave_type.replace('_', ' ').title()}.",
+        "request_id": str(result.inserted_id),
+        "updated_balance": balance
+    }
+
+
+
+# -----------------------------------------------------------------------------
+# HOLIDAY & LEAVE POLICY SYSTEM
+# -----------------------------------------------------------------------------
+
+def normalize_date_str(d_str: str) -> Optional[str]:
+    """Normalize any date format (DD/MM/YYYY, YYYY-MM-DD, ISO) into standard YYYY-MM-DD."""
+    if not d_str:
+        return None
+    try:
+        s = str(d_str).strip()
+        if "T" in s:
+            s = s.split("T")[0]
+        if "/" in s:
+            parts = s.split("/")
+            if len(parts) == 3:
+                if len(parts[2]) == 4:  # DD/MM/YYYY
+                    return f"{int(parts[2]):04d}-{int(parts[1]):02d}-{int(parts[0]):02d}"
+                elif len(parts[0]) == 4:  # YYYY/MM/DD
+                    return f"{int(parts[0]):04d}-{int(parts[1]):02d}-{int(parts[2]):02d}"
+        elif "-" in s:
+            parts = s.split("-")
+            if len(parts) == 3:
+                if len(parts[0]) == 4:  # YYYY-MM-DD
+                    return f"{int(parts[0]):04d}-{int(parts[1]):02d}-{int(parts[2]):02d}"
+                elif len(parts[2]) == 4:  # DD-MM-YYYY
+                    return f"{int(parts[2]):04d}-{int(parts[1]):02d}-{int(parts[0]):02d}"
+        return s[:10]
+    except Exception:
+        return str(d_str)[:10]
+
+
+def count_days_between(start_date_str: str, end_date_str: str) -> int:
+    """Inclusive calendar days between two dates in any standard format."""
+    try:
+        norm_start = normalize_date_str(start_date_str)
+        norm_end = normalize_date_str(end_date_str)
+        d1 = datetime.strptime(norm_start, "%Y-%m-%d")
+        d2 = datetime.strptime(norm_end, "%Y-%m-%d")
+        if d2 < d1:
+            return 1
+        return (d2 - d1).days + 1
+    except Exception:
+        return 1
+
+
+async def sync_holiday_days_off(org_id: str, payroll_month: str):
+    """Synchronize days_off in holidays collection for HRMS payroll integration."""
+    try:
+        # Find all named holidays for this month
+        month_holidays = await holidays_collection.find({
+            "$or": [
+                {"organization_id": org_id, "payroll_month": payroll_month, "date": {"$exists": True}},
+                {"organization_id": "system_org", "payroll_month": payroll_month, "date": {"$exists": True}}
+            ]
+        }).to_list(length=100)
+
+        holiday_days = set()
+        holiday_names = {}
+        for h in month_holidays:
+            d_val = None
+            if "day" in h and h["day"] is not None:
+                d_val = int(h["day"])
+            elif "date" in h and h["date"]:
+                try:
+                    d_val = int(str(h["date"]).split("-")[2])
+                except Exception:
+                    pass
+            if d_val is not None:
+                holiday_days.add(d_val)
+                holiday_names[str(d_val)] = h.get("name", "Holiday")
+
+        # Update the payroll days_off doc for this month
+        payroll_doc = await holidays_collection.find_one({
+            "organization_id": org_id,
+            "payroll_month": payroll_month,
+            "days_off": {"$exists": True}
+        })
+
+        if payroll_doc:
+            current_days_off = set(payroll_doc.get("days_off", []))
+            merged = sorted(list(current_days_off.union(holiday_days)))
+            merged_names = payroll_doc.get("holiday_names", {})
+            merged_names.update(holiday_names)
+            await holidays_collection.update_one(
+                {"_id": payroll_doc["_id"]},
+                {"$set": {"days_off": merged, "holiday_names": merged_names, "updated_at": datetime.now(timezone.utc)}}
+            )
+        else:
+            # Create default days_off doc with Sundays + holidays
+            try:
+                y, m = map(int, payroll_month.split("-"))
+                num_days = calendar.monthrange(y, m)[1]
+                sundays = []
+                for d in range(1, num_days + 1):
+                    if datetime(y, m, d).weekday() == 6:
+                        sundays.append(d)
+                initial_days_off = sorted(list(set(sundays).union(holiday_days)))
+                await holidays_collection.insert_one({
+                    "organization_id": org_id,
+                    "payroll_month": payroll_month,
+                    "days_off": initial_days_off,
+                    "holiday_names": holiday_names,
+                    "created_at": datetime.now(timezone.utc)
+                })
+            except Exception as cr_err:
+                logger.warning(f"Could not initialize days_off doc: {cr_err}")
+    except Exception as e:
+        logger.error(f"sync_holiday_days_off error: {e}")
+
+
+async def calculate_leave_balance(
+    email: str,
+    org_id: str,
+    year: Optional[int] = None,
+    month: Optional[str] = None,
+    absent_days: float = 0.0
+) -> dict:
+    """Enterprise SL, CL, TL, and Loss of Pay (LOP) balance calculation engine with true month-by-month accrual, carry-forward, and half-day support."""
+    now = datetime.now(timezone.utc)
+    if not year:
+        year = now.year
+    if not month:
+        month = f"{year}-{now.month:02d}"
+
+    # 1. Fetch Leave Policy & Org Settings
+    policy = await leave_policies_collection.find_one({
+        "$or": [
+            {"organization_id": org_id, "year": year},
+            {"organization_id": "system_org", "year": year},
+            {"organization_id": org_id},
+            {"organization_id": "system_org"}
+        ]
+    })
+
+    org_settings = None
+    tz_offset = 330
+    try:
+        org_settings = await settings_collection.find_one({"organization_id": org_id})
+        if org_settings:
+            tz_offset = int(org_settings.get("timezone_offset", 330))
+    except Exception: pass
+
+    allocation_cycle = "annual"
+    carry_forward = True
+    start_month = f"{year}-01"
+    defaults = {"sick_leave": 12.0, "casual_leave": 12.0, "total_leave": 30.0}
+    paid_leave_types = ["sick", "casual", "on_duty", "duty"]
+    unpaid_leave_types = ["other", "unpaid", "lop"]
+    half_day_min_hours = 4.0
+    full_day_min_hours = 8.0
+    late_grace_mins = 15
+    short_leave_monthly_limit = 2
+    short_leave_max_hours = 2.0
+    short_leave_penalty_rule = "half_day_per_2_excess"
+    overrides = {}
+
+    if policy:
+        allocation_cycle = policy.get("allocation_cycle", "annual")
+        carry_forward = policy.get("carry_forward", True)
+        if policy.get("start_month"):
+            start_month = policy.get("start_month")
+        defaults = policy.get("defaults", defaults)
+        paid_leave_types = policy.get("paid_leave_types", paid_leave_types)
+        unpaid_leave_types = policy.get("unpaid_leave_types", unpaid_leave_types)
+        half_day_min_hours = float(policy.get("half_day_min_hours", 4.0))
+        full_day_min_hours = float(policy.get("full_day_min_hours", 8.0))
+        late_grace_mins = int(policy.get("late_grace_mins", 15))
+        short_leave_monthly_limit = int(policy.get("short_leave_monthly_limit", 2))
+        short_leave_max_hours = float(policy.get("short_leave_max_hours", 2.0))
+        short_leave_penalty_rule = policy.get("short_leave_penalty_rule", "half_day_per_2_excess")
+        overrides = policy.get("overrides", {})
+
+    clean_email = email.strip().lower()
+    emp_quota = overrides.get(clean_email) or overrides.get(email) or defaults
+    
+    default_sl = 12.0 if allocation_cycle == "annual" else 0.0
+    default_cl = 12.0 if allocation_cycle == "annual" else 0.0
+    default_tl = 30.0 if allocation_cycle == "annual" else 1.5
+
+    base_sl = float(emp_quota.get("sick_leave", default_sl))
+    base_cl = float(emp_quota.get("casual_leave", default_cl))
+    base_tl = float(emp_quota.get("total_leave", default_tl))
+
+    # Identify all possible identifier variants for this employee
+    emp_identifiers = [clean_email, email.strip()]
+    try:
+        emp_doc = await employees_collection.find_one({"email": clean_email})
+        if emp_doc:
+            if "_id" in emp_doc:
+                emp_identifiers.append(str(emp_doc["_id"]))
+            if "employee_id" in emp_doc and emp_doc["employee_id"]:
+                emp_identifiers.append(str(emp_doc["employee_id"]).strip())
+            # Dynamically infer start_month from joining date if policy did not set a specific start_month
+            if not policy or not policy.get("start_month"):
+                j_date = emp_doc.get("date_of_joining") or emp_doc.get("joining_date")
+                if j_date:
+                    norm_j = normalize_date_str(j_date)
+                    if norm_j and norm_j.startswith(str(year)):
+                        start_month = norm_j[:7]
+    except Exception:
+        pass
+
+    leaves = await leave_requests_collection.find({
+        "$or": [
+            {"employee_id": {"$in": emp_identifiers}},
+            {"email": {"$in": emp_identifiers}}
+        ],
+        "status": {"$regex": "^approved$", "$options": "i"}
+    }).to_list(length=500)
+
+    def eval_leave(l_doc):
+        norm_start = normalize_date_str(l_doc.get("start_date", ""))
+        norm_end = normalize_date_str(l_doc.get("end_date", norm_start))
+        if not norm_start:
+            return None, 0.0, False, "other"
+            
+        dur_type = str(l_doc.get("duration_type", "")).lower().strip()
+        if l_doc.get("duration") is not None:
+            days = float(l_doc.get("duration"))
+        elif dur_type in ["first_half", "second_half", "half_day"]:
+            days = 0.5
+        elif dur_type == "short_leave":
+            days = 0.0
+        else:
+            days = float(count_days_between(norm_start, norm_end or norm_start))
+            
+        l_type = str(l_doc.get("leave_type", "other")).lower().strip()
         
-    return {"status": "success"}
+        # Check Paid Status: Explicit override takes priority, else check against paid_leave_types list
+        if l_doc.get("is_paid") is not None:
+            is_paid = bool(l_doc.get("is_paid"))
+        else:
+            is_paid = any(pt in l_type for pt in paid_leave_types)
+            
+        return norm_start, days, is_paid, l_type
+
+    if allocation_cycle == "monthly":
+        # Generate ordered list of months from start_month to target month
+        try:
+            s_yr, s_mo = map(int, start_month.split("-"))
+            t_yr, t_mo = map(int, month.split("-"))
+            
+            # Clamp if target is before start
+            if (t_yr < s_yr) or (t_yr == s_yr and t_mo < s_mo):
+                start_month = month
+                s_yr, s_mo = t_yr, t_mo
+        except Exception:
+            start_month = month
+            s_yr, s_mo = int(month.split("-")[0]), int(month.split("-")[1])
+            t_yr, t_mo = s_yr, s_mo
+
+        # Build month sequence
+        month_seq = []
+        cur_y, cur_m = s_yr, s_mo
+        while (cur_y < t_yr) or (cur_y == t_yr and cur_m <= t_mo):
+            month_seq.append(f"{cur_y:04d}-{cur_m:02d}")
+            cur_m += 1
+            if cur_m > 12:
+                cur_m = 1
+                cur_y += 1
+
+        # Month-by-month state tracking
+        carried_sl = 0.0
+        carried_cl = 0.0
+        carried_tl = 0.0
+        
+        target_month_data = {}
+
+        for m_str in month_seq:
+            # Filter approved leaves in this specific month
+            m_leaves = []
+            for l in leaves:
+                n_start, days, is_paid, l_type = eval_leave(l)
+                if n_start and n_start.startswith(m_str):
+                    m_leaves.append((n_start, days, is_paid, l_type))
+
+            # Sum usage in this month
+            used_sl_m = sum(d for _, d, _, lt in m_leaves if "sick" in lt)
+            used_cl_m = sum(d for _, d, _, lt in m_leaves if "casual" in lt)
+            used_od_m = sum(d for _, d, _, lt in m_leaves if "on_duty" in lt or "duty" in lt)
+            used_other_m = sum(d for _, d, _, lt in m_leaves if not any(k in lt for k in ["sick", "casual", "on_duty", "duty"]))
+            
+            # Paid vs Unpaid used in this month (On-duty does not deduct from quota)
+            paid_used_tl_m = sum(d for _, d, is_p, lt in m_leaves if is_p and ("on_duty" not in lt and "duty" not in lt))
+            unpaid_used_tl_m = sum(d for _, d, is_p, lt in m_leaves if not is_p and ("on_duty" not in lt and "duty" not in lt))
+
+            # Available quota in this month = monthly quota + carried forward from previous month
+            avail_sl_m = base_sl + carried_sl
+            avail_cl_m = base_cl + carried_cl
+            avail_tl_m = base_tl + carried_tl
+
+            # Remaining quota at end of this month
+            rem_sl_m = max(0.0, avail_sl_m - used_sl_m)
+            rem_cl_m = max(0.0, avail_cl_m - used_cl_m)
+            rem_tl_m = max(0.0, avail_tl_m - paid_used_tl_m)
+
+            # Excess LOP days in this month = (paid leaves taken exceeding available quota) + (unpaid leaves)
+            excess_lop_m = max(0.0, paid_used_tl_m - avail_tl_m) + unpaid_used_tl_m
+
+            # If this is our target month, record full data
+            if m_str == month:
+                prev_month_str = None
+                prev_month_label = None
+                if len(month_seq) > 1 and month_seq.index(m_str) > 0:
+                    prev_idx = month_seq.index(m_str) - 1
+                    prev_month_str = month_seq[prev_idx]
+                    try:
+                        p_dt = datetime.strptime(prev_month_str, "%Y-%m")
+                        prev_month_label = p_dt.strftime("%b %Y")
+                    except Exception:
+                        prev_month_label = prev_month_str
+
+                target_month_data = {
+                    "year": year,
+                    "month": month,
+                    "allocation_cycle": "monthly",
+                    "carry_forward": carry_forward,
+                    "start_month": start_month,
+                    "previous_month": prev_month_str,
+                    "previous_month_label": prev_month_label,
+                    "sick_leave": {
+                        "monthly_quota": round(base_sl, 2),
+                        "carried_forward": round(carried_sl, 2),
+                        "available": round(avail_sl_m, 2),
+                        "total": round(avail_sl_m, 2),
+                        "used": round(used_sl_m, 2),
+                        "remaining": round(rem_sl_m, 2)
+                    },
+                    "casual_leave": {
+                        "monthly_quota": round(base_cl, 2),
+                        "carried_forward": round(carried_cl, 2),
+                        "available": round(avail_cl_m, 2),
+                        "total": round(avail_cl_m, 2),
+                        "used": round(used_cl_m, 2),
+                        "remaining": round(rem_cl_m, 2)
+                    },
+                    "total_leave": {
+                        "monthly_quota": round(base_tl, 2),
+                        "carried_forward": round(carried_tl, 2),
+                        "available": round(avail_tl_m, 2),
+                        "total": round(avail_tl_m, 2),
+                        "used": round(paid_used_tl_m, 2),
+                        "unpaid_used": round(unpaid_used_tl_m, 2),
+                        "remaining": round(rem_tl_m, 2),
+                        "excess_lop": round(excess_lop_m, 2)
+                    },
+                    "on_duty": {
+                        "used": round(used_od_m, 2)
+                    },
+                    "other": {
+                        "used": round(used_other_m, 2)
+                    },
+                    "paid_leave_types": paid_leave_types,
+                    "unpaid_leave_types": unpaid_leave_types,
+                    "absent_days": round(float(absent_days), 2),
+                    "total_lop_days": round(excess_lop_m + float(absent_days), 2)
+                }
+
+            # Update carried forward for next month in sequence
+            if carry_forward:
+                carried_sl = rem_sl_m
+                carried_cl = rem_cl_m
+                carried_tl = rem_tl_m
+            else:
+                carried_sl = 0.0
+                carried_cl = 0.0
+                carried_tl = 0.0
+
+        # Count attendance-based and applied short leaves / half days in target month (de-duplicated by date)
+        short_leave_dates = set()
+        half_day_dates = set()
+        att_short_leave_dates = set()
+        att_half_day_dates = set()
+        applied_short_leave_dates = set()
+        applied_half_day_dates = set()
+
+        try:
+            m_start_utc = datetime.strptime(f"{month}-01", "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            yr_int, mo_int = map(int, month.split("-"))
+            next_m_utc = datetime(yr_int + 1, 1, 1, tzinfo=timezone.utc) if mo_int == 12 else datetime(yr_int, mo_int + 1, 1, tzinfo=timezone.utc)
+
+            month_att_logs = await attendance_logs_collection.find({
+                "$or": [
+                    {"user_id": {"$in": emp_identifiers}},
+                    {"email": {"$in": emp_identifiers}}
+                ],
+                "type": {"$in": ["check-in", "IN"]},
+                "timestamp": {"$gte": m_start_utc, "$lt": next_m_utc}
+            }).to_list(1000)
+
+            for l in month_att_logs:
+                l_ts = l["timestamp"]
+                if l_ts.tzinfo is None: l_ts = l_ts.replace(tzinfo=timezone.utc)
+                l_date = (l_ts + timedelta(minutes=tz_offset)).strftime("%Y-%m-%d")
+                if l.get("is_short_leave") or l.get("attendance_status") == "Short Leave":
+                    att_short_leave_dates.add(l_date)
+                    short_leave_dates.add(l_date)
+                if l.get("is_half_day") or l.get("attendance_status") == "Half Day":
+                    att_half_day_dates.add(l_date)
+                    half_day_dates.add(l_date)
+        except Exception as e:
+            logger.warning(f"Error fetching month att logs for leave balance: {e}")
+
+        for l in leaves:
+            dur_type = str(l.get("duration_type", "")).lower().strip()
+            l_start = str(l.get("start_date", ""))
+            l_end = str(l.get("end_date", l_start))
+            if not l_start or not (l_start.startswith(month) or l_end.startswith(month)):
+                continue
+            
+            try:
+                c_dt = max(datetime.strptime(l_start[:10], "%Y-%m-%d"), datetime.strptime(f"{month}-01", "%Y-%m-%d"))
+                e_dt = min(datetime.strptime(l_end[:10], "%Y-%m-%d"), next_m_utc.replace(tzinfo=None) - timedelta(days=1))
+                while c_dt <= e_dt:
+                    d_str = c_dt.strftime("%Y-%m-%d")
+                    if dur_type == "short_leave":
+                        applied_short_leave_dates.add(d_str)
+                        short_leave_dates.add(d_str)
+                    elif dur_type in ["first_half", "second_half", "half_day"] or l.get("duration") == 0.5:
+                        applied_half_day_dates.add(d_str)
+                        half_day_dates.add(d_str)
+                    c_dt += timedelta(days=1)
+            except Exception: pass
+
+        total_short_leaves = len(short_leave_dates)
+        total_half_days = len(half_day_dates)
+        short_leave_monthly_limit = int((policy or {}).get("short_leave_monthly_limit", 2))
+        short_leave_remaining = max(0, short_leave_monthly_limit - total_short_leaves)
+
+        target_month_data["short_leave"] = {
+            "monthly_limit": short_leave_monthly_limit,
+            "used": total_short_leaves,
+            "remaining": short_leave_remaining,
+            "attendance_triggered": len(att_short_leave_dates - applied_short_leave_dates),
+            "applied": len(applied_short_leave_dates)
+        }
+        target_month_data["half_day"] = {
+            "used": total_half_days,
+            "attendance_triggered": len(att_half_day_dates - applied_half_day_dates),
+            "applied": len(applied_half_day_dates)
+        }
+
+        return target_month_data
+
+    else:
+        # Annual cycle
+        y_str = str(year)
+        y_leaves = []
+        for l in leaves:
+            n_start, days, is_paid, l_type = eval_leave(l)
+            if n_start and n_start.startswith(y_str):
+                y_leaves.append((n_start, days, is_paid, l_type))
+
+        used_sick = sum(d for _, d, _, lt in y_leaves if "sick" in lt)
+        used_casual = sum(d for _, d, _, lt in y_leaves if "casual" in lt)
+        used_on_duty = sum(d for _, d, _, lt in y_leaves if "on_duty" in lt or "duty" in lt)
+        used_other = sum(d for _, d, _, lt in y_leaves if not any(k in lt for k in ["sick", "casual", "on_duty", "duty"]))
+
+        paid_used_tl = sum(d for _, d, is_p, lt in y_leaves if is_p and ("on_duty" not in lt and "duty" not in lt))
+        unpaid_used_tl = sum(d for _, d, is_p, lt in y_leaves if not is_p and ("on_duty" not in lt and "duty" not in lt))
+
+        rem_sl = max(0.0, base_sl - used_sick)
+        rem_cl = max(0.0, base_cl - used_casual)
+        rem_tl = max(0.0, base_tl - paid_used_tl)
+        excess_lop = max(0.0, paid_used_tl - base_tl) + unpaid_used_tl
+
+        # Count attendance-based and applied short leaves / half days in target month
+        try:
+            m_start_utc = datetime.strptime(f"{month}-01", "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            yr_int, mo_int = map(int, month.split("-"))
+            next_m_utc = datetime(yr_int + 1, 1, 1, tzinfo=timezone.utc) if mo_int == 12 else datetime(yr_int, mo_int + 1, 1, tzinfo=timezone.utc)
+
+            att_short_leaves = await attendance_logs_collection.count_documents({
+                "$or": [
+                    {"user_id": {"$in": emp_identifiers}},
+                    {"email": {"$in": emp_identifiers}}
+                ],
+                "is_short_leave": True,
+                "type": "check-in",
+                "timestamp": {"$gte": m_start_utc, "$lt": next_m_utc}
+            })
+            att_half_days = await attendance_logs_collection.count_documents({
+                "$or": [
+                    {"user_id": {"$in": emp_identifiers}},
+                    {"email": {"$in": emp_identifiers}}
+                ],
+                "is_half_day": True,
+                "type": "check-in",
+                "timestamp": {"$gte": m_start_utc, "$lt": next_m_utc}
+            })
+        except Exception:
+            att_short_leaves = 0
+            att_half_days = 0
+
+        applied_short_leaves = sum(1 for l in leaves if str(l.get("duration_type", "")).lower().strip() == "short_leave" and str(l.get("start_date", "")).startswith(month))
+        applied_half_days = sum(1 for l in leaves if str(l.get("duration_type", "")).lower().strip() in ["first_half", "second_half", "half_day"] and str(l.get("start_date", "")).startswith(month))
+
+        total_short_leaves = att_short_leaves + applied_short_leaves
+        total_half_days = att_half_days + applied_half_days
+        short_leave_monthly_limit = int((policy or {}).get("short_leave_monthly_limit", 2))
+        short_leave_remaining = max(0, short_leave_monthly_limit - total_short_leaves)
+
+        return {
+            "year": year,
+            "month": month,
+            "allocation_cycle": "annual",
+            "sick_leave": {
+                "total": round(base_sl, 2),
+                "used": round(used_sick, 2),
+                "remaining": round(rem_sl, 2)
+            },
+            "casual_leave": {
+                "total": round(base_cl, 2),
+                "used": round(used_casual, 2),
+                "remaining": round(rem_cl, 2)
+            },
+            "total_leave": {
+                "total": round(base_tl, 2),
+                "available": round(base_tl, 2),
+                "used": round(paid_used_tl, 2),
+                "unpaid_used": round(unpaid_used_tl, 2),
+                "remaining": round(rem_tl, 2),
+                "excess_lop": round(excess_lop, 2)
+            },
+            "short_leave": {
+                "monthly_limit": short_leave_monthly_limit,
+                "used": total_short_leaves,
+                "remaining": short_leave_remaining,
+                "attendance_triggered": att_short_leaves,
+                "applied": applied_short_leaves
+            },
+            "half_day": {
+                "used": total_half_days,
+                "attendance_triggered": att_half_days,
+                "applied": applied_half_days
+            },
+            "on_duty": {
+                "used": round(used_on_duty, 2)
+            },
+            "other": {
+                "used": round(used_other, 2)
+            },
+            "paid_leave_types": paid_leave_types,
+            "unpaid_leave_types": unpaid_leave_types,
+            "absent_days": round(float(absent_days), 2),
+            "total_lop_days": round(excess_lop + float(absent_days), 2)
+        }
+
+
+# --- HOLIDAY ENDPOINTS ---
+
+@app.post("/admin/holidays")
+async def admin_create_holiday(req: HolidayCreateRequest, admin: dict = Depends(get_current_admin)):
+    """Create or update a named holiday for the organization."""
+    org_id = admin.organization_id or "system_org"
+    date_str = req.date.strip()
+    try:
+        dt = datetime.strptime(date_str, "%Y-%m-%d")
+        payroll_month = date_str[:7]
+        day_num = dt.day
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
+
+    holiday_doc = {
+        "organization_id": org_id,
+        "date": date_str,
+        "payroll_month": payroll_month,
+        "day": day_num,
+        "name": req.name.strip(),
+        "holiday_type": req.holiday_type or "festival",
+        "description": req.description or "",
+        "created_by": admin.email,
+        "updated_at": datetime.now(timezone.utc)
+    }
+
+    result = await holidays_collection.update_one(
+        {"organization_id": org_id, "date": date_str},
+        {"$set": holiday_doc},
+        upsert=True
+    )
+
+    # Sync with HRMS payroll days_off
+    await sync_holiday_days_off(org_id, payroll_month)
+
+    return {"status": "success", "message": f"Holiday '{req.name}' set for {date_str}", "date": date_str}
+
+
+@app.post("/admin/holidays/bulk")
+async def admin_bulk_create_holidays(req: HolidayBulkCreateRequest, admin: dict = Depends(get_current_admin)):
+    """Bulk create holidays for the organization."""
+    org_id = admin.organization_id or "system_org"
+    created_count = 0
+    months_to_sync = set()
+
+    for h in req.holidays:
+        date_str = h.date.strip()
+        try:
+            dt = datetime.strptime(date_str, "%Y-%m-%d")
+            payroll_month = date_str[:7]
+            day_num = dt.day
+            months_to_sync.add(payroll_month)
+
+            holiday_doc = {
+                "organization_id": org_id,
+                "date": date_str,
+                "payroll_month": payroll_month,
+                "day": day_num,
+                "name": h.name.strip(),
+                "holiday_type": h.holiday_type or "festival",
+                "description": h.description or "",
+                "created_by": admin.email,
+                "updated_at": datetime.now(timezone.utc)
+            }
+
+            await holidays_collection.update_one(
+                {"organization_id": org_id, "date": date_str},
+                {"$set": holiday_doc},
+                upsert=True
+            )
+            created_count += 1
+        except Exception as err:
+            logger.warning(f"Skipping holiday {h}: {err}")
+
+    for m in months_to_sync:
+        await sync_holiday_days_off(org_id, m)
+
+    return {"status": "success", "count": created_count, "message": f"Successfully added {created_count} holidays"}
+
+
+@app.get("/admin/holidays")
+async def admin_get_holidays(year: Optional[int] = None, month: Optional[str] = None, admin: dict = Depends(get_current_admin)):
+    """List all configured holidays for the admin's organization."""
+    org_id = admin.organization_id or "system_org"
+    query = {
+        "$or": [
+            {"organization_id": org_id, "date": {"$exists": True}},
+            {"organization_id": "system_org", "date": {"$exists": True}}
+        ]
+    }
+
+    if month:
+        query["payroll_month"] = month
+    elif year:
+        query["date"] = {"$regex": f"^{year}"}
+
+    cursor = holidays_collection.find(query).sort("date", 1)
+    holidays = await cursor.to_list(length=500)
+
+    results = []
+    for h in holidays:
+        h["_id"] = str(h["_id"])
+        results.append(h)
+    return results
+
+
+@app.delete("/admin/holidays/{holiday_id_or_date}")
+async def admin_delete_holiday(holiday_id_or_date: str, admin: dict = Depends(get_current_admin)):
+    """Delete a holiday by its ID or YYYY-MM-DD date."""
+    org_id = admin.organization_id or "system_org"
+    query = {}
+    if ObjectId.is_valid(holiday_id_or_date):
+        query = {"_id": ObjectId(holiday_id_or_date)}
+    else:
+        query = {
+            "$or": [
+                {"organization_id": org_id, "date": holiday_id_or_date},
+                {"organization_id": "system_org", "date": holiday_id_or_date}
+            ]
+        }
+
+    holiday_to_delete = await holidays_collection.find_one(query)
+    if not holiday_to_delete:
+        raise HTTPException(status_code=404, detail="Holiday not found")
+
+    payroll_month = holiday_to_delete.get("payroll_month", "")
+    day_num = holiday_to_delete.get("day")
+
+    await holidays_collection.delete_one({"_id": holiday_to_delete["_id"]})
+
+    # Also remove from days_off array in payroll doc if needed
+    if payroll_month and day_num:
+        await holidays_collection.update_one(
+            {"organization_id": org_id, "payroll_month": payroll_month, "days_off": {"$exists": True}},
+            {"$pull": {"days_off": day_num}}
+        )
+
+    return {"status": "success", "message": "Holiday deleted successfully"}
+
+
+@app.get("/api/holidays")
+async def employee_get_holidays(year: Optional[int] = None, employee: dict = Depends(get_current_employee)):
+    """Fetch holidays visible to the current employee."""
+    org_id = employee.get("organization_id", "system_org")
+    if not year:
+        year = datetime.now(timezone.utc).year
+
+    query = {
+        "$or": [
+            {"organization_id": org_id, "date": {"$regex": f"^{year}"}},
+            {"organization_id": "system_org", "date": {"$regex": f"^{year}"}}
+        ]
+    }
+
+    cursor = holidays_collection.find(query).sort("date", 1)
+    holidays = await cursor.to_list(length=200)
+
+    results = []
+    for h in holidays:
+        h["_id"] = str(h["_id"])
+        results.append({
+            "id": h["_id"],
+            "date": h.get("date"),
+            "name": h.get("name"),
+            "holiday_type": h.get("holiday_type", "festival"),
+            "description": h.get("description", "")
+        })
+    return results
+
+
+# --- LEAVE POLICY ENDPOINTS ---
+
+@app.get("/admin/leave-policy")
+async def admin_get_leave_policy(year: Optional[int] = None, admin: dict = Depends(get_current_admin)):
+    """Fetch org-wide leave policy and quotas with enterprise attendance rules."""
+    org_id = admin.organization_id or "system_org"
+    if not year:
+        year = datetime.now(timezone.utc).year
+
+    policy = await leave_policies_collection.find_one({
+        "$or": [
+            {"organization_id": org_id, "year": year},
+            {"organization_id": "system_org", "year": year},
+            {"organization_id": org_id},
+            {"organization_id": "system_org"}
+        ]
+    })
+
+    allocation_cycle = "annual"
+    carry_forward = True
+    start_month = "2026-08"
+    defaults = {"sick_leave": 12.0, "casual_leave": 12.0, "total_leave": 30.0}
+    paid_leave_types = ["sick", "casual", "on_duty"]
+    unpaid_leave_types = ["other", "unpaid"]
+    half_day_min_hours = 4.0
+    full_day_min_hours = 8.0
+    late_grace_mins = 15
+    short_leave_monthly_limit = 2
+    short_leave_max_hours = 2.0
+    short_leave_penalty_rule = "half_day_per_2_excess"
+    overrides = {}
+
+    if policy:
+        allocation_cycle = policy.get("allocation_cycle", "annual")
+        carry_forward = policy.get("carry_forward", True)
+        start_month = policy.get("start_month", "2026-08")
+        defaults = policy.get("defaults", defaults)
+        paid_leave_types = policy.get("paid_leave_types", paid_leave_types)
+        unpaid_leave_types = policy.get("unpaid_leave_types", unpaid_leave_types)
+        half_day_min_hours = float(policy.get("half_day_min_hours", 4.0))
+        full_day_min_hours = float(policy.get("full_day_min_hours", 8.0))
+        late_grace_mins = int(policy.get("late_grace_mins", 15))
+        short_leave_monthly_limit = int(policy.get("short_leave_monthly_limit", 2))
+        short_leave_max_hours = float(policy.get("short_leave_max_hours", 2.0))
+        short_leave_penalty_rule = policy.get("short_leave_penalty_rule", "half_day_per_2_excess")
+        overrides = policy.get("overrides", {})
+
+    return {
+        "organization_id": org_id,
+        "year": year,
+        "allocation_cycle": allocation_cycle,
+        "carry_forward": carry_forward,
+        "start_month": start_month,
+        "defaults": defaults,
+        "paid_leave_types": paid_leave_types,
+        "unpaid_leave_types": unpaid_leave_types,
+        "half_day_min_hours": half_day_min_hours,
+        "full_day_min_hours": full_day_min_hours,
+        "late_grace_mins": late_grace_mins,
+        "short_leave_monthly_limit": short_leave_monthly_limit,
+        "short_leave_max_hours": short_leave_max_hours,
+        "short_leave_penalty_rule": short_leave_penalty_rule,
+        "office_start_time": (policy or {}).get("office_start_time", "09:00"),
+        "office_end_time": (policy or {}).get("office_end_time", "18:00"),
+        "short_leave_cutoff_time": (policy or {}).get("short_leave_cutoff_time", "10:15"),
+        "half_day_late_cutoff_time": (policy or {}).get("half_day_late_cutoff_time", "11:30"),
+        "half_day_early_exit_cutoff_time": (policy or {}).get("half_day_early_exit_cutoff_time", "14:00"),
+        "lunch_start_time": (policy or {}).get("lunch_start_time", "13:00"),
+        "lunch_end_time": (policy or {}).get("lunch_end_time", "14:00"),
+        "max_lunch_duration_mins": (policy or {}).get("max_lunch_duration_mins", 60),
+        "overrides": overrides
+    }
+
+
+@app.put("/admin/leave-policy")
+async def admin_update_leave_policy(req: LeavePolicyUpdateRequest, admin: dict = Depends(get_current_admin)):
+    """Set organization-wide default leave quotas, allocation cycle, carry forward, and paid/unpaid rules."""
+    org_id = admin.organization_id or "system_org"
+    year = req.year or datetime.now(timezone.utc).year
+    allocation_cycle = (req.allocation_cycle or "annual").strip().lower()
+    carry_forward = bool(req.carry_forward if req.carry_forward is not None else True)
+    start_month = req.start_month or "2026-08"
+
+    defaults = {
+        "sick_leave": float(req.sick_leave),
+        "casual_leave": float(req.casual_leave),
+        "total_leave": float(req.total_leave)
+    }
+    paid_leave_types = req.paid_leave_types if req.paid_leave_types is not None else ["sick", "casual", "on_duty"]
+    unpaid_leave_types = req.unpaid_leave_types if req.unpaid_leave_types is not None else ["other", "unpaid"]
+
+    update_doc = {
+        "organization_id": org_id,
+        "year": year,
+        "allocation_cycle": allocation_cycle,
+        "carry_forward": carry_forward,
+        "start_month": start_month,
+        "defaults": defaults,
+        "paid_leave_types": paid_leave_types,
+        "unpaid_leave_types": unpaid_leave_types,
+        "half_day_min_hours": float(req.half_day_min_hours or 4.0),
+        "full_day_min_hours": float(req.full_day_min_hours or 8.0),
+        "late_grace_mins": int(req.late_grace_mins or 15),
+        "short_leave_monthly_limit": int(req.short_leave_monthly_limit or 2),
+        "short_leave_max_hours": float(req.short_leave_max_hours or 2.0),
+        "short_leave_penalty_rule": req.short_leave_penalty_rule or "half_day_per_2_excess",
+        "office_start_time": req.office_start_time or "09:00",
+        "office_end_time": req.office_end_time or "18:00",
+        "short_leave_cutoff_time": req.short_leave_cutoff_time or "10:15",
+        "half_day_late_cutoff_time": req.half_day_late_cutoff_time or "11:30",
+        "half_day_early_exit_cutoff_time": req.half_day_early_exit_cutoff_time or "14:00",
+        "lunch_start_time": req.lunch_start_time or "13:00",
+        "lunch_end_time": req.lunch_end_time or "14:00",
+        "max_lunch_duration_mins": int(req.max_lunch_duration_mins or 60),
+        "updated_by": admin.email,
+        "updated_at": datetime.now(timezone.utc)
+    }
+
+    await leave_policies_collection.update_one(
+        {"organization_id": org_id, "year": year},
+        {"$set": update_doc},
+        upsert=True
+    )
+
+    # Mirror shift attendance cutoffs to organization settings
+    settings_mirror = {
+        "office_start_time": req.office_start_time or "09:00",
+        "office_end_time": req.office_end_time or "18:00",
+        "late_grace_mins": int(req.late_grace_mins or 15),
+        "short_leave_cutoff_time": req.short_leave_cutoff_time or "10:15",
+        "half_day_late_cutoff_time": req.half_day_late_cutoff_time or "11:30",
+        "half_day_early_exit_cutoff_time": req.half_day_early_exit_cutoff_time or "14:00",
+        "lunch_start_time": req.lunch_start_time or "13:00",
+        "lunch_end_time": req.lunch_end_time or "14:00",
+        "max_lunch_duration_mins": int(req.max_lunch_duration_mins or 60),
+        "half_day_min_hours": float(req.half_day_min_hours or 4.0),
+        "full_day_min_hours": float(req.full_day_min_hours or 8.0),
+        "short_leave_max_hours": float(req.short_leave_max_hours or 2.0),
+        "short_leave_monthly_limit": int(req.short_leave_monthly_limit or 2),
+        "short_leave_penalty_rule": req.short_leave_penalty_rule or "half_day_per_2_excess",
+    }
+    if org_id == "system_org":
+        await settings_collection.update_one({"id": "config"}, {"$set": settings_mirror}, upsert=True)
+    else:
+        await settings_collection.update_one({"organization_id": org_id}, {"$set": settings_mirror}, upsert=True)
+
+    return {
+        "status": "success",
+        "message": f"Leave policy and attendance cutoffs updated for {year}",
+        **update_doc
+    }
+
+
+@app.put("/admin/leave-policy/employee/{email}")
+async def admin_update_employee_leave_quota(
+    email: str,
+    req: EmployeeLeaveQuotaUpdateRequest,
+    admin: dict = Depends(get_current_admin)
+):
+    """Set custom leave quota override for a specific employee."""
+    org_id = admin.organization_id or "system_org"
+    clean_email = email.strip().lower()
+    year = req.year or datetime.now(timezone.utc).year
+
+    override = {
+        "sick_leave": float(req.sick_leave),
+        "casual_leave": float(req.casual_leave),
+        "total_leave": float(req.total_leave)
+    }
+    if req.paid_leave_types is not None:
+        override["paid_leave_types"] = req.paid_leave_types
+    if req.unpaid_leave_types is not None:
+        override["unpaid_leave_types"] = req.unpaid_leave_types
+
+    await leave_policies_collection.update_one(
+        {"organization_id": org_id, "year": year},
+        {
+            "$set": {
+                f"overrides.{clean_email}": override,
+                "updated_by": admin.email,
+                "updated_at": datetime.now(timezone.utc)
+            }
+        },
+        upsert=True
+    )
+
+    balance = await calculate_leave_balance(clean_email, org_id, year)
+    return {"status": "success", "message": f"Custom quota set for {clean_email}", "balance": balance}
+
+
+@app.get("/admin/leave-policy/employee/{email}/balance")
+async def admin_get_employee_leave_balance(
+    email: str,
+    year: Optional[int] = None,
+    month: Optional[str] = None,
+    admin: dict = Depends(get_current_admin)
+):
+    """Fetch live calculated leave balance for an employee."""
+    org_id = admin.organization_id or "system_org"
+    clean_email = email.strip().lower()
+    balance = await calculate_leave_balance(clean_email, org_id, year, month)
+    return balance
+
+
+@app.get("/api/leave/balance")
+async def employee_get_leave_balance(
+    year: Optional[int] = None,
+    month: Optional[str] = None,
+    employee: dict = Depends(get_current_employee)
+):
+    """Fetch live calculated leave balance for the logged-in employee."""
+    org_id = employee.get("organization_id", "system_org")
+    clean_email = employee["email"]
+    balance = await calculate_leave_balance(clean_email, org_id, year, month)
+    return balance
 
 
 
@@ -3890,15 +6512,18 @@ async def admin_list_expenses(status: Optional[str] = None, admin=Depends(get_cu
         query["status"] = status
     
     claims = await expense_claims_collection.find(query).sort("created_at", -1).to_list(length=200)
+    
+    emp_emails = list({c.get("employee_id") for c in claims if c.get("employee_id")})
+    employees = await employees_collection.find({"email": {"$in": emp_emails}}, {"email": 1, "full_name": 1}).to_list(length=len(emp_emails))
+    emp_map = {e["email"]: e["full_name"] for e in employees}
+
     for c in claims:
         c["_id"] = str(c["_id"])
         if isinstance(c.get("created_at"), datetime):
             c["created_at"] = c["created_at"].isoformat()
         if isinstance(c.get("resolved_at"), datetime):
             c["resolved_at"] = c["resolved_at"].isoformat()
-        # Enrich with employee name
-        emp = await employees_collection.find_one({"email": c.get("employee_id")})
-        c["employee_name"] = emp["full_name"] if emp else c.get("employee_id", "Unknown")
+        c["employee_name"] = emp_map.get(c.get("employee_id"), c.get("employee_id", "Unknown"))
     return claims
 
 
@@ -3942,6 +6567,7 @@ async def get_alerts(
     severity: Optional[str] = None,
     status: Optional[str] = "pending",
     employee_id: Optional[str] = None,
+    source: Optional[str] = None,
     admin=Depends(get_current_admin)
 ):
     """Retrieve filtered security and operational alerts."""
@@ -3950,14 +6576,18 @@ async def get_alerts(
     if severity: query["severity"] = severity
     if status and status != "all": query["status"] = status
     if employee_id: query["employee_id"] = employee_id
+    if source:
+        query["metadata.source"] = source
 
     alerts = await alerts_collection.find(query).sort("timestamp", -1).to_list(length=100)
     
+    emp_emails = list({a["employee_id"] for a in alerts if a.get("employee_id")})
+    employees = await employees_collection.find({"email": {"$in": emp_emails}}, {"email": 1, "full_name": 1}).to_list(length=len(emp_emails))
+    emp_map = {e["email"]: e["full_name"] for e in employees}
+
     for a in alerts:
         a["_id"] = str(a["_id"])
-        # Enrich with employee name
-        emp = await employees_collection.find_one({"email": a["employee_id"]})
-        a["employee_name"] = emp["full_name"] if emp else a["employee_id"]
+        a["employee_name"] = emp_map.get(a.get("employee_id"), a.get("employee_id"))
         if isinstance(a.get("timestamp"), datetime):
             a["timestamp"] = a["timestamp"].isoformat()
             
@@ -4080,11 +6710,17 @@ async def attendance_report(
     
     logs = await attendance_logs_collection.find(query).sort("timestamp", -1).to_list(length=1000)
     
+    from bson import ObjectId
+    emp_ids = list({ObjectId(log["user_id"]) for log in logs if log.get("user_id") and ObjectId.is_valid(str(log["user_id"]))})
+    employees = await employees_collection.find({"_id": {"$in": emp_ids}}, {"_id": 1, "full_name": 1, "employee_type": 1, "email": 1}).to_list(length=len(emp_ids))
+    emp_map = {str(e["_id"]): e for e in employees}
+
     summary = {"total_records": len(logs), "check_ins": 0, "check_outs": 0, "unique_employees": set()}
     enriched = []
     
     for log in logs:
-        emp = await employees_collection.find_one({"_id": ObjectId(log["user_id"])})
+        emp_id_str = str(log.get("user_id", ""))
+        emp = emp_map.get(emp_id_str)
         if employee_type and emp and emp.get("employee_type", "desk") != employee_type:
             continue
         
@@ -4098,7 +6734,7 @@ async def attendance_report(
             summary["check_ins"] += 1
         else:
             summary["check_outs"] += 1
-        summary["unique_employees"].add(log.get("email", ""))
+        summary["unique_employees"].add(emp.get("email", "") if emp else "")
         enriched.append(log)
     
     summary["unique_employees"] = len(summary["unique_employees"])
@@ -4518,14 +7154,70 @@ async def get_field_leaderboard(employee=Depends(get_current_employee)):
 
 
 # -----------------------------------------------------------------------------
-# AREA 3: MANAGER NUDGE
+# AREA 3: MANAGER & ADMIN NUDGE SYSTEM WITH REAL BACKGROUND PUSH NOTIFICATIONS
 # -----------------------------------------------------------------------------
+
+async def send_expo_push_notifications(
+    tokens: List[str], 
+    title: str, 
+    body: str, 
+    data: Optional[Dict] = None, 
+    sound: str = "default", 
+    channel_id: str = "nudges"
+):
+    """
+    Sends real background push notifications via Expo Push Notification API.
+    Works even when the mobile app is in the background or killed.
+    """
+    if not tokens:
+        return
+    
+    valid_tokens = []
+    for t in tokens:
+        if isinstance(t, str) and (t.startswith("ExponentPushToken[") or t.startswith("ExpoPushToken[")):
+            valid_tokens.append(t)
+            
+    if not valid_tokens:
+        logger.info("[PUSH] No valid Expo push tokens found among provided candidates.")
+        return
+    
+    valid_tokens = list(set(valid_tokens))
+
+    messages = [
+        {
+            "to": token,
+            "sound": sound,
+            "title": title,
+            "body": body,
+            "data": data or {},
+            "priority": "high",
+            "channelId": channel_id,
+            "_displayInForeground": True
+        }
+        for token in valid_tokens
+    ]
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                "https://exp.host/--/api/v2/push/send",
+                json=messages,
+                headers={
+                    "Accept": "application/json",
+                    "Accept-Encoding": "gzip, deflate",
+                    "Content-Type": "application/json"
+                }
+            )
+            logger.info(f"[PUSH] Expo push notification dispatched to {len(valid_tokens)} device(s). Status: {resp.status_code}")
+    except Exception as e:
+        logger.error(f"[PUSH] Error sending Expo push notifications: {e}")
+
 
 @app.post("/api/manager/nudge")
 async def send_manager_nudge(req: dict, manager=Depends(get_current_employee)):
     """
-    Manager sends a motivational nudge to one or more team members.
-    Logged to DB. FCM push notification can be added here in production.
+    Manager sends a motivational nudge to one or more team members or all.
+    Dispatches real background push notifications to field employees' devices.
     """
     # Verify manager status
     subordinates_count = await employees_collection.count_documents({"manager_id": manager["email"]})
@@ -4533,43 +7225,78 @@ async def send_manager_nudge(req: dict, manager=Depends(get_current_employee)):
         raise HTTPException(status_code=403, detail="Only managers can send nudges.")
 
     employee_emails = req.get("employee_emails", [])
+    recipient_type = req.get("recipient_type", "individual")  # 'individual' or 'all'
     message = req.get("message", "").strip()
-    nudge_type = req.get("nudge_type", "general")  # general | target_missed | late_start | great_job
+    nudge_type = req.get("nudge_type", "general")
 
-    if not employee_emails:
-        raise HTTPException(status_code=400, detail="At least one employee email is required.")
     if not message:
         raise HTTPException(status_code=400, detail="Nudge message cannot be empty.")
 
-    # Verify all recipients belong to the manager
-    valid_recipients = []
-    for email in employee_emails:
-        emp = await employees_collection.find_one({"email": email, "manager_id": manager["email"]})
-        if emp:
-            valid_recipients.append(email)
+    # If sending to all subordinates or "all" in employee_emails
+    if recipient_type == "all" or "all" in employee_emails or not employee_emails:
+        recipient_type = "all"
+        cursor = employees_collection.find({"manager_id": manager["email"], "is_active": {"$ne": False}})
+        subordinates = await cursor.to_list(length=500)
+        valid_recipients = [s["email"] for s in subordinates if s.get("email")]
+    else:
+        valid_recipients = []
+        for email in employee_emails:
+            emp = await employees_collection.find_one({"email": email, "manager_id": manager["email"]})
+            if emp:
+                valid_recipients.append(email)
 
     if not valid_recipients:
         raise HTTPException(status_code=400, detail="No valid team members found in the provided emails.")
 
-    # Save nudge log
+    manager_name = manager.get("full_name") or manager.get("name") or manager.get("email")
+
     nudge_log = {
         "manager_id": manager["email"],
-        "manager_name": manager.get("full_name", manager["email"]),
+        "manager_name": manager_name,
         "organization_id": manager.get("organization_id"),
         "recipients": valid_recipients,
+        "recipient_type": recipient_type,
         "message": message,
         "nudge_type": nudge_type,
+        "read_by": [],
         "sent_at": datetime.now(timezone.utc),
-        # FCM push would go here in production: firebase_admin.messaging.send_multicast(...)
     }
     result = await nudge_logs_collection.insert_one(nudge_log)
+    nudge_id = str(result.inserted_id)
 
-    logger.info(f"Manager nudge sent by {manager['email']} to {valid_recipients}: [{nudge_type}] {message}")
+    # Collect push tokens for all recipients
+    push_tokens = []
+    async for emp in employees_collection.find({"email": {"$in": valid_recipients}}):
+        if emp.get("push_token"):
+            push_tokens.append(emp["push_token"])
+        if isinstance(emp.get("push_tokens"), list):
+            push_tokens.extend(emp["push_tokens"])
+
+    nudge_titles = {
+        "general": f"⚡ Message from {manager_name}",
+        "target_missed": f"🎯 Target Alert from {manager_name}",
+        "late_start": f"⏰ Schedule Alert from {manager_name}",
+        "great_job": f"🌟 Great Job from {manager_name}!"
+    }
+    title = nudge_titles.get(nudge_type, f"⚡ Nudge from {manager_name}")
+
+    push_data = {
+        "type": "nudge",
+        "nudge_id": nudge_id,
+        "nudge_type": nudge_type,
+        "sender_name": manager_name,
+        "sender_role": "Manager",
+        "message": message,
+        "sent_at": datetime.now(timezone.utc).isoformat()
+    }
+
+    asyncio.create_task(send_expo_push_notifications(push_tokens, title, message, push_data))
 
     return {
         "status": "sent",
-        "nudge_id": str(result.inserted_id),
+        "nudge_id": nudge_id,
         "recipients_count": len(valid_recipients),
+        "recipient_type": recipient_type,
         "recipients": valid_recipients,
         "message": f"Nudge sent to {len(valid_recipients)} team member(s)."
     }
@@ -4589,47 +7316,92 @@ async def get_nudge_history(manager=Depends(get_current_employee)):
 
     return logs
 
+
 @app.post("/admin/nudge")
 async def admin_send_nudge(req: dict, admin=Depends(get_current_admin)):
-    """Admin sends a motivational nudge to field team members in their organization."""
+    """
+    Admin sends a motivational nudge/message to field team members in their organization.
+    Supports private 1-to-1 nudge or broadcast to all field team employees.
+    Dispatches real background push notifications to field employees' devices.
+    """
     org_id = admin.organization_id
     employee_emails = req.get("employee_emails", [])
+    recipient_type = req.get("recipient_type", "individual")  # 'individual' or 'all'
     message = req.get("message", "").strip()
     nudge_type = req.get("nudge_type", "general")
 
-    if not employee_emails:
-        raise HTTPException(status_code=400, detail="At least one employee email is required.")
     if not message:
         raise HTTPException(status_code=400, detail="Nudge message cannot be empty.")
 
-    # Verify recipients belong to same organization
-    valid_recipients = []
-    for email in employee_emails:
-        query = {"email": email}
+    if recipient_type == "all" or "all" in employee_emails or not employee_emails:
+        recipient_type = "all"
+        query = {"is_active": {"$ne": False}}
         if org_id:
             query["organization_id"] = org_id
-            
-        emp = await employees_collection.find_one(query)
-        if emp:
-            valid_recipients.append(email)
+        all_emps = await employees_collection.find(query).to_list(length=1000)
+        valid_recipients = [e["email"] for e in all_emps if e.get("email")]
+    else:
+        valid_recipients = []
+        for email in employee_emails:
+            query = {"email": email}
+            if org_id:
+                query["organization_id"] = org_id
+            emp = await employees_collection.find_one(query)
+            if emp:
+                valid_recipients.append(email)
 
     if not valid_recipients:
         raise HTTPException(status_code=400, detail="No valid employees found in your organization.")
 
+    admin_name = getattr(admin, "full_name", None) or getattr(admin, "name", None) or admin.email
+
     nudge_log = {
         "admin_id": admin.email,
-        "admin_name": admin.full_name,
+        "admin_name": admin_name,
         "organization_id": org_id,
         "recipients": valid_recipients,
+        "recipient_type": recipient_type,
         "message": message,
         "nudge_type": nudge_type,
+        "read_by": [],
         "sent_at": datetime.now(timezone.utc),
     }
     result = await nudge_logs_collection.insert_one(nudge_log)
+    nudge_id = str(result.inserted_id)
+
+    # Collect push tokens
+    push_tokens = []
+    async for emp in employees_collection.find({"email": {"$in": valid_recipients}}):
+        if emp.get("push_token"):
+            push_tokens.append(emp["push_token"])
+        if isinstance(emp.get("push_tokens"), list):
+            push_tokens.extend(emp["push_tokens"])
+
+    nudge_titles = {
+        "general": f"📢 Announcement from {admin_name}",
+        "target_missed": f"🎯 Target Alert from Admin",
+        "late_start": f"⏰ Attendance Notice from Admin",
+        "great_job": f"🏆 Recognition from Admin!"
+    }
+    title = nudge_titles.get(nudge_type, f"⚡ Message from Admin ({admin_name})")
+
+    push_data = {
+        "type": "nudge",
+        "nudge_id": nudge_id,
+        "nudge_type": nudge_type,
+        "sender_name": admin_name,
+        "sender_role": "Admin",
+        "message": message,
+        "sent_at": datetime.now(timezone.utc).isoformat()
+    }
+
+    asyncio.create_task(send_expo_push_notifications(push_tokens, title, message, push_data))
+
     return {
         "status": "sent",
-        "nudge_id": str(result.inserted_id),
+        "nudge_id": nudge_id,
         "recipients_count": len(valid_recipients),
+        "recipient_type": recipient_type,
         "message": f"Nudge sent to {len(valid_recipients)} member(s)."
     }
 
@@ -4649,6 +7421,90 @@ async def admin_get_nudge_history(admin=Depends(get_current_admin)):
             log["sent_at"] = log["sent_at"].isoformat()
 
     return logs
+
+
+# -----------------------------------------------------------------------------
+# EMPLOYEE NUDGE & PUSH NOTIFICATION TOKEN ENDPOINTS
+# -----------------------------------------------------------------------------
+
+@app.post("/api/employee/push-token")
+async def register_push_token(req: dict, emp=Depends(get_current_employee)):
+    """
+    Register mobile Expo push token for the current employee.
+    Enables real background notifications even when the app is closed.
+    """
+    token = req.get("push_token") or req.get("token")
+    device_info = req.get("device_info", {})
+    if not token:
+        raise HTTPException(status_code=400, detail="push_token is required.")
+        
+    await employees_collection.update_one(
+        {"email": emp["email"]},
+        {
+            "$set": {
+                "push_token": token,
+                "push_token_updated_at": datetime.now(timezone.utc),
+                "device_info": device_info
+            },
+            "$addToSet": {
+                "push_tokens": token
+            }
+        }
+    )
+    return {"status": "success", "message": "Push token registered successfully"}
+
+
+@app.get("/api/employee/nudges")
+async def get_employee_nudges(emp=Depends(get_current_employee)):
+    """
+    Fetch all nudges received by this employee (both targeted to them or broadcast to all in org).
+    """
+    org_id = emp.get("organization_id")
+    email = emp.get("email")
+
+    query = {
+        "$or": [
+            {"recipients": email},
+            {"recipient_type": "all", "organization_id": org_id},
+            {"recipients": "all", "organization_id": org_id}
+        ]
+    }
+    
+    logs = await nudge_logs_collection.find(query).sort("sent_at", -1).to_list(length=100)
+    result = []
+    for log in logs:
+        log_id = str(log["_id"])
+        read_by = log.get("read_by", [])
+        is_read = email in read_by
+        sent_at_val = log.get("sent_at")
+        sent_at_str = sent_at_val.isoformat() if isinstance(sent_at_val, datetime) else str(sent_at_val or "")
+
+        result.append({
+            "id": log_id,
+            "_id": log_id,
+            "sender_name": log.get("admin_name") or log.get("manager_name") or "Management",
+            "sender_role": "Admin" if log.get("admin_id") else "Manager",
+            "message": log.get("message", ""),
+            "nudge_type": log.get("nudge_type", "general"),
+            "sent_at": sent_at_str,
+            "is_read": is_read
+        })
+    return result
+
+
+@app.post("/api/employee/nudges/{nudge_id}/read")
+async def mark_nudge_read(nudge_id: str, emp=Depends(get_current_employee)):
+    """Mark a nudge as read by this employee."""
+    try:
+        oid = ObjectId(nudge_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid nudge ID")
+
+    await nudge_logs_collection.update_one(
+        {"_id": oid},
+        {"$addToSet": {"read_by": emp["email"]}}
+    )
+    return {"status": "success", "message": "Marked as read"}
 
 @app.get("/admin/leaderboard")
 async def get_admin_leaderboard(admin=Depends(get_current_admin)):
@@ -4785,17 +7641,47 @@ async def get_employee_monthly_summary(
         "timestamp": {"$gte": start_date, "$lt": end_date}
     }).sort("timestamp", 1).to_list(length=1000)
 
-    # 3. Fetch Approved Leaves for the month
-    # Fix: Correct overlap logic and case-insensitivity for status
-    month_start_str = month + "-01"
-    month_end_str = next_month.strftime("%Y-%m-%d")
-    
-    leaves = await leave_requests_collection.find({
-        "employee_id": email,
-        "status": {"$regex": "^approved$", "$options": "i"},
-        "start_date": {"$lt": month_end_str},
-        "end_date": {"$gte": month_start_str}
-    }).to_list(length=50)
+    # 3. Fetch Approved Leaves for the month (flexible identifier matching)
+    clean_email = email.strip().lower()
+    emp_identifiers = [clean_email, email.strip()]
+    if "_id" in employee:
+        emp_identifiers.append(str(employee["_id"]))
+    if "employee_id" in employee and employee["employee_id"]:
+        emp_identifiers.append(str(employee["employee_id"]).strip())
+
+    raw_leaves = await leave_requests_collection.find({
+        "$or": [
+            {"employee_id": {"$in": emp_identifiers}},
+            {"email": {"$in": emp_identifiers}}
+        ],
+        "status": {"$regex": "^approved$", "$options": "i"}
+    }).to_list(length=100)
+
+    leaves = []
+    for rl in raw_leaves:
+        norm_s = normalize_date_str(rl.get("start_date", ""))
+        norm_e = normalize_date_str(rl.get("end_date", ""))
+        if norm_s:
+            rl["start_date"] = norm_s
+            rl["end_date"] = norm_e or norm_s
+            leaves.append(rl)
+
+    raw_pending = await leave_requests_collection.find({
+        "$or": [
+            {"employee_id": {"$in": emp_identifiers}},
+            {"email": {"$in": emp_identifiers}}
+        ],
+        "status": {"$regex": "^pending$", "$options": "i"}
+    }).to_list(length=100)
+
+    pending_leaves = []
+    for rp in raw_pending:
+        norm_s = normalize_date_str(rp.get("start_date", ""))
+        norm_e = normalize_date_str(rp.get("end_date", ""))
+        if norm_s:
+            rp["start_date"] = norm_s
+            rp["end_date"] = norm_e or norm_s
+            pending_leaves.append(rp)
 
     # 4. Process Data Day by Day
     daily_breakdown = []
@@ -4804,10 +7690,71 @@ async def get_employee_monthly_summary(
     absent_days = 0
     leaves_count = 0
     
-    # We must loop through local days, so start with the local month boundary
-    # Assuming IST (330 offset) if org missing settings -> fallback 330
-    tz_offset = 330 # Should fetch from settings ideally
-    
+    # Fetch org settings for timezone and shift times (unified from settings + leave_policy)
+    org_id = employee.get("organization_id")
+    org_doc = await get_effective_org_settings(org_id)
+    tz_offset = org_doc.get("timezone_offset", 330)
+
+    if employee.get("employee_type") == "field":
+        office_end_time_str = org_doc.get("field_office_end_time") or org_doc.get("office_end_time", "18:00")
+        office_start_time_str = org_doc.get("field_office_start_time") or org_doc.get("office_start_time", "10:00")
+        late_threshold_mins = org_doc.get("field_late_grace_mins") if org_doc.get("field_late_grace_mins") is not None else org_doc.get("field_late_threshold_mins", 30)
+    else:
+        office_end_time_str = org_doc.get("office_end_time", "18:00")
+        office_start_time_str = org_doc.get("office_start_time", "10:00")
+        late_threshold_mins = org_doc.get("late_grace_mins") if org_doc.get("late_grace_mins") is not None else org_doc.get("late_threshold_mins", 15)
+
+    # Fetch configured days off / holidays for this organization and month
+    days_off_set = set()
+    holiday_names = {}
+    if org_id:
+        try:
+            # 1. Fetch days_off doc (has composite days_off array)
+            h_doc = await holidays_collection.find_one({
+                "$or": [
+                    {"organization_id": str(org_id), "payroll_month": month, "days_off": {"$exists": True}},
+                    {"organization_id": "system_org", "payroll_month": month, "days_off": {"$exists": True}}
+                ]
+            })
+            if h_doc:
+                days_off_set.update(h_doc.get("days_off", []))
+                holiday_names.update(h_doc.get("holiday_names", {}))
+
+            # 2. Fetch all named holidays for this month (e.g. Janmashtami, festival, company)
+            named_holidays = await holidays_collection.find({
+                "$or": [
+                    {"organization_id": str(org_id), "payroll_month": month, "date": {"$exists": True}},
+                    {"organization_id": "system_org", "payroll_month": month, "date": {"$exists": True}}
+                ]
+            }).to_list(length=100)
+            for nh in named_holidays:
+                d_num = None
+                if "day" in nh and nh["day"] is not None:
+                    d_num = int(nh["day"])
+                elif "date" in nh and nh["date"]:
+                    try:
+                        d_num = int(str(nh["date"]).split("-")[2])
+                    except Exception:
+                        pass
+                if d_num is not None:
+                    days_off_set.add(d_num)
+                    holiday_names[str(d_num)] = nh.get("name") or "Holiday"
+
+            # 3. Always include all Sundays in this month as weekends
+            try:
+                y_m = month.split("-")
+                month_days_cnt = calendar.monthrange(int(y_m[0]), int(y_m[1]))[1]
+                for di in range(1, month_days_cnt + 1):
+                    if datetime(int(y_m[0]), int(y_m[1]), di).weekday() == 6:
+                        days_off_set.add(di)
+            except Exception:
+                pass
+        except Exception as e:
+            logger.warning(f"Failed to fetch holidays in monthly summary: {e}")
+
+    start_h, start_m = map(int, office_start_time_str.split(":"))
+    end_h, end_m = map(int, office_end_time_str.split(":"))
+
     local_start_of_month = start_date + timedelta(minutes=tz_offset)
     local_month_end = end_date + timedelta(minutes=tz_offset)
     local_now = datetime.now(timezone.utc) + timedelta(minutes=tz_offset)
@@ -4841,24 +7788,64 @@ async def get_employee_monthly_summary(
         day_info = {
             "date": day_str,
             "status": "Absent",
+            "is_late": False,
+            "is_early_leave": False,
+            "is_short_leave": False,
+            "is_half_day": False,
+            "short_leave_type": None,
+            "half_day_type": None,
+            "late_mins": 0,
+            "early_exit_mins": 0,
+            "late_off_hours": 0.0,
+            "early_off_hours": 0.0,
+            "off_hours": 0.0,
+            "required_hours": 8.0,
+            "effective_days": 0.0,
+            "classification_reason": "",
+            "is_applied_leave": False,
             "first_in": None,
             "last_out": None,
             "duration_hours": 0,
             "logs": []
         }
 
-        # Check for Weekend (Saturday=5, Sunday=6)
-        if current_day_local.weekday() >= 5:
-            day_info["status"] = "Weekend"
-
-        # Check for Leave
-        is_on_leave = False
+        # 1. Check for Approved Leave on this day
+        matching_leave = None
         for leave in leaves:
-            if leave["start_date"] <= day_str <= leave["end_date"]:
-                day_info["status"] = f"Leave ({leave.get('leave_type', 'General')})"
-                is_on_leave = True
+            s_date = str(leave.get("start_date", ""))[:10]
+            e_date = str(leave.get("end_date", ""))[:10]
+            if s_date and e_date and (s_date <= day_str <= e_date):
+                matching_leave = leave
                 leaves_count += 1
                 break
+
+        # 2. Check for Pending Leave on this day
+        is_pending_leave = False
+        pending_label = None
+        if not matching_leave:
+            for pl in pending_leaves:
+                s_date = str(pl.get("start_date", ""))[:10]
+                e_date = str(pl.get("end_date", ""))[:10]
+                if s_date and e_date and (s_date <= day_str <= e_date):
+                    l_type = pl.get("leave_type", "General")
+                    pending_label = f"Pending Leave ({l_type})"
+                    is_pending_leave = True
+                    break
+
+        # 3. Check for Configured Holidays / Days Off / Weekend
+        day_num = current_day_local.day
+        is_weekend_or_holiday = False
+        if day_num in days_off_set:
+            is_weekend_or_holiday = True
+            if current_day_local.weekday() == 6:
+                day_info["status"] = "Weekend"
+            elif current_day_local.weekday() == 5:
+                day_info["status"] = holiday_names.get(str(day_num), "Weekend")
+            else:
+                day_info["status"] = holiday_names.get(str(day_num), "Holiday")
+        elif current_day_local.weekday() >= 5:
+            is_weekend_or_holiday = True
+            day_info["status"] = "Weekend"
 
         if day_logs:
             day_logs.sort(key=lambda x: x["timestamp"])
@@ -4866,74 +7853,141 @@ async def get_employee_monthly_summary(
             
             day_info["first_in"] = day_logs[0]["timestamp"].replace(tzinfo=timezone.utc).isoformat()
             
-            # Calculate duration: simplify by taking last check-out - first check-in
-            # Better: sum durations between paired IN and OUT
             day_duration_ms = 0
             last_in_time = None
             
             for log in day_logs:
-                # Dynamically calculate is_late to override buggy legacy historical DB states
-                is_late = log.get("is_late", False)
-                if log["type"] == "check-in":
-                    # strictly check if time is past 10:15 local time
-                    local_time = log["timestamp"].replace(tzinfo=timezone.utc) + timedelta(minutes=tz_offset)
-                    if local_time.hour > 10 or (local_time.hour == 10 and local_time.minute > 15):
-                        is_late = True
-                    else:
-                        is_late = False
+                log_ts = log["timestamp"]
+                if log_ts.tzinfo is None:
+                    log_ts = log_ts.replace(tzinfo=timezone.utc)
+                local_log_time = log_ts + timedelta(minutes=tz_offset)
+                
+                log_type = log.get("type", "")
+                log_status = log.get("attendance_status") or "Present"
 
                 # Basic representation for frontend
                 day_info["logs"].append({
-                    "time": log["timestamp"].replace(tzinfo=timezone.utc).isoformat(),
-                    "type": log["type"],
-                    "status": "Late" if is_late else "Early Leave" if log.get("is_early_leave") else "Present",
+                    "time": log_ts.isoformat(),
+                    "type": log_type,
+                    "status": log_status,
+                    "attendance_status": log.get("attendance_status", log_status),
+                    "is_short_leave": log.get("is_short_leave", False),
+                    "is_half_day": log.get("is_half_day", False),
+                    "off_hours": log.get("off_hours", 0.0),
                     "method": log.get("check_in_method", "N/A"),
-                    "location": log.get("location"),
+                    "location": log.get("location") or ({"lat": log.get("lat"), "long": log.get("long")} if (log.get("lat") is not None) else None),
+                    "lat": (log.get("location") or {}).get("lat", log.get("lat")),
+                    "long": (log.get("location") or {}).get("long", log.get("long")),
+                    "address": log.get("address") or log.get("location_name"),
+                    "location_name": log.get("location_name") or log.get("address"),
                     "selfie": log.get("selfie_url"),
                     "wifi_confidence": log.get("wifi_confidence", 0)
                 })
 
-                if log["type"] == "check-in":
-                    last_in_time = log["timestamp"]
-                    if last_in_time.tzinfo is None:
-                        last_in_time = last_in_time.replace(tzinfo=timezone.utc)
-                elif log["type"] == "check-out" and last_in_time:
-                    # Ensure log timestamp is aware
-                    log_ts = log["timestamp"]
-                    if log_ts.tzinfo is None:
-                        log_ts = log_ts.replace(tzinfo=timezone.utc)
-                    
-                    delta = log_ts - last_in_time
-                    day_duration_ms += delta.total_seconds() * 1000
-                    last_in_time = None
+                if log_type == "check-in":
+                    last_in_time = log_ts
+                elif log_type == "check-out":
                     day_info["last_out"] = log_ts.isoformat()
+                    if last_in_time:
+                        delta = log_ts - last_in_time
+                        day_duration_ms += delta.total_seconds() * 1000
+                        last_in_time = None
 
-            day_info["duration_hours"] = round(day_duration_ms / (1000 * 3600), 2)
+            duration_hours = round(day_duration_ms / (1000 * 3600), 2)
+            day_info["duration_hours"] = duration_hours
             total_working_ms += day_duration_ms
 
-            # Set status to Early Leave if the last check-out on this day was flagged
-            if any(l.get("type") == "check-out" and l.get("is_early_leave") for l in day_logs):
-                 day_info["status"] = "Early Leave"
-            else:
-                 # Check if the very first check-in log is dynamically evaluated as late
-                 first_checkin = [l for l in day_logs if l["type"] == "check-in"]
-                 if first_checkin:
-                     loc_time = first_checkin[0]["timestamp"].replace(tzinfo=timezone.utc) + timedelta(minutes=tz_offset)
-                     if loc_time.hour > 10 or (loc_time.hour == 10 and loc_time.minute > 15):
-                         day_info["status"] = "Late"
-                     else:
-                         day_info["status"] = "Present"
-                 else:
-                     day_info["status"] = "Present"
+            # Comprehensive classification via classify_attendance_day
+            checkout_logs = [l for l in day_logs if l.get("type") == "check-out"]
+            first_checkin = [l for l in day_logs if l.get("type") == "check-in"]
+
+            first_in_ts = first_checkin[0]["timestamp"] if first_checkin else day_logs[0]["timestamp"]
+            if first_in_ts.tzinfo is None: first_in_ts = first_in_ts.replace(tzinfo=timezone.utc)
+            local_first_in = first_in_ts + timedelta(minutes=tz_offset)
+
+            local_last_out = None
+            if checkout_logs:
+                last_ts = checkout_logs[-1]["timestamp"]
+                if last_ts.tzinfo is None: last_ts = last_ts.replace(tzinfo=timezone.utc)
+                local_last_out = last_ts + timedelta(minutes=tz_offset)
+
+            classification = classify_attendance_day(
+                first_checkin_local=local_first_in,
+                last_checkout_local=local_last_out,
+                worked_hours=duration_hours,
+                settings=org_doc or {},
+                employee_type=employee.get("employee_type", "desk"),
+                approved_leave=matching_leave
+            )
+
+            day_info["status"] = classification["status"]
+            day_info["is_late"] = classification["is_late"]
+            day_info["is_early_leave"] = classification["is_early_leave"]
+            day_info["is_short_leave"] = classification["is_short_leave"]
+            day_info["is_half_day"] = classification["is_half_day"]
+            day_info["short_leave_type"] = classification["short_leave_type"]
+            day_info["half_day_type"] = classification["half_day_type"]
+            day_info["late_mins"] = classification["late_mins"]
+            day_info["early_exit_mins"] = classification["early_exit_mins"]
+            day_info["late_off_hours"] = classification["late_off_hours"]
+            day_info["early_off_hours"] = classification["early_off_hours"]
+            day_info["off_hours"] = classification["off_hours"]
+            day_info["required_hours"] = classification["required_hours"]
+            day_info["effective_days"] = classification["effective_days"]
+            day_info["classification_reason"] = classification["classification_reason"]
+            day_info["is_applied_leave"] = classification["is_applied_leave"]
+
         else:
-            # Not present and not weekend and not leave -> Absent
-            if day_info["status"] == "Absent":
+            # No attendance logs on this day
+            if matching_leave:
+                classification = classify_attendance_day(
+                    first_checkin_local=None,
+                    last_checkout_local=None,
+                    worked_hours=0.0,
+                    settings=org_doc or {},
+                    employee_type=employee.get("employee_type", "desk"),
+                    approved_leave=matching_leave
+                )
+                day_info["status"] = classification["status"]
+                day_info["is_short_leave"] = classification["is_short_leave"]
+                day_info["is_half_day"] = classification["is_half_day"]
+                day_info["short_leave_type"] = classification["short_leave_type"]
+                day_info["half_day_type"] = classification["half_day_type"]
+                day_info["off_hours"] = classification["off_hours"]
+                day_info["effective_days"] = classification["effective_days"]
+                day_info["classification_reason"] = classification["classification_reason"]
+                day_info["is_applied_leave"] = True
+            elif is_pending_leave:
+                day_info["status"] = pending_label
+                day_info["classification_reason"] = "Pending Leave Approval"
+            elif is_weekend_or_holiday:
+                day_info["classification_reason"] = day_info["status"]
+                day_info["off_hours"] = 0.0
+                day_info["effective_days"] = 1.0 if day_info["status"] not in ["Weekend"] else 0.0
+            else:
+                day_info["status"] = "Absent"
+                day_info["classification_reason"] = "Unexcused Absence"
                 absent_days += 1
+                req_h = float((org_doc or {}).get("required_hours", 8.0))
+                day_info["off_hours"] = req_h
+                day_info["required_hours"] = req_h
 
         daily_breakdown.append(day_info)
         current_day_local = next_day_local
 
-    # 5. Summary Metrics
+    # Calculate holiday count from breakdown
+    holiday_days_count = sum(1 for d in daily_breakdown if d.get("status") not in ["Present", "Late", "Early Leave", "Short Leave", "Half Day", "Absent", "Weekend"] and not str(d.get("status", "")).startswith("Leave") and not str(d.get("status", "")).startswith("Pending Leave"))
+    
+    # Calculate Short Leave & Half Day metrics
+    short_leave_days = sum(1 for d in daily_breakdown if d.get("is_short_leave"))
+    half_day_days = sum(1 for d in daily_breakdown if d.get("is_half_day"))
+    total_off_hours = round(sum(d.get("off_hours", 0.0) for d in daily_breakdown if d.get("status") not in ["Weekend", "Holiday"] and not str(d.get("status", "")).startswith("Leave")), 2)
+    total_late_off_hours = round(sum(d.get("late_off_hours", 0.0) for d in daily_breakdown), 2)
+    total_early_off_hours = round(sum(d.get("early_off_hours", 0.0) for d in daily_breakdown), 2)
+
+    # Live leave balance for this year and month (including unexcused absent days in total deduction)
+    leave_balance = await calculate_leave_balance(email, org_id or "system_org", year, month, absent_days=absent_days)
+
     total_hours = round(total_working_ms / (1000 * 3600), 2)
     avg_hours = round(total_hours / present_days, 2) if present_days > 0 else 0
 
@@ -4949,8 +8003,16 @@ async def get_employee_monthly_summary(
             "total_working_hours": total_hours,
             "average_daily_hours": avg_hours,
             "present_days": present_days,
-            "leaves_taken": len(leaves),
-            "absent_days": absent_days
+            "leaves_taken": leaves_count,
+            "absent_days": absent_days,
+            "short_leave_days": short_leave_days,
+            "half_day_days": half_day_days,
+            "total_off_hours": total_off_hours,
+            "total_late_off_hours": total_late_off_hours,
+            "total_early_off_hours": total_early_off_hours,
+            "holiday_days": holiday_days_count,
+            "total_days_evaluated": len(daily_breakdown),
+            "leave_balance": leave_balance
         },
         "daily_breakdown": daily_breakdown
     }
@@ -4990,6 +8052,2822 @@ async def admin_bulk_update_employees(req: dict, admin=Depends(get_current_admin
         "matched_count": result.matched_count
     }
 
+
+
+# =========================
+# WFH DEVICE APIs
+# =========================
+
+@app.post("/api/wfh/device-info")
+async def register_wfh_device(req: dict, employee=Depends(get_current_employee)):
+    """
+    WFH desktop app registers or updates employee device info.
+    Employee must be logged in with normal employee JWT.
+    """
+
+    employee_email = employee.get("email")
+    employee_id = str(employee.get("_id"))
+    org_id = employee.get("organization_id")
+
+    if not org_id:
+        raise HTTPException(status_code=400, detail="Employee organization_id missing")
+
+    device_id = req.get("device_id")
+    if not device_id:
+        raise HTTPException(status_code=400, detail="device_id is required")
+
+    existing_device = await wfh_device_info_collection.find_one({
+        "employee_id": employee_id,
+        "device_id": device_id,
+        "organization_id": org_id
+    })
+
+    now = datetime.now(timezone.utc)
+
+    device_data = {
+        "employee_id": employee_id,
+        "employee_email": employee_email,
+        "employee_name": employee.get("full_name", ""),
+        "organization_id": org_id,
+        "device_id": device_id,
+        "mac_address": req.get("mac_address"),
+        "cpu_id": req.get("cpu_id"),
+        "os_info": req.get("os_info"),
+        "hostname": req.get("hostname"),
+        "ip_local": req.get("ip_local"),
+        "ip_public": req.get("ip_public"),
+        "ram_gb": req.get("ram_gb"),
+        "screen_resolution": req.get("screen_resolution"),
+        "monitor_count": req.get("monitor_count"),
+        "last_seen": now,
+        "updated_at": now
+    }
+
+    if existing_device:
+        await wfh_device_info_collection.update_one(
+            {"_id": existing_device["_id"]},
+            {"$set": device_data}
+        )
+
+        existing_device["_id"] = str(existing_device["_id"])
+
+        return {
+            "status": "success",
+            "message": "WFH device updated successfully",
+            "device_status": existing_device.get("status", "pending"),
+            "device_id": device_id
+        }
+
+    AUTO_APPROVE = os.getenv("AUTO_APPROVE_WFH_DEVICES", "false").lower() == "true"
+
+    device_data["status"] = "approved" if AUTO_APPROVE else "pending"
+    device_data["registered_at"] = now
+    device_data["approved_by"] = "auto-approved" if AUTO_APPROVE else None
+    device_data["approved_at"] = now if AUTO_APPROVE else None
+    device_data["revoked_by"] = None
+    device_data["revoked_at"] = None
+    device_data["revoke_reason"] = None
+
+    result = await wfh_device_info_collection.insert_one(device_data)
+
+    return {
+        "status": "success",
+        "message": "WFH device approved." if AUTO_APPROVE else "WFH device registered. Waiting for admin approval.",
+        "device_status": "approved" if AUTO_APPROVE else "pending",
+        "device_record_id": str(result.inserted_id),
+        "device_id": device_id
+    }
+
+
+@app.get("/api/wfh/my-device")
+async def get_my_wfh_device(device_id: Optional[str] = None, employee=Depends(get_current_employee)):
+    """
+    Employee checks current WFH device approval status.
+    """
+
+    employee_id = str(employee.get("_id"))
+    org_id = employee.get("organization_id")
+
+    query = {
+        "employee_id": employee_id,
+        "organization_id": org_id
+    }
+
+    if device_id:
+        query["device_id"] = device_id
+
+    device = await wfh_device_info_collection.find_one(query, sort=[("registered_at", -1)])
+
+    if not device:
+        return {
+            "registered": False,
+            "device_status": "unregistered"
+        }
+
+    device["_id"] = str(device["_id"])
+
+    return {
+        "registered": True,
+        "device": device,
+        "device_status": device.get("status", "pending")
+    }
+
+
+@app.get("/admin/wfh/devices")
+async def admin_list_wfh_devices(
+    status: Optional[str] = None,
+    current_admin: Admin = Depends(get_current_admin)
+):
+    """
+    Admin lists all WFH registered devices in their organization.
+    """
+
+    org_id = current_admin.organization_id
+
+    query = {}
+
+    if org_id and org_id != "system_org":
+        query["organization_id"] = org_id
+
+    if status:
+        query["status"] = status
+
+    cursor = wfh_device_info_collection.find(query).sort("registered_at", -1)
+    devices = await cursor.to_list(length=1000)
+
+    for device in devices:
+        device["_id"] = str(device["_id"])
+
+    return devices
+
+
+@app.post("/admin/wfh/devices/{device_record_id}/approve")
+async def admin_approve_wfh_device(
+    device_record_id: str,
+    current_admin: Admin = Depends(get_current_admin)
+):
+    """
+    Admin approves a WFH device.
+    """
+
+    if not ObjectId.is_valid(device_record_id):
+        raise HTTPException(status_code=400, detail="Invalid device record id")
+
+    query = {"_id": ObjectId(device_record_id)}
+
+    if current_admin.organization_id and current_admin.organization_id != "system_org":
+        query["organization_id"] = current_admin.organization_id
+
+    device = await wfh_device_info_collection.find_one(query)
+
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+
+    now = datetime.now(timezone.utc)
+
+    await wfh_device_info_collection.update_one(
+        {"_id": ObjectId(device_record_id)},
+        {
+            "$set": {
+                "status": "approved",
+                "approved_by": current_admin.email,
+                "approved_at": now,
+                "revoked_by": None,
+                "revoked_at": None,
+                "revoke_reason": None
+            }
+        }
+    )
+
+    return {
+        "status": "success",
+        "message": "WFH device approved successfully"
+    }
+
+
+@app.post("/admin/wfh/devices/{device_record_id}/revoke")
+async def admin_revoke_wfh_device(
+    device_record_id: str,
+    req: dict,
+    current_admin: Admin = Depends(get_current_admin)
+):
+    """
+    Admin revokes a WFH device.
+    """
+
+    if not ObjectId.is_valid(device_record_id):
+        raise HTTPException(status_code=400, detail="Invalid device record id")
+
+    query = {"_id": ObjectId(device_record_id)}
+
+    if current_admin.organization_id and current_admin.organization_id != "system_org":
+        query["organization_id"] = current_admin.organization_id
+
+    device = await wfh_device_info_collection.find_one(query)
+
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+
+    now = datetime.now(timezone.utc)
+
+    await wfh_device_info_collection.update_one(
+        {"_id": ObjectId(device_record_id)},
+        {
+            "$set": {
+                "status": "revoked",
+                "revoked_by": current_admin.email,
+                "revoked_at": now,
+                "revoke_reason": req.get("reason", "Revoked by admin")
+            }
+        }
+    )
+
+    return {
+        "status": "success",
+        "message": "WFH device revoked successfully"
+    }
+
+# =========================
+# WFH ATTENDANCE APIs
+# =========================
+
+async def verify_wfh_device(employee_id: str, org_id: str, device_id: str):
+    if not device_id:
+        raise HTTPException(status_code=400, detail="device_id is required")
+
+    AUTO_APPROVE = os.getenv("AUTO_APPROVE_WFH_DEVICES", "true").lower() == "true"
+
+    device = await wfh_device_info_collection.find_one({
+        "employee_id": employee_id,
+        "organization_id": org_id,
+        "device_id": device_id
+    })
+
+    if not device:
+        if AUTO_APPROVE:
+            from bson import ObjectId
+            employee = await employees_collection.find_one({"_id": ObjectId(employee_id)})
+            now = datetime.now(timezone.utc)
+            device_doc = {
+                "employee_id": employee_id,
+                "employee_email": employee.get("email") if employee else "",
+                "employee_name": employee.get("full_name", "") if employee else "",
+                "organization_id": org_id,
+                "device_id": device_id,
+                "status": "approved",
+                "registered_at": now,
+                "approved_at": now,
+                "approved_by": "auto-approved",
+                "last_seen": now,
+                "updated_at": now
+            }
+            await wfh_device_info_collection.insert_one(device_doc)
+            return device_doc
+
+        # Auto approve authenticated employee devices
+        from bson import ObjectId
+        employee = await employees_collection.find_one({"_id": ObjectId(employee_id)})
+        now = datetime.now(timezone.utc)
+        device_doc = {
+            "employee_id": employee_id,
+            "employee_email": employee.get("email") if employee else "",
+            "employee_name": employee.get("full_name", "") if employee else "",
+            "organization_id": org_id,
+            "device_id": device_id,
+            "status": "approved",
+            "registered_at": now,
+            "approved_at": now,
+            "approved_by": "auto-approved",
+            "last_seen": now,
+            "updated_at": now
+        }
+        await wfh_device_info_collection.insert_one(device_doc)
+        return device_doc
+
+    if device.get("status") != "approved":
+        await wfh_device_info_collection.update_one(
+            {"_id": device["_id"]},
+            {"$set": {"status": "approved", "approved_at": datetime.now(timezone.utc), "approved_by": "auto-approved"}}
+        )
+        device["status"] = "approved"
+        return device
+
+        raise HTTPException(
+            status_code=403,
+            detail="WFH device not approved. Please contact admin."
+        )
+
+    return device
+
+
+@app.post("/api/wfh/checkin")
+async def wfh_checkin(req: dict, employee=Depends(get_current_employee)):
+    employee_id = str(employee.get("_id"))
+    org_id = employee.get("organization_id")
+    email = employee.get("email")
+    device_id = req.get("device_id")
+    face_image = req.get("face_image")
+
+    if not org_id:
+        raise HTTPException(status_code=400, detail="Employee organization_id missing")
+
+    await verify_wfh_device(employee_id, org_id, device_id)
+
+    if not face_image:
+        raise HTTPException(status_code=400, detail="face_image is required")
+
+    stored_embedding = employee.get("face_embedding")
+    if not stored_embedding or is_dummy_embedding(stored_embedding):
+        # Auto-enroll real DeepFace biometric if clear face image is provided
+        new_emb = get_face_embedding(face_image)
+        if new_emb is not None and not is_dummy_embedding(new_emb):
+            await employees_collection.update_one(
+                {"_id": employee["_id"]},
+                {"$set": {
+                    "face_embedding": new_emb,
+                    "needs_face_enrollment": False,
+                    "profile_image": face_image
+                }}
+            )
+            stored_embedding = new_emb
+            logger.info(f"Auto-enrolled real DeepFace biometric during WFH checkin for {email}")
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="Face biometric enrollment missing or needs refresh. Please ensure your face is well-lit and clearly visible to complete registration."
+            )
+
+    face_ok, face_distance = verify_face(face_image, stored_embedding)
+
+    if not face_ok:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Face verification failed. Distance: {face_distance}"
+        )
+
+    active_session = await wfh_sessions_collection.find_one({
+        "employee_id": employee_id,
+        "organization_id": org_id,
+        "status": "active"
+    })
+
+    if active_session:
+        return {
+            "status": "already_active",
+            "message": "WFH session already active",
+            "session_id": str(active_session["_id"])
+        }
+
+    now = datetime.now(timezone.utc)
+    # IMPORTANT: Use LOCAL date (with org timezone offset) so it matches
+    # the stale-session check in /api/wfh/session/active which uses local date.
+    # Using UTC date here caused instant "stale session" closure for IST users
+    # between midnight and 5:30 AM local time.
+    tz_offset_mins = 330  # default IST
+    try:
+        org_settings = await settings_collection.find_one({"organization_id": org_id}) if org_id else None
+        if org_settings:
+            tz_offset_mins = org_settings.get("timezone_offset", 330)
+    except Exception:
+        pass
+    local_now = now + timedelta(minutes=tz_offset_mins)
+    today = local_now.strftime("%Y-%m-%d")
+
+    session_doc = {
+        "employee_id": employee_id,
+        "employee_email": email,
+        "employee_name": employee.get("full_name", ""),
+        "organization_id": org_id,
+        "device_id": device_id,
+        "date": today,
+        "check_in_time": now,
+        "check_out_time": None,
+        "status": "active",
+        "check_in_face_verified": True,
+        "face_distance": face_distance,
+        "total_active_seconds": 0,
+        "total_idle_seconds": 0,
+        "productivity_score": 0,
+        "created_at": now,
+        "updated_at": now,
+        "metadata": req.get("metadata", {})
+    }
+
+    result = await wfh_sessions_collection.insert_one(session_doc)
+    session_id = str(result.inserted_id)
+
+    attendance_doc = {
+        "user_id": employee_id,
+        "email": email,
+        "employee_name": employee.get("full_name", ""),
+        "organization_id": org_id,
+        "timestamp": now,
+        "type": "check-in",
+        "status": "Present",
+        "selfie_verified": True,
+        "face_confidence": face_distance,
+        "device_id": device_id,
+        "source": "wfh_desktop",
+        "wfh_session_id": session_id,
+        "attendance_type": "wfh",
+        "check_in_method": "wfh_desktop",
+        "created_at": now
+    }
+
+    await attendance_logs_collection.insert_one(attendance_doc)
+    await employees_collection.update_one(
+        {"_id": employee["_id"]},
+        {"$set": {"checked_in": True, "last_attendance_type": "wfh_checkin", "last_attendance_time": now}}
+    )
+
+
+    policy = None
+    try:
+        org = await organizations_collection.find_one({"_id": ObjectId(org_id)})
+        if org:
+            policy = org.get("wfh_policy")
+    except Exception as e:
+        logger.error(f"Error fetching policy in checkin: {e}")
+        
+    if not policy:
+        policy = {
+            "screenshot_interval_minutes": 10,
+            "face_check_interval_minutes": 30,
+            "max_idle_minutes": 20,
+            "productivity_threshold_percent": 60,
+            "working_hours_start": "09:00",
+            "working_hours_end": "18:00",
+            "screenshot_retention_days": 5,
+            "require_face_verification": True,
+            "productive_apps": [],
+            "unproductive_apps": []
+        }
+
+    return {
+        "status": "success",
+        "message": "WFH check-in successful",
+        "session_id": session_id,
+        "check_in_time": now.isoformat(),
+        "face_verified": True,
+        "wfh_policy": policy
+    }
+
+
+@app.post("/api/wfh/checkout")
+async def wfh_checkout(req: dict, employee=Depends(get_current_employee)):
+    employee_id = str(employee.get("_id"))
+    org_id = employee.get("organization_id")
+    email = employee.get("email")
+    device_id = req.get("device_id")
+    session_id = req.get("session_id")
+
+    if not org_id:
+        raise HTTPException(status_code=400, detail="Employee organization_id missing")
+
+    # Don't block checkout on device verification — the session was already
+    # validated at check-in. Blocking here traps users in permanent active sessions.
+
+    query = {
+        "employee_id": employee_id,
+        "organization_id": org_id,
+        "status": "active"
+    }
+
+    if session_id:
+        if not ObjectId.is_valid(session_id):
+            raise HTTPException(status_code=400, detail="Invalid session_id")
+        query["_id"] = ObjectId(session_id)
+
+    session = await wfh_sessions_collection.find_one(query)
+
+    if not session:
+        raise HTTPException(status_code=404, detail="No active WFH session found")
+
+    now = datetime.now(timezone.utc)
+    check_in_time = session.get("check_in_time")
+
+    total_seconds = 0
+    if check_in_time:
+        if check_in_time.tzinfo is None:
+            check_in_time = check_in_time.replace(tzinfo=timezone.utc)
+        total_seconds = int((now - check_in_time).total_seconds())
+
+    # SERVER-SIDE PRODUCTIVITY VALIDATION
+    # 1. Fetch Policy
+    policy = None
+    try:
+        org = await organizations_collection.find_one({"_id": ObjectId(org_id)})
+        if org:
+            policy = org.get("wfh_policy")
+    except Exception as e:
+        logger.error(f"Error fetching policy in checkout validation: {e}")
+        
+    # 2. Activity Recomputation
+    activity_ratio = 0.0
+    active_ratio = 1.0
+    try:
+        activity_cursor = wfh_activity_collection.find({"session_id": str(session["_id"])})
+        activities = await activity_cursor.to_list(length=1000)
+        
+        total_keystrokes = sum(a.get("keystrokes", 0) for a in activities)
+        total_clicks = sum(a.get("mouse_clicks", 0) for a in activities)
+        total_scrolls = sum(a.get("scroll_events", 0) for a in activities)
+        total_active_sec = sum(a.get("active_seconds", 0) for a in activities)
+        total_idle_sec = sum(a.get("idle_seconds", 0) for a in activities)
+        
+        total_rec_seconds = total_active_sec + total_idle_sec
+        if total_rec_seconds > 0:
+            active_ratio = float(total_active_sec) / total_rec_seconds
+            
+        total_events = total_keystrokes + total_clicks + total_scrolls
+        expected_baseline_events = max(1.0, (total_rec_seconds / 300.0) * 250.0)
+        activity_ratio = min(1.0, float(total_events) / expected_baseline_events)
+    except Exception as e:
+        logger.error(f"Error recomputing activity ratio: {e}")
+        active_ratio = 1.0
+        activity_ratio = 0.5
+
+    # 3. App Usage Recomputation
+    app_productivity_ratio = 0.5
+    try:
+        app_cursor = wfh_app_usage_collection.find({"session_id": str(session["_id"])})
+        usages = await app_cursor.to_list(length=1000)
+        
+        productive_sec = 0.0
+        neutral_sec = 0.0
+        unproductive_sec = 0.0
+        
+        # Helper classification inside checkout block
+        def get_local_app_category(app_name: str, org_policy: dict = None) -> str:
+            if not app_name or app_name == "unknown":
+                return "neutral"
+            app_name_lower = app_name.lower().replace(".exe", "").strip()
+            productive_keywords = ["vscode", "code", "pycharm", "idea", "figma", "notion", "slack", "teams", "excel", "winword", "word", "powerpnt", "outlook", "chrome", "firefox"]
+            unproductive_keywords = ["steam", "netflix", "youtube", "instagram", "facebook", "spotify", "discord", "game", "twitter", "reddit"]
+            if org_policy:
+                custom_productive = org_policy.get("productive_apps", [])
+                custom_unproductive = org_policy.get("unproductive_apps", [])
+                if any(app.lower() in app_name_lower for app in custom_productive):
+                    return "productive"
+                if any(app.lower() in app_name_lower for app in custom_unproductive):
+                    return "unproductive"
+            if any(keyword in app_name_lower for keyword in productive_keywords):
+                return "productive"
+            if any(keyword in app_name_lower for keyword in unproductive_keywords):
+                return "unproductive"
+            return "neutral"
+            
+        for usage in usages:
+            apps = usage.get("apps", [])
+            for app in apps:
+                app_name = app.get("name", "unknown")
+                dur = float(app.get("duration_seconds", 0))
+                category = get_local_app_category(app_name, policy)
+                if category == "productive":
+                    productive_sec += dur
+                elif category == "neutral":
+                    neutral_sec += dur
+                else:
+                    unproductive_sec += dur
+                    
+        total_app_sec = productive_sec + neutral_sec + unproductive_sec
+        if total_app_sec > 0:
+            app_productivity_ratio = (productive_sec * 1.0 + neutral_sec * 0.6 + unproductive_sec * 0.1) / total_app_sec
+    except Exception as e:
+        logger.error(f"Error recomputing app productivity ratio: {e}")
+
+    # 4. Face Presence Recomputation
+    face_ratio = 1.0
+    try:
+        face_cursor = wfh_face_checks_collection.find({"session_id": str(session["_id"])})
+        face_checks = await face_cursor.to_list(length=1000)
+        if len(face_checks) > 0:
+            passed_checks = sum(1 for check in face_checks if check.get("passed", False))
+            face_ratio = float(passed_checks) / len(face_checks)
+    except Exception as e:
+        logger.error(f"Error recomputing face ratio: {e}")
+
+    # 5. Combined Score
+    w_app = 0.45
+    w_activity = 0.35
+    w_face = 0.20
+    app_score = active_ratio * app_productivity_ratio
+    
+    server_score = (app_score * w_app + activity_ratio * w_activity + face_ratio * w_face) * 100.0
+    server_score = round(max(0.0, min(100.0, server_score)), 2)
+    
+    # 6. Flag Alert on Discrepancy (> 15 delta)
+    client_reported_score = session.get("productivity_score", 0.0)
+    delta = abs(client_reported_score - server_score)
+    
+    if delta > 15.0:
+        alert_doc = {
+            "employee_id": employee_id,
+            "employee_email": email,
+            "employee_name": employee.get("full_name", ""),
+            "organization_id": org_id,
+            "session_id": str(session["_id"]),
+            "type": "WFH_SCORE_DISCREPANCY",
+            "timestamp": now,
+            "severity": "high",
+            "status": "pending",
+            "details": f"Productivity score tampering risk. Client reported: {client_reported_score:.1f}, Server validated: {server_score:.1f} (Delta: {delta:.1f})",
+            "created_at": now
+        }
+        alert_res = await wfh_alerts_collection.insert_one(alert_doc)
+        
+        # Mirror alert to unified alerts collection
+        try:
+            await alerts_collection.insert_one({
+                "organization_id": org_id,
+                "employee_id": employee_id,
+                "employee_name": employee.get("full_name", ""),
+                "type": "Compliance",
+                "severity": "high",
+                "status": "pending",
+                "detail": f"WFH Productivity discrepancy: Client ({client_reported_score:.0f}%) vs Server ({server_score:.0f}%)",
+                "timestamp": now,
+                "metadata": {
+                    "source": "wfh_desktop",
+                    "wfh_alert_id": str(alert_res.inserted_id),
+                    "session_id": str(session["_id"])
+                }
+            })
+        except Exception as err_alert:
+            logger.error(f"Failed to mirror WFH discrepancy alert: {err_alert}")
+
+    # Set completed with server-verified productivity score
+    await wfh_sessions_collection.update_one(
+        {"_id": session["_id"]},
+        {
+            "$set": {
+                "status": "completed",
+                "check_out_time": now,
+                "total_active_seconds": total_seconds,
+                "verified_productivity_score": server_score,
+                "updated_at": now
+            }
+        }
+    )
+
+    attendance_doc = {
+        "user_id": employee_id,
+        "email": email,
+        "employee_name": employee.get("full_name", ""),
+        "organization_id": org_id,
+        "timestamp": now,
+        "type": "check-out",
+        "status": "Present",
+        "selfie_verified": True,
+        "device_id": device_id,
+        "source": "wfh_desktop",
+        "wfh_session_id": str(session["_id"]),
+        "attendance_type": "wfh",
+        "check_in_method": "wfh_desktop",
+        "total_seconds": total_seconds,
+        "created_at": now
+    }
+
+    await attendance_logs_collection.insert_one(attendance_doc)
+    await employees_collection.update_one(
+        {"_id": employee["_id"]},
+        {"$set": {"checked_in": False, "last_attendance_type": "wfh_checkout", "last_attendance_time": now}}
+    )
+
+
+    return {
+        "status": "success",
+        "message": "WFH check-out successful",
+        "session_id": str(session["_id"]),
+        "check_out_time": now.isoformat(),
+        "total_seconds": total_seconds,
+        "verified_productivity_score": server_score
+    }
+
+
+@app.get("/api/wfh/session/active")
+async def get_active_wfh_session(employee=Depends(get_current_employee)):
+    employee_id = str(employee.get("_id"))
+    org_id = employee.get("organization_id")
+
+    # Timezone-aware stale session closing
+    tz_offset = 330 # default IST
+    org_settings = await settings_collection.find_one({"organization_id": org_id}) if org_id else None
+    if org_settings:
+        tz_offset = org_settings.get("timezone_offset", 330)
+
+    local_now = datetime.now(timezone.utc) + timedelta(minutes=tz_offset)
+    today_str = local_now.strftime("%Y-%m-%d")
+
+    session = await wfh_sessions_collection.find_one({
+        "employee_id": employee_id,
+        "organization_id": org_id,
+        "status": "active"
+    })
+
+    if session:
+        # If the session is from a previous day, auto-close it as stale!
+        # But add a grace period: only close if the session is >20 hours old
+        # to prevent midnight-boundary race conditions (check-in at 23:59,
+        # session/active polled at 00:00 → wrongly killed as stale).
+        session_date = session.get("date", "")
+        stale_check_in_time = session.get("check_in_time")
+        session_age_hours = 0
+        if stale_check_in_time:
+            if stale_check_in_time.tzinfo is None:
+                stale_check_in_time = stale_check_in_time.replace(tzinfo=timezone.utc)
+            session_age_hours = (datetime.now(timezone.utc) - stale_check_in_time).total_seconds() / 3600
+        if session_date != today_str and session_age_hours > 20:
+            now_utc = datetime.now(timezone.utc)
+            check_in_time = session.get("check_in_time")
+            total_seconds = 0
+            if check_in_time:
+                if check_in_time.tzinfo is None:
+                    check_in_time = check_in_time.replace(tzinfo=timezone.utc)
+                total_seconds = int((now_utc - check_in_time).total_seconds())
+
+            await wfh_sessions_collection.update_one(
+                {"_id": session["_id"]},
+                {
+                    "$set": {
+                        "status": "completed",
+                        "check_out_time": now_utc,
+                        "total_active_seconds": min(total_seconds, 28800), # Cap at 8 hours if stale
+                        "updated_at": now_utc
+                    }
+                }
+            )
+            session = None
+
+    if not session:
+        return {
+            "active": False,
+            "session": None
+        }
+
+    session["_id"] = str(session["_id"])
+    
+    return {
+        "active": True,
+        "session": session,
+        "server_time": datetime.now(timezone.utc).isoformat()
+    }
+
+
+@app.get("/api/wfh/productivity")
+async def get_my_wfh_productivity(
+    date: Optional[str] = None,
+    limit: int = 100,
+    employee=Depends(get_current_employee)
+):
+    clean_email = employee.get("email").strip().lower()
+    query = {"employee_email": clean_email}
+    if date:
+        query["date"] = date
+    cursor = wfh_productivity_collection.find(query).sort("timestamp", 1).limit(limit)
+    data = await cursor.to_list(length=limit)
+    for item in data:
+        item["_id"] = str(item["_id"])
+    return data
+
+
+@app.get("/api/wfh/apps")
+async def get_my_wfh_apps(
+    date: Optional[str] = None,
+    limit: int = 100,
+    employee=Depends(get_current_employee)
+):
+    clean_email = employee.get("email").strip().lower()
+    query = {"employee_email": clean_email}
+    if date:
+        query["date"] = date
+    cursor = wfh_app_usage_collection.find(query).sort("timestamp", -1).limit(limit)
+    data = await cursor.to_list(length=limit)
+    for item in data:
+        item["_id"] = str(item["_id"])
+    return data
+
+# =========================
+# WFH DATA INTAKE APIs
+# =========================
+
+async def scan_screenshot_ocr_threats(screenshot_id: str, image_path: str, employee_id: str, org_id: str, email: str, device_id: str, session_id: str):
+    temp_file_path = None
+    try:
+        import os
+        import re
+        from PIL import Image
+        
+        # Try to resolve web URL or static mount path to local path
+        if image_path.startswith("http://") or image_path.startswith("https://"):
+            import urllib.request
+            import tempfile
+            try:
+                # Get display URL (which will be presigned if S3/R2)
+                download_url = get_screenshot_display_url(image_path)
+                
+                # Create a temporary file and close the fd immediately
+                fd, temp_file_path = tempfile.mkstemp(suffix=".jpg")
+                os.close(fd)
+                
+                # Fetch headers to bypass potential user-agent blocks if any
+                req = urllib.request.Request(
+                    download_url, 
+                    headers={'User-Agent': 'Mozilla/5.0'}
+                )
+                with urllib.request.urlopen(req, timeout=15) as response, open(temp_file_path, 'wb') as out_file:
+                    out_file.write(response.read())
+                
+                resolved_path = temp_file_path
+            except Exception as download_err:
+                logger.error(f"Failed to download screenshot from R2/HTTP for OCR: {download_err}")
+                resolved_path = ""
+        else:
+            if "uploads/" in image_path:
+                idx = image_path.find("uploads/")
+                image_path = image_path[idx:]
+                
+            # Try resolving relative path if it's not absolute
+            resolved_path = image_path
+            if not os.path.isabs(image_path) and not os.path.exists(image_path):
+                alternative_path = os.path.join("..", "wfh_desktop", "agent", image_path)
+                if os.path.exists(alternative_path):
+                    resolved_path = alternative_path
+        
+        if not resolved_path or not os.path.exists(resolved_path):
+            logger.warning(f"Screenshot file not found for OCR: {image_path}")
+            return
+            
+        try:
+            import pytesseract  # type: ignore[import-not-found]  # optional dependency
+            from PIL import Image  # type: ignore[import-not-found]
+            img = Image.open(resolved_path)
+            text = pytesseract.image_to_string(img)  # type: ignore[union-attr]
+        except ImportError:
+            logger.warning("pytesseract or PIL is not installed. Falling back to active window text threat check.")
+            # Graceful fallback: scan the active window title instead for simple keywords
+            text = ""
+        except Exception as ocr_err:
+            logger.warning(f"Tesseract OCR engine not fully loaded or failed: {ocr_err}")
+            text = ""
+
+        # Also merge active window title if text was not found
+        text += f"\n"
+
+        # Regex threat signatures
+        pattern = r'(?i)(password|passwd|api[_-]?key|secret|token)\s*[:=]\s*["\']?[a-zA-Z0-9_\-\+]{16,}'
+        match = re.search(pattern, text)
+        
+        if match:
+            leak_reason = f"Plaintext credentials/API keys visible: found '{match.group(1)}' token leak"
+            logger.warning(f"WFH Security Leak Alert! screenshot {screenshot_id}: {leak_reason}")
+            
+            # Update screenshot record in Mongo
+            await wfh_screenshots_collection.update_one(
+                {"_id": ObjectId(screenshot_id)},
+                {"$set": {
+                    "flagged": True,
+                    "flag_reason": "Plaintext credentials/API keys visible"
+                }}
+            )
+            
+            # Raise High Severity WFH Compliance Alert
+            now = datetime.now(timezone.utc)
+            alert_doc = {
+                "employee_id": employee_id,
+                "employee_email": email,
+                "employee_name": "Remote Employee",
+                "organization_id": org_id,
+                "device_id": device_id,
+                "session_id": session_id,
+                "type": "Credential Leak",
+                "timestamp": now,
+                "image_url": image_path,
+                "severity": "high",
+                "status": "pending",
+                "details": f"Plaintext credentials or secret tokens leaked in active window screenshot: {leak_reason}",
+                "metadata": {"screenshot_id": screenshot_id},
+                "created_at": now
+            }
+            alert_result = await wfh_alerts_collection.insert_one(alert_doc)
+            
+            # Mirror WFH alert into unified alerts collection
+            try:
+                await alerts_collection.insert_one({
+                    "organization_id": org_id,
+                    "employee_id": employee_id,
+                    "employee_name": "Remote Employee",
+                    "type": "Productivity",
+                    "severity": "high",
+                    "status": "pending",
+                    "detail": f"WFH Security Leak Alert: Credential leak detected via background OCR scanning.",
+                    "timestamp": now,
+                    "metadata": {
+                        "source": "wfh_desktop",
+                        "wfh_alert_id": str(alert_result.inserted_id),
+                        "device_id": device_id,
+                        "session_id": session_id
+                    }
+                })
+            except Exception as mirror_err:
+                logger.error(f"Failed to mirror unified WFH alert: {mirror_err}")
+    except Exception as e:
+        logger.error(f"OCR threat scan failed: {e}")
+    finally:
+        if temp_file_path and os.path.exists(temp_file_path):
+            try:
+                os.remove(temp_file_path)
+            except Exception as cleanup_err:
+                logger.warning(f"Failed to cleanup temp OCR screenshot file: {cleanup_err}")
+
+@app.get("/api/wfh/screenshots")
+async def get_my_screenshots(
+    request: Request,
+    date: Optional[str] = None,
+    limit: int = 100,
+    employee=Depends(get_current_employee)
+):
+    email = employee.get("email")
+    if not email:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+        
+    query = {"employee_email": email}
+    if date:
+        query["date"] = date
+        
+    cursor = wfh_screenshots_collection.find(query).sort("timestamp", -1).limit(limit)
+    screenshots = await cursor.to_list(length=limit)
+    
+    for item in screenshots:
+        item["_id"] = str(item["_id"])
+        item["image_url"] = get_screenshot_display_url(item.get("image_url", ""), request)
+        if item.get("thumbnail_url"):
+            item["thumbnail_url"] = get_screenshot_display_url(item["thumbnail_url"], request)
+        
+    return {"screenshots": screenshots}
+
+def build_static_upload_url(request: Request, relative_path: str) -> str:
+    base_url = str(request.base_url).rstrip("/")
+    forwarded_proto = request.headers.get("x-forwarded-proto")
+    if forwarded_proto == "https" and base_url.startswith("http://"):
+        base_url = base_url.replace("http://", "https://", 1)
+    if not relative_path.startswith("/"):
+        relative_path = "/" + relative_path
+    return f"{base_url}{relative_path}"
+
+
+
+@app.post("/api/wfh/screenshot")
+async def wfh_submit_screenshot(req: dict, background_tasks: BackgroundTasks, request: Request, employee=Depends(get_current_employee)):
+    employee_id = str(employee.get("_id"))
+    org_id = employee.get("organization_id")
+    device_id = req.get("device_id")
+
+    await verify_wfh_device(employee_id, org_id, device_id)
+
+    image_url = req.get("image_url")
+    if not image_url:
+        raise HTTPException(status_code=400, detail="image_url is required")
+
+    server_now = datetime.now(timezone.utc)
+    timestamp_str = req.get("timestamp")
+    if timestamp_str:
+        try:
+            if timestamp_str.endswith('Z'):
+                timestamp_str = timestamp_str[:-1] + '+00:00'
+            now = datetime.fromisoformat(timestamp_str)
+        except Exception:
+            now = server_now
+    else:
+        now = server_now
+
+    def is_base64_payload(value: str) -> bool:
+        return (value.startswith("data:image/") or ";base64," in value or (not value.startswith("http") and not value.startswith("/uploads") and len(value) > 1000))
+
+    if is_base64_payload(image_url):
+        import base64
+        import uuid
+        import time
+        header = ""
+        base64_data = image_url
+        if "," in image_url:
+            header, base64_data = image_url.split(",", 1)
+
+        try:
+            image_bytes = base64.b64decode(base64_data)
+            ext = ".jpg"
+            if "png" in header:
+                ext = ".png"
+            elif "gif" in header:
+                ext = ".gif"
+            filename = f"view_{int(time.time())}_{uuid.uuid4().hex[:8]}{ext}"
+            image_url = await upload_file_to_storage(image_bytes, filename, "wfh_view")
+        except Exception as err:
+            logger.error(f"Failed to decode base64 screenshot: {err}")
+            raise HTTPException(status_code=400, detail=f"Invalid base64 image data: {err}")
+    elif image_url.startswith("/uploads/"):
+        pass
+
+    doc = {
+        "employee_id": employee_id,
+        "employee_email": employee.get("email"),
+        "employee_name": employee.get("full_name", ""),
+        "organization_id": org_id,
+        "device_id": device_id,
+        "session_id": req.get("session_id"),
+        "date": now.strftime("%Y-%m-%d"),
+        "timestamp": now,
+        "image_url": image_url,
+        "thumbnail_url": req.get("thumbnail_url"),
+        "active_app": req.get("active_app"),
+        "active_window": req.get("active_window"),
+        "flagged": req.get("flagged", False),
+        "flag_reason": req.get("flag_reason"),
+        "created_at": server_now
+    }
+
+    result = await wfh_screenshots_collection.insert_one(doc)
+    screenshot_id = str(result.inserted_id)
+
+    # Queue background threat scan using OCR parser
+    background_tasks.add_task(
+        scan_screenshot_ocr_threats,
+        screenshot_id,
+        image_url,
+        employee_id,
+        org_id,
+        employee.get("email"),
+        device_id,
+        req.get("session_id")
+    )
+
+    return {
+        "status": "success",
+        "message": "WFH screenshot saved",
+        "screenshot_id": screenshot_id
+    }
+
+
+@app.post("/api/wfh/activity")
+async def wfh_submit_activity(req: dict, employee=Depends(get_current_employee)):
+    employee_id = str(employee.get("_id"))
+    org_id = employee.get("organization_id")
+    device_id = req.get("device_id")
+
+    await verify_wfh_device(employee_id, org_id, device_id)
+
+    now = datetime.now(timezone.utc)
+
+    doc = {
+        "employee_id": employee_id,
+        "employee_email": employee.get("email"),
+        "employee_name": employee.get("full_name", ""),
+        "organization_id": org_id,
+        "device_id": device_id,
+        "session_id": req.get("session_id"),
+        "timestamp": now,
+        "period_minutes": req.get("period_minutes", 5),
+        "keystrokes": req.get("keystrokes", 0),
+        "mouse_clicks": req.get("mouse_clicks", 0),
+        "mouse_distance_px": req.get("mouse_distance_px", 0),
+        "scroll_events": req.get("scroll_events", 0),
+        "idle_seconds": req.get("idle_seconds", 0),
+        "active_seconds": req.get("active_seconds", 0),
+        "created_at": now
+    }
+
+    result = await wfh_activity_collection.insert_one(doc)
+
+    return {
+        "status": "success",
+        "message": "WFH activity saved",
+        "activity_id": str(result.inserted_id)
+    }
+
+
+@app.post("/api/wfh/app-usage")
+async def wfh_submit_app_usage(req: dict, employee=Depends(get_current_employee)):
+    employee_id = str(employee.get("_id"))
+    org_id = employee.get("organization_id")
+    device_id = req.get("device_id")
+
+    await verify_wfh_device(employee_id, org_id, device_id)
+
+    now = datetime.now(timezone.utc)
+
+    doc = {
+        "employee_id": employee_id,
+        "employee_email": employee.get("email"),
+        "employee_name": employee.get("full_name", ""),
+        "organization_id": org_id,
+        "device_id": device_id,
+        "session_id": req.get("session_id"),
+        "timestamp": now,
+        "date": req.get("date", now.strftime("%Y-%m-%d")),
+        "apps": req.get("apps", []),
+        "created_at": now
+    }
+
+    result = await wfh_app_usage_collection.insert_one(doc)
+
+    return {
+        "status": "success",
+        "message": "WFH app usage saved",
+        "app_usage_id": str(result.inserted_id)
+    }
+
+
+@app.post("/api/wfh/productivity")
+async def wfh_submit_productivity(req: dict, employee=Depends(get_current_employee)):
+    employee_id = str(employee.get("_id"))
+    org_id = employee.get("organization_id")
+    device_id = req.get("device_id")
+
+    await verify_wfh_device(employee_id, org_id, device_id)
+
+    now = datetime.now(timezone.utc)
+
+    score = float(req.get("score", 0))
+    score = max(0, min(score, 100))
+
+    doc = {
+        "employee_id": employee_id,
+        "employee_email": employee.get("email"),
+        "employee_name": employee.get("full_name", ""),
+        "organization_id": org_id,
+        "device_id": device_id,
+        "session_id": req.get("session_id"),
+        "timestamp": now,
+        "date": req.get("date", now.strftime("%Y-%m-%d")),
+        "score": score,
+        "breakdown": req.get("breakdown", {}),
+        "created_at": now
+    }
+
+    result = await wfh_productivity_collection.insert_one(doc)
+
+    if req.get("session_id") and ObjectId.is_valid(req.get("session_id")):
+        await wfh_sessions_collection.update_one(
+            {"_id": ObjectId(req.get("session_id")), "employee_id": employee_id},
+            {
+                "$set": {
+                    "productivity_score": score,
+                    "updated_at": now
+                }
+            }
+        )
+
+    return {
+        "status": "success",
+        "message": "WFH productivity saved",
+        "productivity_id": str(result.inserted_id),
+        "score": score
+    }
+
+
+@app.post("/api/wfh/alert")
+async def wfh_submit_alert(req: dict, employee=Depends(get_current_employee)):
+    employee_id = str(employee.get("_id"))
+    org_id = employee.get("organization_id")
+    device_id = req.get("device_id")
+
+    await verify_wfh_device(employee_id, org_id, device_id)
+
+    now = datetime.now(timezone.utc)
+
+    alert_type = req.get("type")
+    if not alert_type:
+        raise HTTPException(status_code=400, detail="alert type is required")
+
+    severity = req.get("severity", "medium")
+
+    doc = {
+        "employee_id": employee_id,
+        "employee_email": employee.get("email"),
+        "employee_name": employee.get("full_name", ""),
+        "organization_id": org_id,
+        "device_id": device_id,
+        "session_id": req.get("session_id"),
+        "type": alert_type,
+        "timestamp": now,
+        "image_url": req.get("image_url"),
+        "severity": severity,
+        "status": "pending",
+        "details": req.get("details"),
+        "metadata": req.get("metadata", {}),
+        "created_at": now
+    }
+
+    result = await wfh_alerts_collection.insert_one(doc)
+
+    # Also mirror WFH alert into existing unified alerts collection
+    try:
+        # Map WFH alert types to admin-friendly categories
+        wfh_type_map = {
+            "WFH_IDLE_EXTENDED": "Productivity",
+            "WFH_IDENTITY_MISMATCH": "Identity",
+            "Continuous Auth Failure": "Identity",
+            "WFH_FACE_CHECK_FAILURE": "Identity",
+            "WFH_FAKE_WEBCAM": "Identity",
+            "WFH_SCREENSHOT_THREAT": "Compliance",
+            "WFH_SUSPICIOUS_APP": "Compliance",
+        }
+        mapped_type = wfh_type_map.get(alert_type, "Productivity")
+
+        # Create a clean, human-readable detail for the admin
+        raw_detail = req.get('details', '')
+        friendly_detail = raw_detail if raw_detail else f"{alert_type} detected for this employee."
+
+        await alerts_collection.insert_one({
+            "organization_id": org_id,
+            "employee_id": employee_id,
+            "employee_name": employee.get("full_name", ""),
+            "type": mapped_type,
+            "severity": severity,
+            "status": "pending",
+            "detail": friendly_detail,
+            "timestamp": now,
+            "metadata": {
+                "source": "wfh_desktop",
+                "wfh_alert_id": str(result.inserted_id),
+                "wfh_alert_type": alert_type,
+                "device_id": device_id,
+                "session_id": req.get("session_id")
+            }
+        })
+    except Exception as e:
+        logger.error(f"Failed to mirror WFH alert into alerts collection: {e}")
+
+    return {
+        "status": "success",
+        "message": "WFH alert saved",
+        "alert_id": str(result.inserted_id)
+    }
+
+
+@app.post("/api/wfh/meeting")
+async def wfh_submit_meeting(req: dict, employee=Depends(get_current_employee)):
+    employee_id = str(employee.get("_id"))
+    org_id = employee.get("organization_id")
+    device_id = req.get("device_id")
+
+    await verify_wfh_device(employee_id, org_id, device_id)
+
+    now = datetime.now(timezone.utc)
+
+    platform = req.get("platform")
+    if not platform:
+        raise HTTPException(status_code=400, detail="platform is required")
+
+    doc = {
+        "employee_id": employee_id,
+        "employee_email": employee.get("email"),
+        "employee_name": employee.get("full_name", ""),
+        "organization_id": org_id,
+        "device_id": device_id,
+        "session_id": req.get("session_id"),
+        "platform": platform,
+        "start_time": req.get("start_time"),
+        "end_time": req.get("end_time"),
+        "duration_minutes": req.get("duration_minutes"),
+        "date": req.get("date", now.strftime("%Y-%m-%d")),
+        "created_at": now
+    }
+
+    result = await wfh_meetings_collection.insert_one(doc)
+
+    return {
+        "status": "success",
+        "message": "WFH meeting saved",
+        "meeting_id": str(result.inserted_id)
+    }
+
+@app.get("/api/wfh/team/active")
+async def wfh_get_active_team(employee=Depends(get_current_employee)):
+    org_id = employee.get("organization_id")
+    if not org_id:
+        raise HTTPException(status_code=400, detail="Employee organization_id missing")
+    
+    # Find active WFH sessions in the same organization, excluding current employee
+    cursor = wfh_sessions_collection.find({
+        "organization_id": org_id,
+        "status": "active",
+        "employee_email": {"$ne": employee.get("email")}
+    })
+    sessions = await cursor.to_list(length=100)
+    
+    team_members = []
+    for s in sessions:
+        team_members.append({
+            "employee_id": s.get("employee_id"),
+            "employee_email": s.get("employee_email"),
+            "employee_name": s.get("employee_name", ""),
+            "check_in_time": s.get("check_in_time").isoformat() if s.get("check_in_time") else None,
+            "productivity_score": s.get("productivity_score", 0)
+        })
+    return team_members
+
+@app.post("/api/wfh/meeting/signal")
+async def wfh_post_signal(req: dict, employee=Depends(get_current_employee)):
+    sender_email = employee.get("email")
+    receiver_email = req.get("receiver_email")
+    signal_type = req.get("type") # 'offer', 'answer', 'candidate'
+    data = req.get("data")
+    
+    if not receiver_email or not signal_type or not data:
+        raise HTTPException(status_code=400, detail="receiver_email, type, and data are required")
+        
+    doc = {
+        "sender_email": sender_email,
+        "receiver_email": receiver_email,
+        "type": signal_type,
+        "data": data,
+        "timestamp": datetime.now(timezone.utc),
+        "delivered": False
+    }
+    
+    await wfh_signals_collection.insert_one(doc)
+    return {"status": "success", "message": "Signal sent"}
+
+@app.get("/api/wfh/meeting/signal")
+async def wfh_get_signals(employee=Depends(get_current_employee)):
+    email = employee.get("email")
+    
+    # Fetch all undelivered signals for current employee
+    cursor = wfh_signals_collection.find({
+        "receiver_email": email,
+        "delivered": False
+    }).sort("timestamp", 1)
+    
+    signals = await cursor.to_list(length=100)
+    
+    # Mark as delivered
+    if signals:
+        signal_ids = [s["_id"] for s in signals]
+        await wfh_signals_collection.update_many(
+            {"_id": {"$in": signal_ids}},
+            {"$set": {"delivered": True}}
+        )
+        
+    result = []
+    for s in signals:
+        result.append({
+            "id": str(s["_id"]),
+            "sender_email": s.get("sender_email"),
+            "type": s.get("type"),
+            "data": s.get("data"),
+            "timestamp": s.get("timestamp").isoformat() if s.get("timestamp") else None
+        })
+        
+    return result
+
+# =========================
+# ADMIN WFH VIEW APIs
+# =========================
+
+@app.get("/admin/wfh/stats")
+async def admin_wfh_stats(current_admin: Admin = Depends(get_current_admin)):
+    org_id = current_admin.organization_id
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    query = {}
+    if org_id and org_id != "system_org":
+        query["organization_id"] = org_id
+
+    try:
+        # Run all 4 queries in parallel to minimize latency
+        today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+
+        active_sessions_task = wfh_sessions_collection.count_documents({
+            **query,
+            "status": "active"
+        })
+        today_alerts_task = wfh_alerts_collection.count_documents({
+            **query,
+            "status": "pending",
+            "timestamp": {"$gte": today_start}
+        })
+        emp_type_filter = ["wfh", "desk", "office", "hybrid", "all", None]
+        wfh_employees_task = employees_collection.count_documents({
+            **query,
+            "$or": [
+                {"employee_type": {"$in": emp_type_filter}},
+                {"employee_type": {"$exists": False}}
+            ]
+        })
+        productivity_task = wfh_productivity_collection.find({
+            **query,
+            "date": today
+        }).to_list(length=500)
+
+        active_sessions, today_alerts, wfh_employees, productivity_list = await asyncio.gather(
+            active_sessions_task,
+            today_alerts_task,
+            wfh_employees_task,
+            productivity_task,
+            return_exceptions=True
+        )
+
+        # Handle any individual query failures gracefully
+        if isinstance(active_sessions, Exception):
+            logger.error(f"stats: active_sessions query failed: {active_sessions}")
+            active_sessions = 0
+        if isinstance(today_alerts, Exception):
+            logger.error(f"stats: today_alerts query failed: {today_alerts}")
+            today_alerts = 0
+        if isinstance(wfh_employees, Exception):
+            logger.error(f"stats: wfh_employees query failed: {wfh_employees}")
+            wfh_employees = 0
+        if isinstance(productivity_list, Exception):
+            logger.error(f"stats: productivity query failed: {productivity_list}")
+            productivity_list = []
+
+        avg_productivity = 0
+        if productivity_list and isinstance(productivity_list, list):
+            scores = [item.get("score", 0) for item in productivity_list if isinstance(item, dict)]
+            if scores:
+                avg_productivity = round(sum(scores) / len(scores), 2)
+
+        return {
+            "active_sessions": active_sessions,
+            "wfh_employees": wfh_employees,
+            "pending_alerts": today_alerts,
+            "avg_productivity": avg_productivity,
+            "date": today
+        }
+    except Exception as e:
+        logger.error(f"admin_wfh_stats crashed: {e}", exc_info=True)
+        # Return safe fallback instead of 500 — CORS headers will still be sent
+        return {
+            "active_sessions": 0,
+            "wfh_employees": 0,
+            "pending_alerts": 0,
+            "avg_productivity": 0,
+            "date": today,
+            "error": "Stats temporarily unavailable"
+        }
+
+
+@app.get("/admin/wfh/live-view")
+async def admin_wfh_live_view(request: Request, current_admin: Admin = Depends(get_current_admin)):
+    org_id = current_admin.organization_id
+
+    try:
+        from bson import ObjectId
+
+        # 1. Fetch active sessions in bulk for this org
+        session_query = {"status": "active"}
+        if org_id and org_id != "system_org":
+            session_query["organization_id"] = org_id
+        active_sessions_list = await wfh_sessions_collection.find(session_query).to_list(length=500)
+        active_emp_ids = [s.get("employee_id") for s in (active_sessions_list or []) if s.get("employee_id")]
+
+        active_obj_ids = []
+        for eid in active_emp_ids:
+            try:
+                active_obj_ids.append(ObjectId(eid))
+            except Exception:
+                pass
+
+        # 2. Match employees who are WFH, desk, office, hybrid, or currently checked-in
+        query_conditions = [
+            {"employee_type": {"$in": ["wfh", "desk", "office", "hybrid", "all", None]}},
+            {"employee_type": {"$exists": False}}
+        ]
+        if active_obj_ids:
+            query_conditions.append({"_id": {"$in": active_obj_ids}})
+
+        query = {"$or": query_conditions}
+        if org_id and org_id != "system_org":
+            query["organization_id"] = org_id
+
+        employees = await employees_collection.find(query).to_list(length=500)
+
+        if not employees:
+            return []
+
+        employee_ids = [str(emp["_id"]) for emp in employees]
+
+        # Fetch latest screenshot and activity per employee using fast indexed find_one
+        screenshots_by_emp = {}
+        activities_by_emp = {}
+        
+        async def fetch_emp_latest(emp_id):
+            shot_task = wfh_screenshots_collection.find_one(
+                {"employee_id": emp_id},
+                sort=[("timestamp", -1)]
+            )
+            act_task = wfh_activity_collection.find_one(
+                {"employee_id": emp_id},
+                sort=[("timestamp", -1)]
+            )
+            shot, act = await asyncio.gather(shot_task, act_task)
+            if shot:
+                screenshots_by_emp[emp_id] = shot
+            if act:
+                activities_by_emp[emp_id] = act
+
+        await asyncio.gather(*(fetch_emp_latest(emp_id) for emp_id in employee_ids))
+
+        # Build lookup dicts keyed by employee_id
+        sessions_by_emp = {s["employee_id"]: s for s in (active_sessions_list or [])}
+
+        result = []
+        for employee in employees:
+            employee_id = str(employee["_id"])
+            employee_email = employee.get("email")
+
+            active_session = sessions_by_emp.get(employee_id)
+            latest_screenshot = screenshots_by_emp.get(employee_id)
+            latest_activity = activities_by_emp.get(employee_id)
+
+            result.append({
+                "session_id": str(active_session["_id"]) if active_session else f"offline-{employee_email}",
+                "employee_id": employee_id,
+                "employee_email": employee_email,
+                "employee_name": employee.get("full_name"),
+                "check_in_time": active_session.get("check_in_time") if active_session else None,
+                "productivity_score": active_session.get("productivity_score", 0) if active_session else 0,
+                "device_id": active_session.get("device_id") if active_session else None,
+                "latest_screenshot": {
+                    "_id": str(latest_screenshot["_id"]),
+                    "image_url": get_screenshot_display_url(latest_screenshot.get("image_url", ""), request),
+                    "timestamp": latest_screenshot.get("timestamp"),
+                    "active_app": latest_screenshot.get("active_app"),
+                    "active_window": latest_screenshot.get("active_window")
+                } if latest_screenshot else None,
+                "latest_activity": {
+                    "_id": str(latest_activity["_id"]),
+                    "keystrokes": latest_activity.get("keystrokes", 0),
+                    "mouse_clicks": latest_activity.get("mouse_clicks", 0),
+                    "idle_seconds": latest_activity.get("idle_seconds", 0),
+                    "active_seconds": latest_activity.get("active_seconds", 0),
+                    "timestamp": latest_activity.get("timestamp")
+                } if latest_activity else None
+            })
+
+        return result
+    except Exception as e:
+        logger.error(f"admin_wfh_live_view crashed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Live view temporarily unavailable: {str(e)}")
+
+@app.post("/admin/wfh/employee/{email}/trigger-screenshot")
+async def admin_trigger_screenshot(email: str, current_admin: Admin = Depends(get_current_admin)):
+    clean_email = email.strip().lower()
+    
+    # Check if employee exists
+    user = await employees_collection.find_one({"email": clean_email})
+    if not user:
+        raise HTTPException(status_code=404, detail="Employee not found")
+        
+    doc = {
+        "employee_email": clean_email,
+        "command": "trigger_screenshot",
+        "status": "pending",
+        "timestamp": datetime.now(timezone.utc)
+    }
+    
+    await wfh_commands_collection.insert_one(doc)
+    return {"status": "success", "message": "Trigger command enqueued successfully"}
+
+@app.post("/admin/wfh/employee/{email}/force-end")
+async def admin_force_end_session(email: str, req: dict, current_admin: Admin = Depends(get_current_admin)):
+    clean_email = email.strip().lower()
+    reason = req.get("reason", "Force-ended by administrator").strip()
+    
+    user = await employees_collection.find_one({"email": clean_email})
+    if not user:
+        raise HTTPException(status_code=404, detail="Employee not found")
+        
+    active_session = await wfh_sessions_collection.find_one({
+        "employee_email": clean_email,
+        "status": "active"
+    })
+    
+    if not active_session:
+        raise HTTPException(status_code=400, detail="No active WFH session found for this employee.")
+        
+    now = datetime.now(timezone.utc)
+    session_id = active_session["_id"]
+    
+    check_in_time_val = active_session.get("check_in_time")
+    total_seconds_val = 0
+    if check_in_time_val:
+        if check_in_time_val.tzinfo is None:
+            check_in_time_val = check_in_time_val.replace(tzinfo=timezone.utc)
+        total_seconds_val = int((now - check_in_time_val).total_seconds())
+        
+    # Update active session
+    await wfh_sessions_collection.update_one(
+        {"_id": session_id},
+        {
+            "$set": {
+                "status": "force_ended",
+                "check_out_time": now,
+                "total_active_seconds": total_seconds_val,
+                "force_ended_by": current_admin.email,
+                "force_end_reason": reason,
+                "updated_at": now
+            }
+        }
+    )
+    
+    # Write checkout log in attendance_logs
+    checkout_log = {
+        "user_id": str(user["_id"]),
+        "email": clean_email,
+        "employee_name": user.get("full_name", ""),
+        "organization_id": user.get("organization_id"),
+        "timestamp": now,
+        "type": "check-out",
+        "attendance_type": "wfh",
+        "location": None,
+        "check_in_method": "wfh_desktop",
+        "status": "SUCCESS",
+        "location_name": "Force Ended by Admin",
+        "selfie_verified": False,
+        "device_id": active_session.get("device_id"),
+        "wfh_session_id": str(session_id),
+        "method": "admin_force_end",
+        "force_ended_by": current_admin.email
+    }
+    await attendance_logs_collection.insert_one(checkout_log)
+    
+    # Enqueue logout command to agent
+    cmd_doc = {
+        "employee_email": clean_email,
+        "command": "force_end_session",
+        "status": "pending",
+        "timestamp": now,
+        "reason": reason
+    }
+    await wfh_commands_collection.insert_one(cmd_doc)
+    
+    # Generate WFH Alert
+    alert_doc = {
+        "employee_id": str(user["_id"]),
+        "employee_email": clean_email,
+        "employee_name": user.get("full_name", ""),
+        "organization_id": user.get("organization_id"),
+        "type": "WFH_SESSION_FORCE_ENDED",
+        "timestamp": now,
+        "severity": "info",
+        "status": "pending",
+        "details": f"Session force-ended by admin {current_admin.email}. Reason: {reason}",
+        "created_at": now
+    }
+    alert_res = await wfh_alerts_collection.insert_one(alert_doc)
+    
+    # Mirror into unified alerts collection
+    try:
+        await alerts_collection.insert_one({
+            "organization_id": user.get("organization_id"),
+            "employee_id": str(user["_id"]),
+            "employee_name": user.get("full_name", ""),
+            "type": "Compliance",
+            "severity": "medium",
+            "status": "pending",
+            "detail": f"WFH Session force-ended by admin: {reason}",
+            "timestamp": now,
+            "metadata": {
+                "source": "wfh_desktop",
+                "wfh_alert_id": str(alert_res.inserted_id),
+                "session_id": str(session_id)
+            }
+        })
+    except Exception as e:
+        logger.error(f"Failed to mirror force-end alert: {e}")
+        
+    return {
+        "status": "success",
+        "message": "Session force-ended successfully",
+        "session_id": str(session_id)
+    }
+
+@app.post("/admin/wfh/employee/{email}/force-logout")
+async def admin_force_logout(email: str, current_admin: Admin = Depends(get_current_admin)):
+    clean_email = email.strip().lower()
+    
+    user = await employees_collection.find_one({"email": clean_email})
+    if not user:
+        raise HTTPException(status_code=404, detail="Employee not found")
+        
+    now = datetime.now(timezone.utc)
+    
+    # Enqueue force_logout command to agent
+    cmd_doc = {
+        "employee_email": clean_email,
+        "command": "force_logout",
+        "status": "pending",
+        "timestamp": now,
+        "reason": f"Force logged out by admin {current_admin.email}"
+    }
+    await wfh_commands_collection.insert_one(cmd_doc)
+    
+    # Also force-end active WFH session if exists
+    active_session = await wfh_sessions_collection.find_one({
+        "employee_email": clean_email,
+        "status": "active"
+    })
+    
+    session_id_str = None
+    if active_session:
+        session_id = active_session["_id"]
+        session_id_str = str(session_id)
+        check_in_time_val = active_session.get("check_in_time")
+        total_seconds_val = 0
+        if check_in_time_val:
+            if check_in_time_val.tzinfo is None:
+                check_in_time_val = check_in_time_val.replace(tzinfo=timezone.utc)
+            total_seconds_val = int((now - check_in_time_val).total_seconds())
+            
+        await wfh_sessions_collection.update_one(
+            {"_id": session_id},
+            {
+                "$set": {
+                    "status": "force_ended",
+                    "check_out_time": now,
+                    "total_active_seconds": total_seconds_val,
+                    "force_ended_by": current_admin.email,
+                    "force_end_reason": "Logged out by admin",
+                    "updated_at": now
+                }
+            }
+        )
+        
+        # Write checkout log in attendance_logs
+        checkout_log = {
+            "user_id": str(user["_id"]),
+            "email": clean_email,
+            "employee_name": user.get("full_name", ""),
+            "organization_id": user.get("organization_id"),
+            "timestamp": now,
+            "type": "check-out",
+            "attendance_type": "wfh",
+            "location": None,
+            "check_in_method": "wfh_desktop",
+            "status": "SUCCESS",
+            "location_name": "Logged out by Admin",
+            "selfie_verified": False,
+            "device_id": active_session.get("device_id"),
+            "wfh_session_id": session_id_str,
+            "method": "admin_force_logout",
+            "force_ended_by": current_admin.email
+        }
+        await attendance_logs_collection.insert_one(checkout_log)
+
+    return {
+        "status": "success",
+        "message": "Force-logout command queued successfully",
+        "session_id": session_id_str
+    }
+
+@app.get("/admin/wfh/policy")
+async def get_wfh_policy(current_admin: Admin = Depends(get_current_admin)):
+    org_id = current_admin.organization_id
+    if not org_id:
+        raise HTTPException(status_code=400, detail="Admin organization missing")
+    
+    org = await organizations_collection.find_one({"_id": ObjectId(org_id)})
+    if not org:
+        raise HTTPException(status_code=404, detail="Organization not found")
+        
+    policy = org.get("wfh_policy")
+    if not policy:
+        policy = {
+            "screenshot_interval_minutes": 10,
+            "face_check_interval_minutes": 30,
+            "max_idle_minutes": 20,
+            "productivity_threshold_percent": 60,
+            "working_hours_start": "09:00",
+            "working_hours_end": "18:00",
+            "screenshot_retention_days": 5,
+            "require_face_verification": True,
+            "productive_apps": [],
+            "unproductive_apps": []
+        }
+    return policy
+
+@app.put("/admin/wfh/policy")
+async def update_wfh_policy(req: dict, current_admin: Admin = Depends(get_current_admin)):
+    org_id = current_admin.organization_id
+    if not org_id:
+        raise HTTPException(status_code=400, detail="Admin organization missing")
+        
+    policy = {
+        "screenshot_interval_minutes": int(req.get("screenshot_interval_minutes", 10)),
+        "face_check_interval_minutes": int(req.get("face_check_interval_minutes", 30)),
+        "max_idle_minutes": int(req.get("max_idle_minutes", 20)),
+        "productivity_threshold_percent": int(req.get("productivity_threshold_percent", 60)),
+        "working_hours_start": str(req.get("working_hours_start", "09:00")),
+        "working_hours_end": str(req.get("working_hours_end", "18:00")),
+        "screenshot_retention_days": int(req.get("screenshot_retention_days", 5)),
+        "require_face_verification": bool(req.get("require_face_verification", True)),
+        "productive_apps": list(req.get("productive_apps", [])),
+        "unproductive_apps": list(req.get("unproductive_apps", []))
+    }
+    
+    result = await organizations_collection.update_one(
+        {"_id": ObjectId(org_id)},
+        {"$set": {"wfh_policy": policy}}
+    )
+    
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Organization not found")
+        
+    return {"status": "success", "message": "WFH policy updated successfully", "policy": policy}
+
+@app.get("/api/wfh/policy")
+async def api_get_wfh_policy(employee = Depends(get_current_employee)):
+    org_id = employee.get("organization_id")
+    if not org_id:
+        raise HTTPException(status_code=400, detail="Employee organization_id missing")
+        
+    org = await organizations_collection.find_one({"_id": ObjectId(org_id)})
+    if not org:
+        raise HTTPException(status_code=404, detail="Organization not found")
+        
+    policy = org.get("wfh_policy")
+    if not policy:
+        policy = {
+            "screenshot_interval_minutes": 10,
+            "face_check_interval_minutes": 30,
+            "max_idle_minutes": 20,
+            "productivity_threshold_percent": 60,
+            "working_hours_start": "09:00",
+            "working_hours_end": "18:00",
+            "screenshot_retention_days": 5,
+            "require_face_verification": True,
+            "productive_apps": [],
+            "unproductive_apps": []
+        }
+    return policy
+
+@app.post("/api/wfh/face-check")
+async def wfh_face_check(req: dict, employee=Depends(get_current_employee)):
+    employee_id = str(employee.get("_id"))
+    org_id = employee.get("organization_id")
+    
+    session_id = req.get("session_id")
+    passed = bool(req.get("passed", True))
+    face_score = float(req.get("face_score", 1.0))
+    failure_reason = req.get("failure_reason", "")
+    image_base64 = req.get("image_base64")
+    
+    now = datetime.now(timezone.utc)
+    
+    image_url = None
+    if image_base64:
+        import uuid
+        import time
+        filename = f"face_check_{int(time.time())}_{uuid.uuid4().hex[:8]}.jpg"
+        import base64
+        try:
+            base64_data = image_base64
+            if "," in image_base64:
+                base64_data = image_base64.split(",", 1)[1]
+            image_bytes = base64.b64decode(base64_data)
+            image_url = await upload_file_to_storage(image_bytes, filename, "wfh_face_checks")
+        except Exception as e:
+            logger.error(f"Failed to save face check image: {e}")
+            
+    doc = {
+        "employee_id": employee_id,
+        "employee_email": employee.get("email"),
+        "employee_name": employee.get("full_name", ""),
+        "organization_id": org_id,
+        "session_id": session_id,
+        "timestamp": now,
+        "passed": passed,
+        "face_score": face_score,
+        "failure_reason": failure_reason,
+        "image_url": image_url,
+        "created_at": now
+    }
+    
+    result = await wfh_face_checks_collection.insert_one(doc)
+    
+    # Update active session counters
+    if session_id and ObjectId.is_valid(session_id):
+        update_op = {
+            "$inc": {
+                "face_check_count": 1,
+                "face_check_passed": 1 if passed else 0
+            },
+            "$set": {
+                "updated_at": now
+            }
+        }
+        await wfh_sessions_collection.update_one(
+            {"_id": ObjectId(session_id), "employee_id": employee_id},
+            update_op
+        )
+        
+    # If failed, raise alert
+    if not passed:
+        alert_doc = {
+            "employee_id": employee_id,
+            "employee_email": employee.get("email"),
+            "employee_name": employee.get("full_name", ""),
+            "organization_id": org_id,
+            "session_id": session_id,
+            "type": "WFH_FACE_CHECK_FAILED",
+            "timestamp": now,
+            "image_url": image_url,
+            "severity": "critical" if "fake" in failure_reason.lower() else "high",
+            "status": "pending",
+            "details": f"WFH face verification failed: {failure_reason}",
+            "created_at": now
+        }
+        alert_res = await wfh_alerts_collection.insert_one(alert_doc)
+        
+        # Mirror alert to unified alerts collection
+        try:
+            await alerts_collection.insert_one({
+                "organization_id": org_id,
+                "employee_id": employee_id,
+                "employee_name": employee.get("full_name", ""),
+                "type": "Identity",
+                "severity": "critical" if "fake" in failure_reason.lower() else "high",
+                "status": "pending",
+                "detail": f"WFH face check failed: {failure_reason}",
+                "timestamp": now,
+                "metadata": {
+                    "source": "wfh_desktop",
+                    "wfh_alert_id": str(alert_res.inserted_id),
+                    "session_id": session_id
+                }
+            })
+        except Exception as e:
+            logger.error(f"Failed to mirror WFH face-check failure alert: {e}")
+            
+    return {
+        "status": "success",
+        "message": "Face check recorded",
+        "face_check_id": str(result.inserted_id),
+        "passed": passed
+    }
+
+
+@app.get("/api/wfh/commands/pending")
+async def get_pending_commands(employee=Depends(get_current_employee)):
+    email = employee.get("email")
+    if not email:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+        
+    cursor = wfh_commands_collection.find({
+        "employee_email": email.strip().lower(),
+        "status": "pending"
+    }).sort("timestamp", 1)
+    
+    commands = await cursor.to_list(length=100)
+    
+    result = []
+    for c in commands:
+        result.append({
+            "id": str(c["_id"]),
+            "command": c.get("command"),
+            "status": c.get("status"),
+            "timestamp": c.get("timestamp").isoformat() if c.get("timestamp") else None
+        })
+        
+    return {"commands": result}
+
+@app.post("/api/wfh/commands/{command_id}/complete")
+async def complete_command(command_id: str, employee=Depends(get_current_employee)):
+    if not ObjectId.is_valid(command_id):
+        raise HTTPException(status_code=400, detail="Invalid command ID")
+        
+    result = await wfh_commands_collection.update_one(
+        {"_id": ObjectId(command_id), "employee_email": employee.get("email").strip().lower()},
+        {"$set": {"status": "completed", "completed_at": datetime.now(timezone.utc)}}
+    )
+    
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Command not found or unauthorized")
+        
+    return {"status": "success", "message": "Command marked as completed"}
+
+@app.get("/admin/wfh/employee/{email}/screenshots")
+async def admin_wfh_employee_screenshots(
+    request: Request,
+    email: str,
+    date: Optional[str] = None,
+    limit: int = 100,
+    current_admin: Admin = Depends(get_current_admin)
+):
+    clean_email = email.strip().lower()
+
+    query = {"employee_email": clean_email}
+
+    if current_admin.organization_id and current_admin.organization_id != "system_org":
+        query["organization_id"] = current_admin.organization_id
+
+    if date:
+        query["date"] = date
+
+    cursor = wfh_screenshots_collection.find(query).sort("timestamp", -1).limit(limit)
+    screenshots = await cursor.to_list(length=limit)
+    for item in screenshots:
+        item["_id"] = str(item["_id"])
+        item["image_url"] = get_screenshot_display_url(item.get("image_url", ""), request)
+        if item.get("thumbnail_url"):
+            item["thumbnail_url"] = get_screenshot_display_url(item["thumbnail_url"], request)
+
+    return screenshots
+
+
+
+@app.get("/admin/wfh/employee/{email}/screenshots/download")
+async def admin_wfh_employee_screenshots_download(
+    request: Request,
+    email: str,
+    date: Optional[str] = None,
+    current_admin: Admin = Depends(get_current_admin)
+):
+    import zipfile
+    import io
+    import os
+    import requests
+    from PIL import Image
+    from fastapi.concurrency import run_in_threadpool
+    from starlette.responses import StreamingResponse
+
+    clean_email = email.strip().lower()
+
+    query = {"employee_email": clean_email}
+
+    if current_admin.organization_id and current_admin.organization_id != "system_org":
+        query["organization_id"] = current_admin.organization_id
+
+    if date:
+        query["date"] = date
+
+    cursor = wfh_screenshots_collection.find(query).sort("timestamp", 1)
+    screenshots = await cursor.to_list(length=1000)
+
+    if not screenshots:
+        raise HTTPException(status_code=404, detail="No screenshots found for the selected date")
+
+    def compress_screenshot(image_url: str) -> bytes:
+        img_bytes = None
+        local_path = None
+        if "/uploads/" in image_url:
+            idx = image_url.find("/uploads/")
+            local_path = image_url[idx:].lstrip("/")
+
+        if local_path and os.path.exists(local_path):
+            with open(local_path, "rb") as f:
+                img_bytes = f.read()
+        elif image_url.startswith("http://") or image_url.startswith("https://"):
+            resp = requests.get(image_url, timeout=10)
+            resp.raise_for_status()
+            img_bytes = resp.content
+        else:
+            local_path = image_url.lstrip("/")
+            if not os.path.exists(local_path):
+                raise FileNotFoundError(f"File not found: {local_path}")
+            with open(local_path, "rb") as f:
+                img_bytes = f.read()
+
+        img = Image.open(io.BytesIO(img_bytes))
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        out_buf = io.BytesIO()
+        img.save(out_buf, format="JPEG", quality=50)
+        return out_buf.getvalue()
+
+    import asyncio
+    semaphore = asyncio.Semaphore(15)
+
+    async def process_item(index, item):
+        image_url = item.get("image_url", "")
+        if not image_url:
+            return None
+
+        ts = item.get("timestamp")
+        time_str = "unknown"
+        if isinstance(ts, datetime):
+            time_str = ts.strftime("%H-%M-%S")
+        elif isinstance(ts, str):
+            try:
+                dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                time_str = dt.strftime("%H-%M-%S")
+            except Exception:
+                time_str = "".join(c if c.isalnum() or c in "-_" else "_" for c in ts)
+
+        active_app = item.get("active_app") or "UnknownApp"
+        sanitized_app = "".join(c if c.isalnum() or c in " ._-" else "_" for c in active_app)
+        sanitized_app = sanitized_app[:30].strip()
+
+        filename = f"screenshot_{index:03d}_{time_str}_{sanitized_app}.jpg"
+
+        async with semaphore:
+            try:
+                compressed_data = await run_in_threadpool(compress_screenshot, image_url)
+                return {"filename": filename, "data": compressed_data, "success": True}
+            except Exception as e:
+                err_msg = f"Failed to compress {image_url}: {str(e)}"
+                return {"filename": filename, "error": err_msg, "success": False}
+
+    tasks = [process_item(index, item) for index, item in enumerate(screenshots, 1)]
+    results = await asyncio.gather(*tasks)
+
+    zip_buffer = io.BytesIO()
+
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+        errors = []
+        for res in results:
+            if not res:
+                continue
+            if res["success"]:
+                zip_file.writestr(res["filename"], res["data"])
+            else:
+                errors.append(res["error"])
+                err_filename = f"error_{res['filename'].replace('.jpg', '.txt')}"
+                zip_file.writestr(err_filename, res["error"].encode("utf-8"))
+
+        if errors:
+            error_log = "\n".join(errors)
+            zip_file.writestr("error_log.txt", error_log.encode("utf-8"))
+
+    zip_buffer.seek(0)
+
+    filename_date = date if date else datetime.now().strftime("%Y-%m-%d")
+    zip_filename = f"screenshots_{clean_email}_{filename_date}.zip"
+
+    headers = {
+        "Content-Disposition": f'attachment; filename="{zip_filename}"',
+        "Access-Control-Expose-Headers": "Content-Disposition"
+    }
+
+    return StreamingResponse(
+        zip_buffer,
+        media_type="application/zip",
+        headers=headers
+    )
+
+
+
+
+
+@app.get("/admin/wfh/employee/{email}/activity")
+async def admin_wfh_employee_activity(
+    email: str,
+    date: Optional[str] = None,
+    limit: int = 200,
+    current_admin: Admin = Depends(get_current_admin)
+):
+    clean_email = email.strip().lower()
+
+    query = {"employee_email": clean_email}
+
+    if current_admin.organization_id and current_admin.organization_id != "system_org":
+        query["organization_id"] = current_admin.organization_id
+
+    if date:
+        start = datetime.fromisoformat(date + "T00:00:00+00:00")
+        end = start + timedelta(days=1)
+        query["timestamp"] = {"$gte": start, "$lt": end}
+
+    cursor = wfh_activity_collection.find(query).sort("timestamp", 1).limit(limit)
+    data = await cursor.to_list(length=limit)
+
+    for item in data:
+        item["_id"] = str(item["_id"])
+
+    return data
+
+
+@app.get("/admin/wfh/employee/{email}/apps")
+async def admin_wfh_employee_apps(
+    email: str,
+    date: Optional[str] = None,
+    limit: int = 100,
+    current_admin: Admin = Depends(get_current_admin)
+):
+    clean_email = email.strip().lower()
+
+    query = {"employee_email": clean_email}
+
+    if current_admin.organization_id and current_admin.organization_id != "system_org":
+        query["organization_id"] = current_admin.organization_id
+
+    if date:
+        query["date"] = date
+
+    cursor = wfh_app_usage_collection.find(query).sort("timestamp", -1).limit(limit)
+    data = await cursor.to_list(length=limit)
+
+    for item in data:
+        item["_id"] = str(item["_id"])
+
+    return data
+
+
+@app.get("/admin/wfh/employee/{email}/productivity")
+async def admin_wfh_employee_productivity(
+    email: str,
+    date: Optional[str] = None,
+    limit: int = 100,
+    current_admin: Admin = Depends(get_current_admin)
+):
+    clean_email = email.strip().lower()
+
+    query = {"employee_email": clean_email}
+
+    if current_admin.organization_id and current_admin.organization_id != "system_org":
+        query["organization_id"] = current_admin.organization_id
+
+    if date:
+        query["date"] = date
+
+    cursor = wfh_productivity_collection.find(query).sort("timestamp", 1).limit(limit)
+    data = await cursor.to_list(length=limit)
+
+    for item in data:
+        item["_id"] = str(item["_id"])
+
+    return data
+
+
+@app.get("/admin/wfh/employee/{email}/timeline")
+async def admin_wfh_employee_timeline(
+    email: str,
+    date: Optional[str] = None,
+    current_admin: Admin = Depends(get_current_admin)
+):
+    clean_email = email.strip().lower()
+
+    base_query = {"employee_email": clean_email}
+
+    if current_admin.organization_id and current_admin.organization_id != "system_org":
+        base_query["organization_id"] = current_admin.organization_id
+
+    if date:
+        start = datetime.fromisoformat(date + "T00:00:00+00:00")
+        end = start + timedelta(days=1)
+        time_filter = {"timestamp": {"$gte": start, "$lt": end}}
+    else:
+        time_filter = {}
+
+    try:
+        # Run all 3 queries in parallel instead of sequentially
+        screenshots_task = wfh_screenshots_collection.find({**base_query, **time_filter}).to_list(length=300)
+        activities_task = wfh_activity_collection.find({**base_query, **time_filter}).to_list(length=300)
+        alerts_task = wfh_alerts_collection.find({**base_query, **time_filter}).to_list(length=300)
+
+        screenshots, activities, alerts = await asyncio.gather(
+            screenshots_task, activities_task, alerts_task,
+            return_exceptions=True
+        )
+
+        timeline = []
+
+        if isinstance(screenshots, list):
+            for item in screenshots:
+                timeline.append({
+                    "type": "screenshot",
+                    "timestamp": item.get("timestamp"),
+                    "data": {
+                        "_id": str(item["_id"]),
+                        "image_url": item.get("image_url"),
+                        "active_app": item.get("active_app"),
+                        "active_window": item.get("active_window")
+                    }
+                })
+        else:
+            logger.error(f"timeline: screenshots query failed: {screenshots}")
+
+        if isinstance(activities, list):
+            for item in activities:
+                timeline.append({
+                    "type": "activity",
+                    "timestamp": item.get("timestamp"),
+                    "data": {
+                        "_id": str(item["_id"]),
+                        "keystrokes": item.get("keystrokes", 0),
+                        "mouse_clicks": item.get("mouse_clicks", 0),
+                        "idle_seconds": item.get("idle_seconds", 0),
+                        "active_seconds": item.get("active_seconds", 0)
+                    }
+                })
+        else:
+            logger.error(f"timeline: activities query failed: {activities}")
+
+        if isinstance(alerts, list):
+            for item in alerts:
+                timeline.append({
+                    "type": "alert",
+                    "timestamp": item.get("timestamp"),
+                    "data": {
+                        "_id": str(item["_id"]),
+                        "alert_type": item.get("type"),
+                        "severity": item.get("severity"),
+                        "details": item.get("details")
+                    }
+                })
+        else:
+            logger.error(f"timeline: alerts query failed: {alerts}")
+
+        timeline.sort(key=lambda x: x.get("timestamp") or datetime.min, reverse=True)
+
+        return timeline
+    except Exception as e:
+        logger.error(f"admin_wfh_employee_timeline crashed: {e}", exc_info=True)
+        return []
+
+
+@app.get("/admin/wfh/alerts")
+async def admin_wfh_alerts(
+    status: Optional[str] = None,
+    severity: Optional[str] = None,
+    limit: int = 100,
+    current_admin: Admin = Depends(get_current_admin)
+):
+    query = {}
+
+    if current_admin.organization_id and current_admin.organization_id != "system_org":
+        query["organization_id"] = current_admin.organization_id
+
+    if status:
+        query["status"] = status
+
+    if severity:
+        query["severity"] = severity
+
+    cursor = wfh_alerts_collection.find(query).sort("timestamp", -1).limit(limit)
+    alerts = await cursor.to_list(length=limit)
+
+    for item in alerts:
+        item["_id"] = str(item["_id"])
+
+    return alerts
+
+
+@app.post("/admin/wfh/alerts/{alert_id}/review")
+async def admin_review_wfh_alert(
+    alert_id: str,
+    req: dict,
+    current_admin: Admin = Depends(get_current_admin)
+):
+    if not ObjectId.is_valid(alert_id):
+        raise HTTPException(status_code=400, detail="Invalid alert id")
+
+    query = {"_id": ObjectId(alert_id)}
+
+    if current_admin.organization_id and current_admin.organization_id != "system_org":
+        query["organization_id"] = current_admin.organization_id
+
+    alert = await wfh_alerts_collection.find_one(query)
+
+    if not alert:
+        raise HTTPException(status_code=404, detail="Alert not found")
+
+    await wfh_alerts_collection.update_one(
+        {"_id": ObjectId(alert_id)},
+        {
+            "$set": {
+                "status": req.get("status", "reviewed"),
+                "reviewed_by": current_admin.email,
+                "reviewed_at": datetime.now(timezone.utc),
+                "review_note": req.get("note")
+            }
+        }
+    )
+
+    return {
+        "status": "success",
+        "message": "WFH alert reviewed successfully"
+    }
+
+@app.get("/api/wfh/my-alerts")
+async def get_my_wfh_alerts(employee = Depends(get_current_employee)):
+    clean_email = employee.get("email").strip().lower()
+    cursor = wfh_alerts_collection.find({"employee_email": clean_email}).sort("timestamp", -1)
+    alerts = await cursor.to_list(length=100)
+    for a in alerts:
+        a["_id"] = str(a["_id"])
+    return alerts
+
+# =========================
+# WFH TASK MONITORING APIs
+# =========================
+
+from database import tasks_collection
+
+@app.get("/api/tasks")
+async def get_my_tasks(employee = Depends(get_current_employee)):
+    email = employee.get("email").strip().lower()
+    cursor = tasks_collection.find({"employee_email": email}).sort("created_at", -1)
+    tasks = await cursor.to_list(length=200)
+    for task in tasks:
+        task["_id"] = str(task["_id"])
+    return tasks
+
+@app.post("/api/tasks")
+async def create_my_task(req: dict, employee = Depends(get_current_employee)):
+    email = employee.get("email").strip().lower()
+    title = req.get("title")
+    if not title:
+        raise HTTPException(status_code=400, detail="Task title is required")
+    
+    now = datetime.now(timezone.utc)
+    task_doc = {
+        "employee_id": str(employee["_id"]),
+        "employee_email": email,
+        "organization_id": employee.get("organization_id"),
+        "title": title.strip(),
+        "description": req.get("description", "").strip(),
+        "status": req.get("status", "todo"),
+        "priority": req.get("priority", "medium"),
+        "worked_minutes": 0,
+        "created_at": now,
+        "updated_at": now
+    }
+    
+    result = await tasks_collection.insert_one(task_doc)
+    task_doc["_id"] = str(result.inserted_id)
+    return task_doc
+
+@app.put("/api/tasks/{task_id}")
+async def update_my_task(task_id: str, req: dict, employee = Depends(get_current_employee)):
+    email = employee.get("email").strip().lower()
+    
+    task = await tasks_collection.find_one({"_id": ObjectId(task_id), "employee_email": email})
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+        
+    update_data = {}
+    if "status" in req:
+        update_data["status"] = req["status"]
+    if "description" in req:
+        update_data["description"] = req["description"]
+    if "priority" in req:
+        update_data["priority"] = req["priority"]
+    if "worked_minutes" in req:
+        update_data["worked_minutes"] = req["worked_minutes"]
+        
+    if not update_data:
+        return {"status": "success", "message": "No fields to update"}
+        
+    update_data["updated_at"] = datetime.now(timezone.utc)
+    
+    await tasks_collection.update_one(
+        {"_id": ObjectId(task_id)},
+        {"$set": update_data}
+    )
+    return {"status": "success", "message": "Task updated successfully"}
+
+# Admin route to fetch an employee's tasks
+@app.get("/admin/wfh/employee/{email}/tasks")
+async def admin_get_employee_tasks(email: str, current_admin: Admin = Depends(get_current_admin)):
+    clean_email = email.strip().lower()
+    query = {"employee_email": clean_email}
+    
+    if current_admin.organization_id and current_admin.organization_id != "system_org":
+        query["organization_id"] = current_admin.organization_id
+        
+    cursor = tasks_collection.find(query).sort("created_at", -1)
+    tasks = await cursor.to_list(length=200)
+    for task in tasks:
+        task["_id"] = str(task["_id"])
+    return tasks
+
+# Admin route to assign a task to an employee
+@app.post("/admin/wfh/employee/{email}/tasks")
+async def admin_assign_employee_task(email: str, req: dict, current_admin: Admin = Depends(get_current_admin)):
+    clean_email = email.strip().lower()
+    title = req.get("title")
+    if not title:
+        raise HTTPException(status_code=400, detail="Task title is required")
+        
+    emp_query = {"email": clean_email}
+    if current_admin.organization_id and current_admin.organization_id != "system_org":
+        emp_query["organization_id"] = current_admin.organization_id
+        
+    emp = await employees_collection.find_one(emp_query)
+    if not emp:
+        raise HTTPException(status_code=404, detail="Employee not found or access denied")
+        
+    now = datetime.now(timezone.utc)
+    task_doc = {
+        "employee_id": str(emp["_id"]),
+        "employee_email": clean_email,
+        "organization_id": emp.get("organization_id"),
+        "title": title.strip(),
+        "description": req.get("description", "").strip(),
+        "status": "todo",
+        "priority": req.get("priority", "medium"),
+        "worked_minutes": 0,
+        "created_at": now,
+        "updated_at": now
+    }
+    
+    result = await tasks_collection.insert_one(task_doc)
+    task_doc["_id"] = str(result.inserted_id)
+    return task_doc
+
+# =========================
+# WFH REPORTS & ANALYTICS APIs
+# =========================
+
+from fastapi.responses import Response
+import csv
+import io
+
+@app.get("/admin/wfh/reports/productivity")
+async def get_wfh_reports_productivity(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    employee_email: Optional[str] = None,
+    format: str = "json",
+    current_admin: Admin = Depends(get_current_admin)
+):
+    query = {}
+    if current_admin.organization_id and current_admin.organization_id != "system_org":
+        query["organization_id"] = current_admin.organization_id
+    if employee_email:
+        query["employee_email"] = employee_email.strip().lower()
+    
+    date_filter = {}
+    if start_date:
+        date_filter["$gte"] = start_date
+    if end_date:
+        date_filter["$lte"] = end_date
+    if date_filter:
+        query["date"] = date_filter
+        
+    cursor = wfh_sessions_collection.find(query).sort("check_in_time", -1)
+    sessions = await cursor.to_list(length=1000)
+    
+    report_data = []
+    for s in sessions:
+        check_in_str = s["check_in_time"].isoformat() if s.get("check_in_time") else ""
+        check_out_str = s["check_out_time"].isoformat() if s.get("check_out_time") else ""
+        duration_hrs = round(s.get("total_active_seconds", 0) / 3600.0, 2)
+        
+        report_data.append({
+            "employee_email": s.get("employee_email", ""),
+            "employee_name": s.get("employee_name", ""),
+            "date": s.get("date", ""),
+            "check_in_time": check_in_str,
+            "check_out_time": check_out_str,
+            "duration_hours": duration_hrs,
+            "productivity_score": s.get("productivity_score", 0),
+            "verified_productivity_score": s.get("verified_productivity_score", s.get("productivity_score", 0)),
+            "face_check_passed": s.get("face_check_passed", 0),
+            "face_check_count": s.get("face_check_count", 0),
+            "status": s.get("status", "")
+        })
+        
+    if format == "csv":
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow([
+            "Employee Email", "Employee Name", "Date", "Check-in Time", "Check-out Time",
+            "Duration (Hours)", "Productivity Score (%)", "Verified Productivity Score (%)",
+            "Face Checks Passed", "Total Face Checks", "Status"
+        ])
+        for row in report_data:
+            writer.writerow([
+                row["employee_email"], row["employee_name"], row["date"], row["check_in_time"],
+                row["check_out_time"], row["duration_hours"], row["productivity_score"],
+                row["verified_productivity_score"], row["face_check_passed"], row["face_check_count"],
+                row["status"]
+            ])
+        return Response(
+            content=output.getvalue(),
+            media_type="text/csv",
+            headers={"Content-Disposition": "attachment; filename=wfh_productivity_report.csv"}
+        )
+        
+    return report_data
+
+
+@app.get("/admin/wfh/reports/app-usage")
+async def get_wfh_reports_app_usage(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    employee_email: Optional[str] = None,
+    format: str = "json",
+    current_admin: Admin = Depends(get_current_admin)
+):
+    query = {}
+    if current_admin.organization_id and current_admin.organization_id != "system_org":
+        query["organization_id"] = current_admin.organization_id
+    if employee_email:
+        query["employee_email"] = employee_email.strip().lower()
+        
+    date_filter = {}
+    if start_date:
+        date_filter["$gte"] = start_date
+    if end_date:
+        date_filter["$lte"] = end_date
+    if date_filter:
+        query["date"] = date_filter
+        
+    cursor = wfh_app_usage_collection.find(query).sort("timestamp", -1)
+    usages = await cursor.to_list(length=1000)
+    
+    # Aggregate duration by (email, name, app_name)
+    app_aggregates = {}
+    for u in usages:
+        email = u.get("employee_email", "")
+        name = u.get("employee_name", "")
+        apps = u.get("apps", [])
+        for app in apps:
+            app_name = app.get("name", "unknown")
+            duration = float(app.get("duration_seconds", 0))
+            category = app.get("status", "neutral")
+            
+            key = (email, name, app_name, category)
+            app_aggregates[key] = app_aggregates.get(key, 0.0) + duration
+            
+    report_data = []
+    for (email, name, app_name, category), total_dur in app_aggregates.items():
+        report_data.append({
+            "employee_email": email,
+            "employee_name": name,
+            "app_name": app_name,
+            "category": category,
+            "total_minutes": round(total_dur / 60.0, 2)
+        })
+        
+    if format == "csv":
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["Employee Email", "Employee Name", "App Name", "Classification", "Total Duration (Minutes)"])
+        for row in report_data:
+            writer.writerow([row["employee_email"], row["employee_name"], row["app_name"], row["category"], row["total_minutes"]])
+        return Response(
+            content=output.getvalue(),
+            media_type="text/csv",
+            headers={"Content-Disposition": "attachment; filename=wfh_app_usage_report.csv"}
+        )
+        
+    return report_data
+
+
+@app.get("/admin/wfh/reports/attendance")
+async def get_wfh_reports_attendance(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    employee_email: Optional[str] = None,
+    format: str = "json",
+    current_admin: Admin = Depends(get_current_admin)
+):
+    query = {}
+    if current_admin.organization_id and current_admin.organization_id != "system_org":
+        query["organization_id"] = current_admin.organization_id
+    if employee_email:
+        query["employee_email"] = employee_email.strip().lower()
+        
+    date_filter = {}
+    if start_date:
+        date_filter["$gte"] = start_date
+    if end_date:
+        date_filter["$lte"] = end_date
+    if date_filter:
+        query["date"] = date_filter
+        
+    cursor = wfh_sessions_collection.find(query).sort("check_in_time", -1)
+    sessions = await cursor.to_list(length=1000)
+    
+    # Group by employee to calculate summary metrics
+    emp_summary = {}
+    for s in sessions:
+        email = s.get("employee_email", "")
+        name = s.get("employee_name", "")
+        active_sec = s.get("total_active_seconds", 0) or 0
+        score = s.get("verified_productivity_score", s.get("productivity_score", 0)) or 0
+        
+        # Approximate active/idle seconds if missing
+        if active_sec == 0:
+            if s.get("check_in_time") and s.get("check_out_time"):
+                active_sec = int((s["check_out_time"] - s["check_in_time"]).total_seconds())
+                
+        if email not in emp_summary:
+            emp_summary[email] = {
+                "employee_email": email,
+                "employee_name": name,
+                "sessions_count": 0,
+                "total_duration_hours": 0.0,
+                "productivity_scores_sum": 0.0,
+                "productivity_scores_count": 0
+            }
+            
+        emp_summary[email]["sessions_count"] += 1
+        emp_summary[email]["total_duration_hours"] += round(active_sec / 3600.0, 2)
+        if score > 0:
+            emp_summary[email]["productivity_scores_sum"] += score
+            emp_summary[email]["productivity_scores_count"] += 1
+            
+    report_data = []
+    for email, data in emp_summary.items():
+        avg_score = 0.0
+        if data["productivity_scores_count"] > 0:
+            avg_score = round(data["productivity_scores_sum"] / data["productivity_scores_count"], 2)
+            
+        report_data.append({
+            "employee_email": data["employee_email"],
+            "employee_name": data["employee_name"],
+            "total_sessions": data["sessions_count"],
+            "total_duration_hours": round(data["total_duration_hours"], 2),
+            "average_productivity_score": avg_score
+        })
+        
+    if format == "csv":
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["Employee Email", "Employee Name", "Total Sessions", "Total Duration (Hours)", "Average Productivity Score (%)"])
+        for row in report_data:
+            writer.writerow([row["employee_email"], row["employee_name"], row["total_sessions"], row["total_duration_hours"], row["average_productivity_score"]])
+        return Response(
+            content=output.getvalue(),
+            media_type="text/csv",
+            headers={"Content-Disposition": "attachment; filename=wfh_attendance_report.csv"}
+        )
+        
+    return report_data
+
+
+@app.get("/admin/wfh/reports/screenshots")
+async def get_wfh_reports_screenshots(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    employee_email: Optional[str] = None,
+    format: str = "json",
+    current_admin: Admin = Depends(get_current_admin)
+):
+    query = {}
+    if current_admin.organization_id and current_admin.organization_id != "system_org":
+        query["organization_id"] = current_admin.organization_id
+        
+    # Get employee ID first if email is provided
+    if employee_email:
+        emp = await employees_collection.find_one({"email": employee_email.strip().lower()})
+        if emp:
+            query["employee_id"] = str(emp["_id"])
+        else:
+            query["employee_id"] = "nonexistent"
+            
+    # Timestamp date logic
+    time_filter = {}
+    if start_date:
+        time_filter["$gte"] = datetime.fromisoformat(start_date)
+    if end_date:
+        time_filter["$lte"] = datetime.fromisoformat(end_date)
+    if time_filter:
+        query["timestamp"] = time_filter
+        
+    cursor = wfh_screenshots_collection.find(query).sort("timestamp", -1)
+    screenshots = await cursor.to_list(length=1000)
+    
+    # Batch-fetch all employee records
+    from bson import ObjectId
+    emp_ids = list({ObjectId(s["employee_id"]) for s in screenshots if s.get("employee_id") and ObjectId.is_valid(str(s["employee_id"]))})
+    employees = await employees_collection.find({"_id": {"$in": emp_ids}}, {"_id": 1, "email": 1, "full_name": 1}).to_list(length=len(emp_ids))
+    emp_map = {str(e["_id"]): e for e in employees}
+
+    report_data = []
+    for s in screenshots:
+        emp_id_str = str(s.get("employee_id", ""))
+        emp = emp_map.get(emp_id_str)
+        emp_email = emp.get("email", "") if emp else ""
+        emp_name = emp.get("full_name", "") if emp else ""
+            
+        report_data.append({
+            "employee_email": emp_email,
+            "employee_name": emp_name,
+            "timestamp": s["timestamp"].isoformat() if s.get("timestamp") else "",
+            "active_app": s.get("active_app", ""),
+            "active_window": s.get("active_window", ""),
+            "flagged": s.get("flagged", False),
+            "flag_reason": s.get("flag_reason", "")
+        })
+        
+    if format == "csv":
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["Employee Email", "Employee Name", "Timestamp", "Active App", "Active Window", "Flagged Status", "Flag Reason"])
+        for row in report_data:
+            writer.writerow([
+                row["employee_email"], row["employee_name"], row["timestamp"], row["active_app"],
+                row["active_window"], "Flagged" if row["flagged"] else "Normal", row["flag_reason"]
+            ])
+        return Response(
+            content=output.getvalue(),
+            media_type="text/csv",
+            headers={"Content-Disposition": "attachment; filename=wfh_screenshots_report.csv"}
+        )
+        
+    return report_data
+
+
+@app.get("/debug/routes")
+async def debug_routes():
+    return [route.path for route in app.routes]
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8001, reload=False, reload_excludes=["*.log", "logs/*"])

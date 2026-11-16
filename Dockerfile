@@ -24,8 +24,8 @@ RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
 
 # ─── Non-root user setup ──────────────────────────────────────────────────────
 RUN useradd -m -u 1000 appuser && \
-    mkdir -p uploads logs && \
-    chown -R appuser:appuser /app
+    mkdir -p uploads logs /home/appuser/.deepface/weights && \
+    chown -R appuser:appuser /app /home/appuser
 
 # ─── Application code ────────────────────────────────────────────────────────
 COPY --chown=appuser . .
