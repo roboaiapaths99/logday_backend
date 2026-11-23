@@ -8,6 +8,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxext6 \
     libxrender-dev \
     libgomp1 \
+    tesseract-ocr \
+    tesseract-ocr-eng \
     curl \
     build-essential \
     python3-dev \
@@ -40,10 +42,11 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD curl -f http://localhost:8001/health || exit 1
 
 # ─── Start command ───────────────────────────────────────────────────────────
-# For production: 2 uvicorn workers via gunicorn
+# Default to 1 worker to ensure single APScheduler instance and coherent memory state.
+# For multi-worker scale, run scheduler as a dedicated worker/process.
 CMD ["gunicorn", "main:app", \
     "--worker-class", "uvicorn.workers.UvicornWorker", \
-    "--workers", "2", \
+    "--workers", "1", \
     "--bind", "0.0.0.0:8001", \
     "--timeout", "120", \
     "--access-logfile", "-", \

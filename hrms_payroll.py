@@ -14,6 +14,7 @@ from models import Admin
 from auth import get_current_admin
 from hrms_models import PayrollStatus, PayrollCreate, PayrollRunRequest, DaysOffSaveRequest
 from permissions import require_feature
+from attendance_service import classify_attendance_day
 
 router = APIRouter(
     prefix="/admin/payroll",
@@ -280,7 +281,7 @@ async def fetch_attendance_data(employee_email: str, org_id: str, payroll_month:
         short_leave_monthly_limit = int(policy.get("short_leave_monthly_limit", 2))
         short_leave_penalty_rule = policy.get("short_leave_penalty_rule", "half_day_per_2_excess")
 
-    from main import classify_attendance_day
+    # classify_attendance_day imported from attendance_service
 
     # 2. Approved leave days (with duration and paid status)
     emp_identifiers = [employee_email.strip().lower(), employee_email.strip(), emp_id]

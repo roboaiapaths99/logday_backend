@@ -249,7 +249,8 @@ async def get_wfh_calendar(
     return calendar_data
 
 
-@router.get("/admin/wfh/stats")
+@router.get("/admin/wfh/request-stats")
+@router.get("/admin/wfh-requests/stats")
 async def get_wfh_stats(admin: Admin = Depends(require_feature("wfh_management"))):
     """Get dashboard stats for WFH management."""
     org_id = admin.organization_id

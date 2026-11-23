@@ -1,7 +1,12 @@
 from pydantic import BaseModel, Field, model_validator
 from typing import List, Optional, Any
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
+
+
+def utc_now() -> datetime:
+    """Helper to return current timezone-aware UTC datetime."""
+    return datetime.now(timezone.utc)
 
 
 class EmployeeType(str, Enum):
@@ -53,7 +58,7 @@ class WFHRequest(BaseModel):
     approved_by: Optional[str] = None
     approved_at: Optional[datetime] = None
     rejection_reason: Optional[str] = None
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=utc_now)
 
 
 
@@ -194,7 +199,7 @@ class EmployeeDB(EmployeeBase):
     territory_radius_meters: Optional[float] = None
     territory_polygon: Optional[List[dict]] = None
     gps_otp_fallback_enabled: bool = True
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=utc_now)
 
 
 class LocationData(BaseModel):
@@ -204,7 +209,7 @@ class LocationData(BaseModel):
 
 class AttendanceLog(BaseModel):
     user_id: str
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=utc_now)
     type: str  # "check-in" or "check-out"
     attendance_type: AttendanceType = AttendanceType.OFFICE
     location: Optional[LocationData] = None
@@ -334,7 +339,7 @@ class Organization(BaseModel):
     logo_url: Optional[str] = None
     primary_color: str = "#0f172a"
     address: Optional[str] = None
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=utc_now)
 
 
 class Admin(BaseModel):
@@ -343,7 +348,7 @@ class Admin(BaseModel):
     role: AdminRole = AdminRole.HR
     organization_id: Optional[str] = None
     allowed_features: List[str] = ["dashboard"]
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=utc_now)
 
 
 class OrganizationRegisterRequest(BaseModel):
@@ -468,7 +473,7 @@ class VisitPlan(BaseModel):
     manager_comments: Optional[str] = None
     is_recurring: bool = False
     template_id: Optional[str] = None
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=utc_now)
 
 
 class Visit(BaseModel):
@@ -476,7 +481,7 @@ class Visit(BaseModel):
     organization_id: str
     date: str  # YYYY-MM-DD
     visit_plan_stop_id: Optional[str] = None
-    check_in_time: datetime = Field(default_factory=datetime.utcnow)
+    check_in_time: datetime = Field(default_factory=utc_now)
     check_out_time: Optional[datetime] = None
     check_in_lat: float
     check_in_lng: float
@@ -501,7 +506,7 @@ class VisitMedia(BaseModel):
     file_size: int
     gps_lat: float
     gps_lng: float
-    captured_at: datetime = Field(default_factory=datetime.utcnow)
+    captured_at: datetime = Field(default_factory=utc_now)
     metadata_verified: bool = False
 
 
@@ -514,7 +519,7 @@ class LocationPing(BaseModel):
     latitude: Optional[float] = None
     longitude: Optional[float] = None
     accuracy: float = 10.0
-    recorded_at: datetime = Field(default_factory=datetime.utcnow)
+    recorded_at: datetime = Field(default_factory=utc_now)
     source: Any = "auto"
     offline_id: Optional[str] = None
     synced_at: Optional[datetime] = None
@@ -562,7 +567,7 @@ class ExpenseClaim(BaseModel):
     manager_query: Optional[str] = None
     employee_response: Optional[str] = None
     resolved_at: Optional[datetime] = None
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=utc_now)
 
 
 class LeaveType(str, Enum):
@@ -592,7 +597,7 @@ class DiscussionMessage(BaseModel):
     sender_name: str
     role: str  # "admin" or "employee"
     message: str
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=utc_now)
 
 
 class LeaveRequest(BaseModel):
@@ -611,7 +616,7 @@ class LeaveRequest(BaseModel):
     status: LeaveStatus = LeaveStatus.PENDING
     proof_url: Optional[str] = None
     discussion: List[DiscussionMessage] = []
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=utc_now)
     processed_at: Optional[datetime] = None
     processed_by: Optional[str] = None
 
@@ -624,7 +629,7 @@ class Alert(BaseModel):
     severity: AlertSeverity
     status: AlertStatus = AlertStatus.PENDING
     detail: str
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=utc_now)
     metadata: Optional[dict] = None  # Lat, Long, accuracy, etc.
     resolved_at: Optional[datetime] = None
     resolved_by: Optional[str] = None
@@ -653,8 +658,8 @@ class WFHDeviceInfo(BaseModel):
     screen_resolution: Optional[str] = None
     monitor_count: Optional[int] = None
     status: str = "pending"  # pending | approved | revoked
-    registered_at: datetime = Field(default_factory=datetime.utcnow)
-    last_seen: datetime = Field(default_factory=datetime.utcnow)
+    registered_at: datetime = Field(default_factory=utc_now)
+    last_seen: datetime = Field(default_factory=utc_now)
     approved_by: Optional[str] = None
     approved_at: Optional[datetime] = None
     revoked_by: Optional[str] = None
@@ -665,7 +670,7 @@ class WFHDeviceInfo(BaseModel):
 class WFHScreenshot(BaseModel):
     employee_id: str
     organization_id: str
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=utc_now)
     image_url: str
     active_app: Optional[str] = None
     active_window: Optional[str] = None
@@ -677,7 +682,7 @@ class WFHScreenshot(BaseModel):
 class WFHActivity(BaseModel):
     employee_id: str
     organization_id: str
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=utc_now)
     period_minutes: int = 5
     keystrokes: int = 0
     mouse_clicks: int = 0
@@ -690,7 +695,7 @@ class WFHActivity(BaseModel):
 class WFHAppUsage(BaseModel):
     employee_id: str
     organization_id: str
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=utc_now)
     date: str
     apps: List[dict] = []
 
@@ -698,7 +703,7 @@ class WFHAppUsage(BaseModel):
 class WFHProductivity(BaseModel):
     employee_id: str
     organization_id: str
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=utc_now)
     date: str
     score: float = 0.0
     breakdown: Optional[dict] = None
@@ -708,7 +713,7 @@ class WFHAlert(BaseModel):
     employee_id: str
     organization_id: str
     type: str
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=utc_now)
     image_url: Optional[str] = None
     severity: str = "medium"
     status: str = "pending"

@@ -13,6 +13,7 @@ class VerificationSource(str, Enum):
 class DocumentType(str, Enum):
     AADHAAR = "aadhaar"
     PAN = "pan"
+    PAN_CARD = "pan_card"
     DRIVING_LICENSE = "driving_license"
     VOTER_ID = "voter_id"
     PASSPORT = "passport"
@@ -20,6 +21,7 @@ class DocumentType(str, Enum):
     CLASS_12 = "class_12_marksheet"
     DEGREE = "degree_certificate"
     BANK_PASSBOOK = "bank_passbook"
+    BANK_DETAILS = "bank_details"
     SALARY_SLIP = "salary_slip"
     EXPERIENCE_LETTER = "experience_letter"
     RELIEVING_LETTER = "relieving_letter"

@@ -2,6 +2,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 import os
 import logging
+import asyncio
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
@@ -12,11 +13,8 @@ SCOPES = [
     'https://www.googleapis.com/auth/drive'
 ]
 
-async def sync_to_google_sheets(log_entry: dict):
-    """
-    Syncs a single attendance log entry to a designated Google Sheet.
-    Requires GOOGLE_SHEET_ID and SERVICE_ACCOUNT_JSON_PATH in .env
-    """
+def _sync_to_google_sheets_worker(log_entry: dict):
+    """Synchronous worker running in a threadpool to prevent blocking the event loop."""
     sheet_id = os.getenv("GOOGLE_SHEET_ID")
     creds_path = os.getenv("SERVICE_ACCOUNT_JSON_PATH")
 
@@ -51,11 +49,16 @@ async def sync_to_google_sheets(log_entry: dict):
         logger.error(f"Google Sheets synchronization failed: {e}")
 
 
-async def sync_visit_to_google_sheets(visit_entry: dict):
+async def sync_to_google_sheets(log_entry: dict):
     """
-    Syncs a completed visit record to a 'Visits' worksheet in the Google Sheet.
-    Called after visit check-out. Requires same env vars as attendance sync.
+    Syncs a single attendance log entry to a designated Google Sheet.
+    Dispatches blocking I/O to a worker thread.
     """
+    await asyncio.to_thread(_sync_to_google_sheets_worker, log_entry)
+
+
+def _sync_visit_to_google_sheets_worker(visit_entry: dict):
+    """Synchronous worker running in a threadpool to prevent blocking the event loop."""
     sheet_id = os.getenv("GOOGLE_SHEET_ID")
     creds_path = os.getenv("SERVICE_ACCOUNT_JSON_PATH")
 
@@ -97,3 +100,11 @@ async def sync_visit_to_google_sheets(visit_entry: dict):
 
     except Exception as e:
         logger.error(f"Visit Google Sheets sync failed: {e}")
+
+
+async def sync_visit_to_google_sheets(visit_entry: dict):
+    """
+    Syncs a completed visit record to a 'Visits' worksheet in the Google Sheet.
+    Dispatches blocking I/O to a worker thread.
+    """
+    await asyncio.to_thread(_sync_visit_to_google_sheets_worker, visit_entry)

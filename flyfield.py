@@ -28,8 +28,9 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["LogDay FlyField"])
 
-# In-memory geocode cache to avoid redundant lookups
+# In-memory geocode cache to avoid redundant lookups (bounded to prevent memory leaks)
 FLYFIELD_GEOCODE_CACHE: Dict[tuple, str] = {}
+MAX_FLYFIELD_GEOCODE_CACHE = 1000
 
 
 # ==============================================================================
@@ -73,6 +74,9 @@ async def resolve_real_address(lat: float, lon: float, client_address: Optional[
                         parts.append(val)
                 
                 formatted = ", ".join(parts[:5]) if parts else display_name
+                if len(FLYFIELD_GEOCODE_CACHE) >= MAX_FLYFIELD_GEOCODE_CACHE:
+                    for k in list(FLYFIELD_GEOCODE_CACHE.keys())[:200]:
+                        del FLYFIELD_GEOCODE_CACHE[k]
                 FLYFIELD_GEOCODE_CACHE[cache_key] = formatted
                 return formatted
     except Exception as e:
@@ -345,13 +349,19 @@ async def start_flyfield_visit(req: VisitStartRequest, user: dict = Depends(get_
         "updated_at": now_utc
     }
 
+    if cur_lat is not None and cur_long is not None:
+        visit_doc["check_in_location"] = {
+            "type": "Point",
+            "coordinates": [float(cur_long), float(cur_lat)]
+        }
+
     result = await visit_logs_collection.insert_one(visit_doc)
     visit_doc["_id"] = str(result.inserted_id)
 
     # Record real-time breadcrumb for live map
     if cur_lat and cur_long:
         try:
-            await location_pings_collection.insert_one({
+            ping_doc = {
                 "employee_id": email,
                 "organization_id": org_id,
                 "lat": cur_lat,
@@ -359,7 +369,13 @@ async def start_flyfield_visit(req: VisitStartRequest, user: dict = Depends(get_
                 "accuracy": req.accuracy or 10.0,
                 "recorded_at": now_utc,
                 "source": "flyfield_visit_checkin"
-            })
+            }
+            if cur_lat is not None and cur_long is not None:
+                ping_doc["location"] = {
+                    "type": "Point",
+                    "coordinates": [float(cur_long), float(cur_lat)]
+                }
+            await location_pings_collection.insert_one(ping_doc)
         except Exception as ping_err:
             logger.warning(f"Failed to record visit start location ping: {ping_err}")
 
@@ -526,7 +542,7 @@ async def end_flyfield_visit(
     # Record real-time breadcrumb for live map
     if cur_lat and cur_long:
         try:
-            await location_pings_collection.insert_one({
+            ping_doc = {
                 "employee_id": email,
                 "organization_id": user.get("organization_id"),
                 "lat": cur_lat,
@@ -534,7 +550,13 @@ async def end_flyfield_visit(
                 "accuracy": req.accuracy or 10.0,
                 "recorded_at": now_utc,
                 "source": "flyfield_visit_checkout"
-            })
+            }
+            if cur_lat is not None and cur_long is not None:
+                ping_doc["location"] = {
+                    "type": "Point",
+                    "coordinates": [float(cur_long), float(cur_lat)]
+                }
+            await location_pings_collection.insert_one(ping_doc)
         except Exception as ping_err:
             logger.warning(f"Failed to record visit end location ping: {ping_err}")
 

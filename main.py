@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, File, Depends, BackgroundTasks, Request
+from fastapi import FastAPI, HTTPException, File, Depends, BackgroundTasks, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.concurrency import run_in_threadpool
 from starlette.responses import StreamingResponse
@@ -129,11 +129,36 @@ app.include_router(wfh_router)
 app.include_router(flyfield_router)
 
 
-# Configure CORS - Allow all origins dynamically with regex for Web, Vercel, Electron & Mobile
+# Configure CORS - Secure, origin-validated configuration
+_cors_env = os.getenv("ALLOWED_ORIGINS", "")
+if _cors_env:
+    allowed_origins = [o.strip() for o in _cors_env.split(",") if o.strip()]
+else:
+    allowed_origins = [
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "http://localhost:8000",
+        "http://localhost:8001",
+        "http://127.0.0.1:3000",
+        "http://127.0.0.1:5173",
+        "http://127.0.0.1:8000",
+        "http://127.0.0.1:8001",
+        "https://logday.in",
+        "https://app.logday.in",
+        "https://admin.logday.in",
+    ]
+
+# Allowed origin regex: allows subdomains of logday.in, preview vercel apps, localhost with any port, mobile apps
+allowed_origin_regex = os.getenv(
+    "ALLOWED_ORIGIN_REGEX",
+    r"^(https?://(localhost|127\.0\.0\.1)(:\d+)?|https://([a-zA-Z0-9-]+\.)*(logday\.in|vercel\.app)|capacitor://localhost|ionic://localhost)$"
+)
+_ALLOWED_REGEX_COMPILED = re.compile(allowed_origin_regex)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_origin_regex=r"^https?://.*",
+    allow_origins=allowed_origins,
+    allow_origin_regex=allowed_origin_regex,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -142,13 +167,22 @@ app.add_middleware(
 
 @app.middleware("http")
 async def add_cors_and_cache_headers(request: Request, call_next):
-    # Handle preflight OPTIONS requests directly with full CORS headers
-    origin = request.headers.get("origin") or "*"
+    origin = request.headers.get("origin")
+    is_allowed = False
+    if origin:
+        if origin in allowed_origins or _ALLOWED_REGEX_COMPILED.match(origin):
+            is_allowed = True
+        elif APP_ENV != "production":
+            is_allowed = True
+
     if request.method == "OPTIONS":
         from fastapi.responses import Response
         response = Response(status_code=200)
-        response.headers["Access-Control-Allow-Origin"] = origin
-        response.headers["Access-Control-Allow-Credentials"] = "true"
+        if origin and is_allowed:
+            response.headers["Access-Control-Allow-Origin"] = origin
+            response.headers["Access-Control-Allow-Credentials"] = "true"
+        elif not origin:
+            response.headers["Access-Control-Allow-Origin"] = "*"
         response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS, PATCH"
         response.headers["Access-Control-Allow-Headers"] = request.headers.get("access-control-request-headers", "*")
         response.headers["Access-Control-Max-Age"] = "86400"
@@ -156,9 +190,10 @@ async def add_cors_and_cache_headers(request: Request, call_next):
 
     response = await call_next(request)
     
-    # Ensure CORS headers are present even on errors
-    response.headers["Access-Control-Allow-Origin"] = origin
-    response.headers["Access-Control-Allow-Credentials"] = "true"
+    # Ensure CORS headers match validated origin
+    if origin and is_allowed:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS, PATCH"
     response.headers["Access-Control-Allow-Headers"] = "*"
     
@@ -168,13 +203,10 @@ async def add_cors_and_cache_headers(request: Request, call_next):
     response.headers["Expires"] = "0"
     return response
 
-@app.get("/health")
-async def health_check():
-    return {"status": "healthy", "timestamp": datetime.now(timezone.utc).isoformat()}
-
 # --- GEOCODING PROXY ---
 
 GEOCODE_CACHE = {}
+MAX_GEOCODE_CACHE_SIZE = 1000
 
 @app.get("/api/geocoding/reverse")
 async def reverse_geocode(lat: float, lon: float):
@@ -198,6 +230,9 @@ async def reverse_geocode(lat: float, lon: float):
         )
         response.raise_for_status()
         data = response.json()
+        if len(GEOCODE_CACHE) >= MAX_GEOCODE_CACHE_SIZE:
+            for k in list(GEOCODE_CACHE.keys())[:200]:
+                del GEOCODE_CACHE[k]
         GEOCODE_CACHE[cache_key] = data
         return data
     except Exception as e:
@@ -207,17 +242,22 @@ async def reverse_geocode(lat: float, lon: float):
 
 # --- API PREFIX MIDDLEWARE ---
 # Automatically routes /api/* to /* if the prefix is missing in main.py
+_KNOWN_ROUTES_CACHE = set()
+
+def _get_app_route_paths():
+    global _KNOWN_ROUTES_CACHE
+    if not _KNOWN_ROUTES_CACHE and hasattr(app, "routes"):
+        _KNOWN_ROUTES_CACHE = {r.path for r in app.routes if hasattr(r, "path")}
+    return _KNOWN_ROUTES_CACHE
+
 @app.middleware("http")
 async def api_prefix_handler(request: Request, call_next):
     path = request.url.path
     if path.startswith("/api/"):
-        # Check if the exact path exists in the app's routes
-        route_exists = any(route.path == path for route in app.routes)
-        if not route_exists:
-            # Try to route without /api
+        known = _get_app_route_paths()
+        if path not in known:
             new_path = path[4:] # strip /api
-            # Check if stripped path exists
-            if any(route.path == new_path for route in app.routes):
+            if new_path in known:
                 scope = request.scope.copy()
                 scope['path'] = new_path
                 request = Request(scope)
@@ -276,7 +316,7 @@ async def startup_event():
     """Ensure database indexes are present for performance optimization."""
     # Each index op is isolated so a MongoDB SSL/network issue won't crash startup
     index_ops = [
-        ("employees_email", employees_collection, [("email", 1)], {"unique": True, "background": True}),
+        ("employees_email", employees_collection, [("email", 1)], {"unique": True, "sparse": True, "background": True}),
         ("attendance_logs", attendance_logs_collection, [("user_id", 1), ("timestamp", -1)], {"background": True}),
         ("visit_plans", visit_plans_collection, [("employee_id", 1), ("status", 1)], {"background": True}),
         ("visit_logs", visit_logs_collection, [("employee_id", 1), ("timestamp", -1)], {"background": True}),
@@ -289,14 +329,7 @@ async def startup_event():
         except Exception as e:
             logger.warning(f"Index '{name}' skipped (non-fatal): {type(e).__name__}: {str(e)[:60]}")
 
-    # Scheduler startup
-    try:
-        if not scheduler.running:
-            scheduler.start()
-        logger.info("Scheduler started successfully.")
-    except Exception as e:
-        logger.warning(f"Scheduler startup failed (non-fatal): {e}")
-
+    # Scheduler startup moved to startup_db_client with jobs registered
     logger.info(f"Application startup complete. ENV={APP_ENV}")
 
 # --- HEALTH CHECK ENDPOINT ---
@@ -339,8 +372,61 @@ if not os.path.exists(UPLOAD_DIR):
     os.makedirs(UPLOAD_DIR)
 os.makedirs("uploads/wfh_view", exist_ok=True)
 
-# Serve static files
-app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
+# Public asset folders that do not require authentication
+PUBLIC_UPLOAD_FOLDERS = {"logos", "public"}
+os.makedirs(os.path.join(UPLOAD_DIR, "logos"), exist_ok=True)
+
+# Mount public logos directory for static asset delivery
+app.mount("/uploads/logos", StaticFiles(directory=os.path.join(UPLOAD_DIR, "logos")), name="logos")
+
+@app.get("/uploads/{file_path:path}")
+async def serve_upload_file(
+    file_path: str,
+    request: Request,
+    token: Optional[str] = Query(None)
+):
+    """
+    Secure file serving endpoint for uploads.
+    Public folders (e.g. logos) are served openly.
+    Sensitive employee docs & screenshots require valid JWT authentication in production.
+    """
+    # Prevent directory traversal
+    clean_path = os.path.normpath(file_path).lstrip("/\\")
+    if clean_path.startswith("..") or ".." in clean_path.split(os.path.sep):
+        raise HTTPException(status_code=403, detail="Invalid path")
+
+    base_dir = os.path.abspath(UPLOAD_DIR)
+    target_file = os.path.abspath(os.path.join(base_dir, clean_path))
+    if not target_file.startswith(base_dir):
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    if not os.path.exists(target_file) or not os.path.isfile(target_file):
+        raise HTTPException(status_code=404, detail="File not found")
+
+    first_segment = clean_path.split(os.path.sep)[0].lower()
+    if first_segment in PUBLIC_UPLOAD_FOLDERS or APP_ENV != "production":
+        return FileResponse(target_file)
+
+    # In production, require authentication for sensitive documents & screenshots
+    auth_token = token
+    if not auth_token:
+        auth_header = request.headers.get("authorization", "")
+        if auth_header.startswith("Bearer "):
+            auth_token = auth_header.split(" ", 1)[1]
+    if not auth_token:
+        auth_token = request.cookies.get("access_token")
+
+    if not auth_token:
+        raise HTTPException(status_code=401, detail="Authentication required to view this file")
+
+    try:
+        payload = jwt.decode(auth_token, SECRET_KEY, algorithms=[ALGORITHM])
+        if not payload.get("sub"):
+            raise HTTPException(status_code=401, detail="Invalid session token")
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+    return FileResponse(target_file)
 
 # Hybrid S3/MinIO & Local File Storage
 import boto3
@@ -564,28 +650,30 @@ async def purge_old_screenshots():
 @app.on_event("startup")
 async def startup_db_client():
     """Create indexes on startup (non-fatal if DB is temporarily unreachable)."""
+    # WFH & Employee indexes
     try:
-        # WFH & Employee indexes
         await ensure_employee_indexes()
-        
-        # Core Indexes
-        await employees_collection.create_index("email", unique=True)
-        await employees_collection.create_index("employee_id")
-        await attendance_logs_collection.create_index([("user_id", 1), ("timestamp", -1)])
-        
-        # Enterprise Indexes
-        await employees_collection.create_index("organization_id")
-        await attendance_logs_collection.create_index("organization_id")
-        
-        # Field Force GIS Indexes
-        await location_pings_collection.create_index([("location", "2dsphere")])
-        await location_pings_collection.create_index([("employee_id", 1), ("recorded_at", -1)])
-        await visit_logs_collection.create_index([("check_in_location", "2dsphere")])
-        await otps_collection.create_index("expires_at", expireAfterSeconds=0)
-        
-        logger.info("MongoDB Enterprise & GIS Indexes created successfully.")
     except Exception as e:
-        logger.warning(f"Startup index creation skipped (non-fatal): {type(e).__name__}: {str(e)[:80]}")
+        logger.warning(f"ensure_employee_indexes skipped: {e}")
+
+    # Core & GIS Indexes with isolated error handling so one failure never blocks others
+    db_indexes = [
+        (employees_collection, "email", {"unique": True, "sparse": True}),
+        (employees_collection, "employee_id", {}),
+        (attendance_logs_collection, [("user_id", 1), ("timestamp", -1)], {}),
+        (employees_collection, "organization_id", {}),
+        (attendance_logs_collection, "organization_id", {}),
+        (location_pings_collection, [("location", "2dsphere")], {}),
+        (location_pings_collection, [("employee_id", 1), ("recorded_at", -1)], {}),
+        (visit_logs_collection, [("check_in_location", "2dsphere")], {}),
+        (otps_collection, "expires_at", {"expireAfterSeconds": 0}),
+    ]
+    for col, keys, kwargs in db_indexes:
+        try:
+            await col.create_index(keys, **kwargs)
+        except Exception as e:
+            logger.warning(f"Index creation skipped ({keys}): {type(e).__name__}: {str(e)[:80]}")
+    logger.info("MongoDB Enterprise & GIS Indexes checked/created.")
 
     # Start Scheduler
     try:
@@ -598,6 +686,17 @@ async def startup_db_client():
         logger.warning(f"Scheduler already running or failed to start: {e}")
     
     print("Startup complete.")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Cleanly shut down scheduler and connections on process exit."""
+    try:
+        if scheduler.running:
+            scheduler.shutdown(wait=False)
+            logger.info("Scheduler shut down successfully.")
+    except Exception as e:
+        logger.warning(f"Error during scheduler shutdown: {e}")
 
 
 @app.get("/")
@@ -1151,311 +1250,35 @@ async def get_effective_org_settings(org_id: Optional[str]) -> dict:
     return merged
 
 
-def classify_attendance_day(
-    first_checkin_local: Optional[datetime],
-    last_checkout_local: Optional[datetime],
-    worked_hours: float,
-    settings: Optional[dict] = None,
-    employee_type: str = "desk",
-    approved_leave: Optional[dict] = None
-) -> dict:
-    """
-    Central enterprise classification engine for an employee's attendance day.
-    Evaluates:
-    - Office/Shift timings (desk vs field configurable by admin)
-    - Late grace & late threshold
-    - Late -> Short Leave threshold (mins or time)
-    - Late -> Half Day threshold (time, e.g. after 11:30 or lunch)
-    - Early Exit -> Half Day threshold (time, e.g. before 14:00)
-    - Early Exit -> Short Leave threshold (mins before shift end)
-    - Min Half-Day hours & Min Full-Day hours
-    - Split off-hours: late deficit vs early exit deficit
-    - Applied Short Leave / Half Day vs Attendance-triggered Short Leave / Half Day
-    """
-    settings = settings or {}
-    emp_type = str(employee_type).lower().strip()
-    is_field = (emp_type == "field") and settings.get("custom_field_rules_enabled", True)
-
-    def _parse_t(t_str, def_h, def_m):
-        try:
-            if t_str and ":" in str(t_str):
-                parts = str(t_str).strip().split(":")
-                return int(parts[0]), int(parts[1])
-        except Exception:
-            pass
-        return def_h, def_m
-
-    # 1. Timings & thresholds from admin configuration
-    if is_field:
-        start_h, start_m = _parse_t(settings.get("field_office_start_time") or settings.get("office_start_time"), 10, 0)
-        end_h, end_m = _parse_t(settings.get("field_office_end_time") or settings.get("office_end_time"), 19, 0)
-        late_grace_mins = int(settings.get("field_late_grace_mins") if settings.get("field_late_grace_mins") is not None else settings.get("late_grace_mins", 30))
-        late_to_short_mins = int(settings.get("field_late_to_short_leave_mins") if settings.get("field_late_to_short_leave_mins") is not None else settings.get("late_to_short_leave_mins", 45))
-        late_half_h, late_half_m = _parse_t(settings.get("field_late_to_half_day_time") or settings.get("late_to_half_day_time"), 12, 30)
-        early_half_h, early_half_m = _parse_t(settings.get("field_early_leave_half_day_time") or settings.get("early_leave_half_day_time"), 15, 0)
-        early_short_mins = int(settings.get("field_early_leave_short_mins") if settings.get("field_early_leave_short_mins") is not None else settings.get("early_leave_short_mins", 45))
-        half_day_min_hours = float(settings.get("field_half_day_min_hours") if settings.get("field_half_day_min_hours") is not None else settings.get("half_day_min_hours", 4.0))
-        full_day_min_hours = float(settings.get("field_full_day_min_hours") if settings.get("field_full_day_min_hours") is not None else settings.get("full_day_min_hours", 8.0))
-        required_hours = float(settings.get("field_required_hours") if settings.get("field_required_hours") is not None else settings.get("required_hours", 9.0))
-        short_leave_max_hours = float(settings.get("field_short_leave_max_hours") if settings.get("field_short_leave_max_hours") is not None else settings.get("short_leave_max_hours", 2.0))
-    else:
-        start_h, start_m = _parse_t(settings.get("office_start_time"), 9, 0)
-        end_h, end_m = _parse_t(settings.get("office_end_time"), 18, 0)
-        late_grace_mins = int(settings.get("late_grace_mins") if settings.get("late_grace_mins") is not None else settings.get("late_threshold_mins", 15))
-        
-        # Support either exact cutoff time or relative mins for late-to-short-leave
-        if settings.get("short_leave_cutoff_time"):
-            sl_h, sl_m = _parse_t(settings.get("short_leave_cutoff_time"), 10, 15)
-            late_to_short_mins = max(0, (sl_h * 60 + sl_m) - (start_h * 60 + start_m))
-        else:
-            late_to_short_mins = int(settings.get("late_to_short_leave_mins", 45))
-
-        late_half_h, late_half_m = _parse_t(settings.get("half_day_late_cutoff_time") or settings.get("late_to_half_day_time"), 11, 30)
-        early_half_h, early_half_m = _parse_t(settings.get("half_day_early_exit_cutoff_time") or settings.get("early_leave_half_day_time"), 14, 0)
-        early_short_mins = int(settings.get("early_leave_short_mins", 45))
-        half_day_min_hours = float(settings.get("half_day_min_hours", 4.0))
-        full_day_min_hours = float(settings.get("full_day_min_hours", 8.0))
-        required_hours = float(settings.get("required_hours", 8.0))
-        short_leave_max_hours = float(settings.get("short_leave_max_hours", 2.0))
-
-    # Format strings for explanations
-    late_half_str = f"{late_half_h:02d}:{late_half_m:02d}"
-    early_half_str = f"{early_half_h:02d}:{early_half_m:02d}"
-
-    # Handle No Check-in Case
-    if not first_checkin_local:
-        if approved_leave:
-            dur_type = str(approved_leave.get("duration_type", "")).lower().strip()
-            l_type = str(approved_leave.get("leave_type", "leave")).title()
-            if dur_type == "short_leave":
-                return {
-                    "status": "Short Leave",
-                    "is_late": False,
-                    "is_early_leave": False,
-                    "is_short_leave": True,
-                    "is_half_day": False,
-                    "short_leave_type": "applied",
-                    "half_day_type": None,
-                    "late_mins": 0,
-                    "early_exit_mins": 0,
-                    "late_off_hours": 0.0,
-                    "early_off_hours": 0.0,
-                    "off_hours": 0.0,
-                    "worked_hours": 0.0,
-                    "required_hours": required_hours,
-                    "effective_days": 1.0,
-                    "classification_reason": f"Approved Short Leave ({l_type})",
-                    "is_applied_leave": True
-                }
-            elif dur_type in ["first_half", "second_half", "half_day"] or approved_leave.get("duration") == 0.5:
-                return {
-                    "status": "Half Day",
-                    "is_late": False,
-                    "is_early_leave": False,
-                    "is_short_leave": False,
-                    "is_half_day": True,
-                    "short_leave_type": None,
-                    "half_day_type": f"{dur_type}_applied",
-                    "late_mins": 0,
-                    "early_exit_mins": 0,
-                    "late_off_hours": 0.0,
-                    "early_off_hours": 0.0,
-                    "off_hours": 0.0,
-                    "worked_hours": 0.0,
-                    "required_hours": required_hours,
-                    "effective_days": 0.5,
-                    "classification_reason": f"Approved Half Day ({dur_type})",
-                    "is_applied_leave": True
-                }
-            else:
-                return {
-                    "status": f"Leave ({l_type})",
-                    "is_late": False,
-                    "is_early_leave": False,
-                    "is_short_leave": False,
-                    "is_half_day": False,
-                    "short_leave_type": None,
-                    "half_day_type": None,
-                    "late_mins": 0,
-                    "early_exit_mins": 0,
-                    "late_off_hours": 0.0,
-                    "early_off_hours": 0.0,
-                    "off_hours": 0.0,
-                    "worked_hours": 0.0,
-                    "required_hours": required_hours,
-                    "effective_days": 0.0,
-                    "classification_reason": f"Approved Leave ({l_type})",
-                    "is_applied_leave": True
-                }
-
-        return {
-            "status": "Absent",
-            "is_late": False,
-            "is_early_leave": False,
-            "is_short_leave": False,
-            "is_half_day": False,
-            "short_leave_type": None,
-            "half_day_type": None,
-            "late_mins": 0,
-            "early_exit_mins": 0,
-            "late_off_hours": 0.0,
-            "early_off_hours": 0.0,
-            "off_hours": 0.0,
-            "worked_hours": 0.0,
-            "required_hours": required_hours,
-            "effective_days": 0.0,
-            "classification_reason": "No check-in recorded",
-            "is_applied_leave": False
-        }
-
-    # Reference datetimes for shift evaluation
-    shift_start = first_checkin_local.replace(hour=start_h, minute=start_m, second=0, microsecond=0)
-    shift_end = first_checkin_local.replace(hour=end_h, minute=end_m, second=0, microsecond=0)
-    grace_cutoff = shift_start + timedelta(minutes=late_grace_mins)
-    short_leave_late_cutoff = shift_start + timedelta(minutes=late_to_short_mins)
-    half_day_late_cutoff = first_checkin_local.replace(hour=late_half_h, minute=late_half_m, second=0, microsecond=0)
-    half_day_early_cutoff = first_checkin_local.replace(hour=early_half_h, minute=early_half_m, second=0, microsecond=0)
-    short_leave_early_cutoff = shift_end - timedelta(minutes=early_short_mins)
-
-    # 2. Late Arrival Evaluation
-    late_mins = 0
-    late_off_hours = 0.0
-    is_late = False
-    if first_checkin_local > shift_start:
-        diff_sec = (first_checkin_local - shift_start).total_seconds()
-        raw_late_mins = max(0, int(diff_sec / 60))
-        if first_checkin_local > grace_cutoff:
-            is_late = True
-            late_mins = raw_late_mins
-            late_off_hours = round(late_mins / 60.0, 2)
-        else:
-            # Arrival within grace is fully ON-TIME: zero penalty, zero deficit
-            is_late = False
-            late_mins = 0
-            late_off_hours = 0.0
-
-    # 3. Early Departure Evaluation
-    early_exit_mins = 0
-    early_off_hours = 0.0
-    is_early_leave = False
-    if last_checkout_local:
-        if last_checkout_local < shift_end:
-            diff_sec = (shift_end - last_checkout_local).total_seconds()
-            raw_early_mins = max(0, int(diff_sec / 60))
-            if raw_early_mins > 10:  # 10 mins early checkout grace
-                is_early_leave = True
-                early_exit_mins = raw_early_mins
-                early_off_hours = round(early_exit_mins / 60.0, 2)
-
-    # Total off-hours: waived / zeroed out across the app
-    total_off_hours = 0.0
-    late_off_hours = 0.0
-    early_off_hours = 0.0
-
-    # 4. Status Determination
-    status = "Present"
-    is_short_leave = False
-    is_half_day = False
-    short_leave_type = None
-    half_day_type = None
-    effective_days = 1.0
-    classification_reason = "On-time full day"
-    is_applied_leave = False
-
-    # A) Check if approved applied leave exists for today
-    if approved_leave:
-        dur_type = str(approved_leave.get("duration_type", "")).lower().strip()
-        slot = str(approved_leave.get("short_leave_slot", "")).lower().strip()
-        if dur_type == "short_leave":
-            is_short_leave = True
-            short_leave_type = "applied"
-            is_applied_leave = True
-            status = "Short Leave"
-            slot_label = f" ({slot.title()})" if slot else ""
-            classification_reason = f"Approved Short Leave{slot_label}"
-            if slot == "morning":
-                is_late = False
-                late_mins = 0
-            elif slot == "evening":
-                is_early_leave = False
-                early_exit_mins = 0
-        elif dur_type in ["first_half", "second_half", "half_day"] or approved_leave.get("duration") == 0.5:
-            is_half_day = True
-            half_day_type = f"{dur_type}_applied"
-            is_applied_leave = True
-            status = "Half Day"
-            effective_days = 0.5
-            classification_reason = f"Approved Half Day ({dur_type.replace('_', ' ').title()})"
-            if "first" in dur_type:
-                is_late = False
-                late_mins = 0
-            elif "second" in dur_type:
-                is_early_leave = False
-                early_exit_mins = 0
-
-    # B) Evaluate Half Day thresholds if not already half day or approved leave
-    if not is_half_day and not is_short_leave:
-        if first_checkin_local >= half_day_late_cutoff:
-            is_half_day = True
-            half_day_type = "late_arrival"
-            status = "Half Day"
-            effective_days = 0.5
-            classification_reason = f"Check-in at {first_checkin_local.strftime('%H:%M')} (after Half-Day limit {late_half_str})"
-        elif last_checkout_local and last_checkout_local <= half_day_early_cutoff:
-            is_half_day = True
-            half_day_type = "early_departure"
-            status = "Half Day"
-            effective_days = 0.5
-            classification_reason = f"Check-out at {last_checkout_local.strftime('%H:%M')} (before Half-Day limit {early_half_str})"
-        elif last_checkout_local and 0 < worked_hours < half_day_min_hours:
-            is_half_day = True
-            half_day_type = "low_hours"
-            status = "Half Day"
-            effective_days = 0.5
-            classification_reason = f"Worked {worked_hours:.1f}h (< min half-day requirement {half_day_min_hours:.1f}h)"
-
-    # C) Short Leave is strictly for approved leave applications (never automatic)
-    # D) Fallback states for standard working day
-    if not is_half_day and not is_short_leave:
-        if last_checkout_local and worked_hours >= (full_day_min_hours - 1.0):
-            status = "Present"
-            classification_reason = f"Full day attendance (worked {worked_hours:.1f}h)" if is_late else "On-time full day"
-        elif is_early_leave:
-            status = "Early Leave"
-            classification_reason = f"Left {early_exit_mins} mins early"
-        elif is_late:
-            status = "Late"
-            classification_reason = f"Late check-in by {late_mins} mins"
-        else:
-            status = "Present"
-            classification_reason = "On-time attendance"
-
-    return {
-        "status": status,
-        "is_late": is_late,
-        "is_early_leave": is_early_leave,
-        "is_short_leave": is_short_leave,
-        "is_half_day": is_half_day,
-        "short_leave_type": short_leave_type,
-        "half_day_type": half_day_type,
-        "late_mins": late_mins,
-        "early_exit_mins": early_exit_mins,
-        "late_off_hours": 0.0,
-        "early_off_hours": 0.0,
-        "off_hours": 0.0,
-        "worked_hours": round(worked_hours, 2),
-        "required_hours": round(required_hours, 2),
-        "effective_days": effective_days,
-        "classification_reason": classification_reason,
-        "is_applied_leave": is_applied_leave
-    }
+# Central enterprise classification engine imported from attendance_service
+from attendance_service import classify_attendance_day
 
 
 @app.post("/verify-presence")
-async def verify_presence(req: VerifyPresenceRequest):
+async def verify_presence(req: VerifyPresenceRequest, request: Request):
     """Verify user presence using face + GPS + WiFi telemetry."""
+    # Check caller authentication
+    clean_email = req.email.strip().lower() if req.email else ""
+    auth_header = request.headers.get("authorization", "")
+    token_email = None
+    if auth_header.startswith("Bearer "):
+        try:
+            token = auth_header.split(" ", 1)[1]
+            payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+            token_email = payload.get("sub", "").strip().lower()
+        except Exception:
+            pass
+
+    if token_email and clean_email and token_email != clean_email:
+        caller_admin = await admins_collection.find_one({"email": token_email})
+        if not caller_admin:
+            raise HTTPException(status_code=403, detail="Forbidden: Cannot mark attendance for another employee.")
+
+    if not clean_email and token_email:
+        clean_email = token_email
+
     # 1. Find User
-    user = await employees_collection.find_one({"email": req.email})
+    user = await employees_collection.find_one({"email": clean_email})
     if not user:
         raise HTTPException(status_code=404, detail="User not found. Please register first.")
 
@@ -1592,6 +1415,24 @@ async def smart_attendance(req: VerifyPresenceRequest, request: Request, backgro
         
         # 1. Identity & Role Fetch
         clean_email = req.email.strip().lower() if req.email else ""
+        auth_header = request.headers.get("authorization", "")
+        token_email = None
+        if auth_header.startswith("Bearer "):
+            try:
+                token = auth_header.split(" ", 1)[1]
+                payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+                token_email = payload.get("sub", "").strip().lower()
+            except Exception:
+                pass
+
+        if token_email and clean_email and token_email != clean_email:
+            caller_admin = await admins_collection.find_one({"email": token_email})
+            if not caller_admin:
+                raise HTTPException(status_code=403, detail="Forbidden: You cannot mark attendance for another employee.")
+
+        if not clean_email and token_email:
+            clean_email = token_email
+
         user = await employees_collection.find_one({"email": clean_email}) if clean_email else None
         is_admin_user = False
         
@@ -4044,6 +3885,12 @@ async def visit_check_in(req: dict, employee=Depends(get_current_employee)):
             "status": "ongoing"
         }
         
+        if agent_lat is not None and agent_lng is not None:
+            log["check_in_location"] = {
+                "type": "Point",
+                "coordinates": [float(agent_lng), float(agent_lat)]
+            }
+
         result = await visit_logs_collection.insert_one(log)
         await employees_collection.update_one(
             {"email": employee["email"]},
@@ -4172,6 +4019,11 @@ async def receive_location_ping(ping: LocationPing, employee=Depends(get_current
         ping_dict["employee_id"] = employee["email"]
         ping_dict["organization_id"] = employee["organization_id"]
         ping_dict["recorded_at"] = now
+        if ping.lat is not None and ping.lng is not None:
+            ping_dict["location"] = {
+                "type": "Point",
+                "coordinates": [float(ping.lng), float(ping.lat)]
+            }
         
         await location_pings_collection.insert_one(ping_dict)
 
@@ -4303,6 +4155,15 @@ async def sync_offline_batch(req: SyncBatchRequest, background_tasks: Background
                         f.write(base64.b64decode(visit["site_photo_base64"]))
                     visit["site_photo_url"] = f"/uploads/{fname}"
 
+                if visit.get("check_in_lat") is not None and visit.get("check_in_lng") is not None:
+                    try:
+                        visit["check_in_location"] = {
+                            "type": "Point",
+                            "coordinates": [float(visit["check_in_lng"]), float(visit["check_in_lat"])]
+                        }
+                    except (ValueError, TypeError):
+                        pass
+
                 await visit_logs_collection.insert_one(visit)
                 
                 # Trigger Sheets sync
@@ -4323,6 +4184,14 @@ async def sync_offline_batch(req: SyncBatchRequest, background_tasks: Background
                     try:
                         ping["recorded_at"] = datetime.fromisoformat(ping["recorded_at"].replace("Z", "+00:00"))
                     except:
+                        pass
+                if ping.get("lat") is not None and ping.get("lng") is not None:
+                    try:
+                        ping["location"] = {
+                            "type": "Point",
+                            "coordinates": [float(ping["lng"]), float(ping["lat"])]
+                        }
+                    except (ValueError, TypeError):
                         pass
                 await location_pings_collection.insert_one(ping)
                 synced_count["pings"] += 1
@@ -6468,20 +6337,6 @@ async def admin_get_employee_leave_balance(
     return balance
 
 
-@app.get("/api/leave/balance")
-async def employee_get_leave_balance(
-    year: Optional[int] = None,
-    month: Optional[str] = None,
-    employee: dict = Depends(get_current_employee)
-):
-    """Fetch live calculated leave balance for the logged-in employee."""
-    org_id = employee.get("organization_id", "system_org")
-    clean_email = employee["email"]
-    balance = await calculate_leave_balance(clean_email, org_id, year, month)
-    return balance
-
-
-
 @app.get("/admin/field/live-status")
 async def get_field_live_status(admin=Depends(get_current_admin)):
     """Live operational data for the War Room map."""
@@ -6607,63 +6462,6 @@ async def get_field_live_status(admin=Depends(get_current_admin)):
 
 
 
-
-# -----------------------------------------------------------------------------
-# FIELD LEADERBOARD
-# -----------------------------------------------------------------------------
-
-@app.get("/api/field/leaderboard")
-async def get_field_leaderboard(employee=Depends(get_current_employee)):
-    """Get the live leaderboard for field agents for the current week."""
-    try:
-        now = datetime.now(timezone.utc)
-        start_of_week = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
-        end_of_week = start_of_week + timedelta(days=6, hours=23, minutes=59, seconds=59)
-
-        employees_cursor = employees_collection.find({
-            "organization_id": employee["organization_id"],
-            "employee_type": EmployeeType.FIELD
-        })
-        
-        leaderboard = []
-        async for emp in employees_cursor:
-            visits_count = await visit_logs_collection.count_documents({
-                "employee_id": emp["email"],
-                "timestamp": {"$gte": start_of_week, "$lte": end_of_week},
-                "action": "check_in"
-            })
-            
-            claims_cursor = km_reimbursements_collection.find({
-                "employee_id": emp["email"],
-                "date": {"$gte": start_of_week.strftime("%Y-%m-%d"), "$lte": end_of_week.strftime("%Y-%m-%d")}
-            })
-            total_km = 0
-            async for claim in claims_cursor:
-                total_km += float(claim.get("total_km", 0))
-                
-            leaderboard.append({
-                "employee_id": emp["email"],
-                "name": emp.get("full_name", "Unknown"),
-                "designation": emp.get("designation", "Field Agent"),
-                "visits_completed": visits_count,
-                "leads_captured": 0,
-                "distance_km": round(total_km, 1),
-                "is_me": emp["email"] == employee["email"]
-            })
-            
-        leaderboard.sort(key=lambda x: x["visits_completed"], reverse=True)
-        
-        for i, entry in enumerate(leaderboard):
-            entry["rank"] = i + 1
-            
-        return {
-            "week_start": start_of_week.strftime("%b %d"),
-            "week_end": end_of_week.strftime("%b %d"),
-            "leaderboard": leaderboard
-        }
-    except Exception as e:
-        logger.error(f"Failed to fetch leaderboard: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Failed to load leaderboard data")
 
 # -----------------------------------------------------------------------------
 # EXPENSE CLAIM MANAGEMENT
@@ -11090,6 +10888,8 @@ async def get_wfh_reports_screenshots(
 
 @app.get("/debug/routes")
 async def debug_routes():
+    if APP_ENV == "production":
+        raise HTTPException(status_code=404, detail="Not found")
     return [route.path for route in app.routes]
 
 if __name__ == "__main__":

@@ -539,29 +539,31 @@ async def auto_verify_document_file(filepath: str, doc_type: str, employee: dict
         return False, "Unsupported file format for auto-verification.", {}
         
     extracted_text = ""
-    # Try calling OCR.space API
-    try:
-        url = "https://api.ocr.space/parse/image"
-        with open(filepath, 'rb') as f:
-            # OCR.space supports PDF, PNG, JPG
-            r = requests.post(
-                url, 
-                files={"file": f}, 
-                data={"apikey": "helloworld", "language": "eng"},
-                timeout=10
-            )
-        if r.status_code == 200:
-            res = r.json()
-            parsed_results = res.get("ParsedResults", [])
-            if parsed_results:
-                extracted_text = parsed_results[0].get("ParsedText", "")
-                logger.info(f"OCR successfully extracted text for {doc_type}")
+    # Try calling OCR.space API only if an API key is configured
+    ocr_api_key = os.getenv("OCR_SPACE_API_KEY", "")
+    if ocr_api_key and ocr_api_key != "helloworld":
+        try:
+            url = "https://api.ocr.space/parse/image"
+            with open(filepath, 'rb') as f:
+                # OCR.space supports PDF, PNG, JPG
+                r = requests.post(
+                    url, 
+                    files={"file": f}, 
+                    data={"apikey": ocr_api_key, "language": "eng"},
+                    timeout=10
+                )
+            if r.status_code == 200:
+                res = r.json()
+                parsed_results = res.get("ParsedResults", [])
+                if parsed_results:
+                    extracted_text = parsed_results[0].get("ParsedText", "")
+                    logger.info(f"OCR successfully extracted text for {doc_type}")
+                else:
+                    logger.warning(f"OCR API returned empty results: {res}")
             else:
-                logger.warning(f"OCR API returned empty results: {res}")
-        else:
-            logger.warning(f"OCR API returned status code {r.status_code}")
-    except Exception as e:
-        logger.error(f"OCR API call failed: {e}")
+                logger.warning(f"OCR API returned status code {r.status_code}")
+        except Exception as e:
+            logger.error(f"OCR API call failed: {e}")
         
     # Standardize names for comparison
     emp_name = employee.get("full_name", employee.get("employee_name", "")).strip().lower()
@@ -574,7 +576,7 @@ async def auto_verify_document_file(filepath: str, doc_type: str, employee: dict
     extracted_details = {}
     
     # Run validations on real extracted text
-    if doc_type == "pan_card":
+    if doc_type in ["pan_card", "pan"]:
         # Search for PAN pattern (5 uppercase letters, 4 digits, 1 uppercase letter)
         pan_match = re.search(r"[A-Z]{5}[0-9]{4}[A-Z]{1}", extracted_text.upper())
         if pan_match:
@@ -604,7 +606,7 @@ async def auto_verify_document_file(filepath: str, doc_type: str, employee: dict
         else:
             message = "Auto-verification failed: 12-digit Aadhaar number not detected in document. Flagged for manual review."
                 
-    elif doc_type == "bank_details":
+    elif doc_type in ["bank_details", "bank_passbook"]:
         # Search for IFSC pattern (4 letters, 0, 6 alpha-numeric)
         ifsc_match = re.search(r"\b[A-Z]{4}0[A-Z0-9]{6}\b", extracted_text.upper())
         if ifsc_match:
@@ -894,15 +896,19 @@ async def digilocker_callback(code: str, state: str):
     import logging
     logger = logging.getLogger(__name__)
 
-    employee_id = state
-    try:
-        obj_id = ObjectId(employee_id)
-    except Exception:
-         raise HTTPException(status_code=400, detail="Invalid state parameter")
-
-    onb = await onboardings_collection.find_one({"_id": obj_id})
+    onb = None
+    if ObjectId.is_valid(state):
+        onb = await onboardings_collection.find_one({"_id": ObjectId(state)})
     if not onb:
-         raise HTTPException(status_code=404, detail="Onboarding record not found")
+        clean_state_email = state.split(":")[0].strip().lower()
+        onb = await onboardings_collection.find_one({
+            "$or": [
+                {"employee_email": clean_state_email},
+                {"employee_id": clean_state_email}
+            ]
+        })
+    if not onb:
+        raise HTTPException(status_code=404, detail="Onboarding record not found")
 
     token_data = await exchange_code_for_token(code)
     access_token = token_data.get("access_token")
@@ -1327,11 +1333,20 @@ async def digilocker_oauth_callback(code: str, state: str, error: Optional[str] 
 
     try:
         parts = state.split(":")
-        emp_email = parts[0]
+        emp_email = parts[0].strip().lower()
         token_res = await exchange_code_for_token(code)
         access_token = token_res.get("access_token")
 
-        onb = await onboardings_collection.find_one({"employee_email": emp_email})
+        onb = None
+        if ObjectId.is_valid(emp_email):
+            onb = await onboardings_collection.find_one({"_id": ObjectId(emp_email)})
+        if not onb:
+            onb = await onboardings_collection.find_one({
+                "$or": [
+                    {"employee_email": emp_email},
+                    {"employee_id": emp_email}
+                ]
+            })
         if onb and access_token:
             docs_submitted = onb.get("documents_submitted", [])
             for doc_type in ["aadhaar", "pan", "driving_license"]:

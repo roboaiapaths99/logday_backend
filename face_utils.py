@@ -47,9 +47,13 @@ DUMMY_IMAGE_BYPASS = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42m
 
 def get_face_embedding(img_base64):
     """Generates a face embedding from a base64 image string."""
-    # If DeepFace is not available, return a mock embedding representation
-    if not HAS_DEEPFACE or img_base64 == DUMMY_IMAGE_BYPASS:
+    env = os.getenv("APP_ENV", "development").lower()
+    # In production, dummy bypass is strictly disabled
+    if env != "production" and (not HAS_DEEPFACE or img_base64 == DUMMY_IMAGE_BYPASS):
         return [0.1] * 4096
+    if env == "production" and not HAS_DEEPFACE:
+        logger.error("DeepFace is required in production environment.")
+        return None
         
     try:
         # Save to temp file for DeepFace
@@ -123,9 +127,9 @@ def verify_face(img_base64, stored_embedding, threshold=0.60):
         logger.warning("No face detected in the provided image.")
         return False, 1.1 # No face detected
     
-    # If DeepFace is not installed, allow 1:1 test bypass for local testing
-    if not HAS_DEEPFACE and is_dummy_embedding(stored_embedding):
-        logger.info("DeepFace unavailable: allowing 1:1 test bypass for enrolled user.")
+    # If DeepFace is not installed, allow 1:1 test bypass only for local testing in development
+    if env != "production" and not HAS_DEEPFACE and is_dummy_embedding(stored_embedding):
+        logger.info("DeepFace unavailable: allowing 1:1 test bypass for enrolled user in development.")
         return True, 0.0
 
     a = np.array(new_embedding)

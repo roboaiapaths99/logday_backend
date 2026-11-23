@@ -57,9 +57,10 @@ async def get_current_admin(request: Request, token: str = Depends(admin_oauth2_
     )
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        email: str = payload.get("sub").lower().strip()
-        if email is None:
+        sub = payload.get("sub")
+        if not sub or not isinstance(sub, str):
             raise credentials_exception
+        email: str = sub.lower().strip()
     except JWTError:
         raise credentials_exception
         
@@ -154,6 +155,10 @@ async def get_current_admin(request: Request, token: str = Depends(admin_oauth2_
                 raise HTTPException(403, "Access denied for 'payroll'")
                 
         # 7. WFH (wfh_management, wfh_monitoring)
+        elif path.startswith("/admin/wfh/request-stats") or path.startswith("/admin/wfh-requests"):
+            if "wfh_management" not in allowed:
+                raise HTTPException(403, "Access denied for 'wfh_management'")
+
         elif path.startswith("/admin/wfh/stats"):
             if "wfh_management" not in allowed and "wfh_monitoring" not in allowed:
                 raise HTTPException(403, "Access denied. Requires 'wfh_management' or 'wfh_monitoring' permission.")
@@ -186,9 +191,10 @@ async def get_current_employee(token: str = Depends(employee_oauth2_scheme)):
     )
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        email: str = payload.get("sub").lower().strip()
-        if email is None:
+        sub = payload.get("sub")
+        if not sub or not isinstance(sub, str):
             raise credentials_exception
+        email: str = sub.lower().strip()
     except JWTError:
         raise credentials_exception
         
