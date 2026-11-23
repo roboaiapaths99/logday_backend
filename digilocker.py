@@ -271,13 +271,13 @@ async def pull_document(access_token: str, doc_type: str) -> Dict[str, Any]:
             "doc_type": doc_type,
             "doc_name": doc_info["name"],
             "issuer": doc_info["issuer"],
-            "verification_source": "digilocker",
-            "is_government_verified": True,
+            "verification_source": "digilocker_sandbox",
+            "is_government_verified": False,
             "digilocker_uri": doc_info["uri"],
             "extracted_data": dummy_data,
             "pulled_at": datetime.now(timezone.utc).isoformat(),
             "mode": "sandbox",
-            "status": "digilocker_verified"
+            "status": "sandbox_verified"
         }
 
     # Production: Make actual API call

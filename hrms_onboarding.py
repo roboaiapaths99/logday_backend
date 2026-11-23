@@ -539,31 +539,29 @@ async def auto_verify_document_file(filepath: str, doc_type: str, employee: dict
         return False, "Unsupported file format for auto-verification.", {}
         
     extracted_text = ""
-    # Try calling OCR.space API only if an API key is configured
-    ocr_api_key = os.getenv("OCR_SPACE_API_KEY", "")
-    if ocr_api_key and ocr_api_key != "helloworld":
-        try:
-            url = "https://api.ocr.space/parse/image"
-            with open(filepath, 'rb') as f:
-                # OCR.space supports PDF, PNG, JPG
-                r = requests.post(
-                    url, 
-                    files={"file": f}, 
-                    data={"apikey": ocr_api_key, "language": "eng"},
-                    timeout=10
-                )
-            if r.status_code == 200:
-                res = r.json()
-                parsed_results = res.get("ParsedResults", [])
-                if parsed_results:
-                    extracted_text = parsed_results[0].get("ParsedText", "")
-                    logger.info(f"OCR successfully extracted text for {doc_type}")
-                else:
-                    logger.warning(f"OCR API returned empty results: {res}")
+    # Try calling OCR.space API
+    try:
+        url = "https://api.ocr.space/parse/image"
+        with open(filepath, 'rb') as f:
+            # OCR.space supports PDF, PNG, JPG
+            r = requests.post(
+                url, 
+                files={"file": f}, 
+                data={"apikey": "helloworld", "language": "eng"},
+                timeout=10
+            )
+        if r.status_code == 200:
+            res = r.json()
+            parsed_results = res.get("ParsedResults", [])
+            if parsed_results:
+                extracted_text = parsed_results[0].get("ParsedText", "")
+                logger.info(f"OCR successfully extracted text for {doc_type}")
             else:
-                logger.warning(f"OCR API returned status code {r.status_code}")
-        except Exception as e:
-            logger.error(f"OCR API call failed: {e}")
+                logger.warning(f"OCR API returned empty results: {res}")
+        else:
+            logger.warning(f"OCR API returned status code {r.status_code}")
+    except Exception as e:
+        logger.error(f"OCR API call failed: {e}")
         
     # Standardize names for comparison
     emp_name = employee.get("full_name", employee.get("employee_name", "")).strip().lower()
@@ -871,14 +869,19 @@ async def get_employee_document_summary(
 # ─── Employee Onboarding & Verification Uploads ──────────────────
 
 @router.post("/{employee_id}/digilocker/connect")
-async def connect_digilocker(employee_id: str):
+async def connect_digilocker(
+    employee_id: str,
+    current_admin: Admin = Depends(get_current_admin)
+):
     """Initiate DigiLocker OAuth by returning the authorization URL."""
+    await require_feature("document_verification")(current_admin)
     try:
         obj_id = ObjectId(employee_id)
     except Exception:
          raise HTTPException(status_code=400, detail="Invalid employee ID format")
          
-    onb = await onboardings_collection.find_one({"_id": obj_id})
+    org_filter = get_org_filter(current_admin)
+    onb = await onboardings_collection.find_one({**org_filter, "_id": obj_id})
     if not onb:
          raise HTTPException(status_code=404, detail="Onboarding record not found")
          
@@ -896,17 +899,13 @@ async def digilocker_callback(code: str, state: str):
     import logging
     logger = logging.getLogger(__name__)
 
-    onb = None
-    if ObjectId.is_valid(state):
-        onb = await onboardings_collection.find_one({"_id": ObjectId(state)})
-    if not onb:
-        clean_state_email = state.split(":")[0].strip().lower()
-        onb = await onboardings_collection.find_one({
-            "$or": [
-                {"employee_email": clean_state_email},
-                {"employee_id": clean_state_email}
-            ]
-        })
+    employee_id = state
+    try:
+        obj_id = ObjectId(employee_id)
+    except Exception:
+         raise HTTPException(status_code=400, detail="Invalid state parameter")
+
+    onb = await onboardings_collection.find_one({"_id": obj_id})
     if not onb:
         raise HTTPException(status_code=404, detail="Onboarding record not found")
 
@@ -929,17 +928,18 @@ async def digilocker_callback(code: str, state: str):
     
     for doc in pulled_docs:
         doc_type = doc.get("doc_type")
+        is_sandbox = doc.get("mode") == "sandbox"
         existing = next((d for d in docs_submitted if d["type"] == doc_type), None)
         doc_entry = {
             "type": doc_type,
             "verified": True,
             "status": "verified",
-            "verification_source": "digilocker",
+            "verification_source": "digilocker_sandbox" if is_sandbox else "digilocker",
             "digilocker_uri": doc.get("digilocker_uri"),
             "digilocker_data": doc.get("extracted_data"),
             "file_url": doc.get("file_url"),
             "submitted_at": datetime.now(timezone.utc).isoformat(),
-            "verified_by": "DigiLocker Integration",
+            "verified_by": "DigiLocker Sandbox" if is_sandbox else "DigiLocker Integration",
             "verified_at": datetime.now(timezone.utc).isoformat()
         }
         if existing:
@@ -978,8 +978,13 @@ async def digilocker_callback(code: str, state: str):
 
 
 @router.post("/{employee_id}/digilocker/pull")
-async def pull_digilocker_doc(employee_id: str, req_body: dict):
+async def pull_digilocker_doc(
+    employee_id: str,
+    req_body: dict,
+    current_admin: Admin = Depends(get_current_admin)
+):
     """Trigger manual pull of a document from DigiLocker."""
+    await require_feature("document_verification")(current_admin)
     from digilocker import pull_document
     doc_type = req_body.get("doc_type")
     access_token = req_body.get("access_token")
@@ -992,7 +997,8 @@ async def pull_digilocker_doc(employee_id: str, req_body: dict):
     except Exception:
          raise HTTPException(status_code=400, detail="Invalid ID format")
 
-    onb = await onboardings_collection.find_one({"_id": obj_id})
+    org_filter = get_org_filter(current_admin)
+    onb = await onboardings_collection.find_one({**org_filter, "_id": obj_id})
     if not onb:
          raise HTTPException(status_code=404, detail="Onboarding record not found")
 
@@ -1003,18 +1009,19 @@ async def pull_digilocker_doc(employee_id: str, req_body: dict):
     except Exception as e:
          raise HTTPException(status_code=400, detail=f"Failed to pull document: {e}")
 
+    is_sandbox = res.get("mode") == "sandbox"
     docs_submitted = onb.get("documents_submitted", [])
     existing = next((d for d in docs_submitted if d["type"] == doc_type), None)
     doc_entry = {
         "type": doc_type,
         "verified": True,
         "status": "verified",
-        "verification_source": "digilocker",
+        "verification_source": "digilocker_sandbox" if is_sandbox else "digilocker",
         "digilocker_uri": res.get("digilocker_uri"),
         "digilocker_data": res.get("extracted_data"),
         "file_url": res.get("file_url"),
         "submitted_at": datetime.now(timezone.utc).isoformat(),
-        "verified_by": "DigiLocker Integration",
+        "verified_by": "DigiLocker Sandbox" if is_sandbox else "DigiLocker Integration",
         "verified_at": datetime.now(timezone.utc).isoformat()
     }
     if existing:
@@ -1032,8 +1039,13 @@ async def pull_digilocker_doc(employee_id: str, req_body: dict):
 
 
 @router.post("/{employee_id}/documents/ocr")
-async def upload_document_ocr(employee_id: str, req_body: dict):
+async def upload_document_ocr(
+    employee_id: str,
+    req_body: dict,
+    current_admin: Admin = Depends(get_current_admin)
+):
     """Process a document image upload with OCR extraction."""
+    await require_feature("document_verification")(current_admin)
     from ocr_utils import process_document_ocr, image_from_base64
 
     doc_type = req_body.get("doc_type")
@@ -1050,7 +1062,8 @@ async def upload_document_ocr(employee_id: str, req_body: dict):
     except Exception:
          raise HTTPException(status_code=400, detail="Invalid ID format")
 
-    onb = await onboardings_collection.find_one({"_id": obj_id})
+    org_filter = get_org_filter(current_admin)
+    onb = await onboardings_collection.find_one({**org_filter, "_id": obj_id})
     if not onb:
          raise HTTPException(status_code=404, detail="Onboarding record not found")
 
@@ -1061,15 +1074,39 @@ async def upload_document_ocr(employee_id: str, req_body: dict):
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Invalid base64 image: {e}")
     else:
+        import urllib.parse
+        import socket
+        import ipaddress
         import requests
-        try:
-            r = requests.get(file_url, timeout=10)
-            if r.status_code == 200:
-                image_data = r.content
-            else:
-                raise HTTPException(status_code=400, detail=f"Failed to fetch image from URL: HTTP {r.status_code}")
-        except Exception as e:
-             raise HTTPException(status_code=400, detail=f"Error downloading image: {e}")
+        if file_url.startswith("/uploads/"):
+            local_file = os.path.abspath(file_url.lstrip("/"))
+            uploads_root = os.path.abspath("uploads")
+            if not local_file.startswith(uploads_root) or not os.path.exists(local_file):
+                raise HTTPException(status_code=400, detail="Local upload file not found")
+            with open(local_file, "rb") as f:
+                image_data = f.read()
+        else:
+            parsed = urllib.parse.urlparse(file_url)
+            if parsed.scheme not in ("https", "http") or not parsed.hostname:
+                raise HTTPException(status_code=400, detail="Invalid file_url scheme")
+            try:
+                resolved_ip = ipaddress.ip_address(socket.gethostbyname(parsed.hostname))
+                if resolved_ip.is_private or resolved_ip.is_loopback or resolved_ip.is_link_local:
+                    raise HTTPException(status_code=400, detail="Access to internal network URLs is forbidden")
+            except HTTPException:
+                raise
+            except Exception:
+                raise HTTPException(status_code=400, detail="Could not resolve file_url host")
+            try:
+                r = requests.get(file_url, timeout=10)
+                if r.status_code == 200:
+                    image_data = r.content
+                else:
+                    raise HTTPException(status_code=400, detail=f"Failed to fetch image from URL: HTTP {r.status_code}")
+            except HTTPException:
+                raise
+            except Exception as e:
+                 raise HTTPException(status_code=400, detail=f"Error downloading image: {e}")
 
     try:
         ocr_result = process_document_ocr(image_data, doc_type)
@@ -1173,12 +1210,20 @@ async def upload_my_onboarding_document(
     if not onb:
         raise HTTPException(status_code=404, detail="Onboarding profile not found")
 
+    ALLOWED_DOC_EXTENSIONS = {"jpg", "jpeg", "png", "pdf", "webp"}
+    MAX_UPLOAD_BYTES = 15 * 1024 * 1024  # 15 MB
+
     file_url = None
+    filepath = None
     if file:
-        ext = file.filename.split(".")[-1] if "." in file.filename else "jpg"
+        ext = file.filename.rsplit(".", 1)[-1].lower() if (file.filename and "." in file.filename) else "jpg"
+        if ext not in ALLOWED_DOC_EXTENSIONS:
+            raise HTTPException(status_code=400, detail=f"Unsupported file type '.{ext}'. Allowed: {', '.join(sorted(ALLOWED_DOC_EXTENSIONS))}")
+        content = await file.read()
+        if len(content) > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail="Uploaded file exceeds 15 MB limit")
         filename = f"{clean_email}_{doc_type}_{uuid.uuid4().hex[:8]}.{ext}"
         filepath = os.path.join(ONBOARDING_UPLOADS_DIR, filename)
-        content = await file.read()
         with open(filepath, "wb") as f:
             f.write(content)
         file_url = f"/uploads/onboarding_docs/{filename}"
@@ -1187,21 +1232,35 @@ async def upload_my_onboarding_document(
         ext = "jpg"
         if image_b64.startswith("data:image"):
             header, image_b64 = image_b64.split(",", 1)
+        raw_bytes = base64.b64decode(image_b64)
+        if len(raw_bytes) > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail="Uploaded image exceeds 15 MB limit")
         filename = f"{clean_email}_{doc_type}_{uuid.uuid4().hex[:8]}.{ext}"
         filepath = os.path.join(ONBOARDING_UPLOADS_DIR, filename)
         with open(filepath, "wb") as f:
-            f.write(base64.b64decode(image_b64))
+            f.write(raw_bytes)
         file_url = f"/uploads/onboarding_docs/{filename}"
+
+    is_verified = False
+    verification_msg = None
+    extracted_details = {}
+    if filepath and os.path.exists(filepath):
+        try:
+            is_verified, verification_msg, extracted_details = await auto_verify_document_file(filepath, doc_type, employee)
+        except Exception as e:
+            logger.warning(f"Auto-verify skipped for {doc_type}: {e}")
 
     docs_submitted = onb.get("documents_submitted", [])
     existing = next((d for d in docs_submitted if d["type"] == doc_type), None)
     
     doc_entry = {
         "type": doc_type,
-        "verified": False,
-        "status": "pending_review",
+        "verified": is_verified,
+        "status": "verified" if is_verified else "pending_review",
         "verification_source": "mobile_upload",
         "file_url": file_url,
+        "extracted_details": extracted_details,
+        "verification_message": verification_msg,
         "submitted_at": datetime.now(timezone.utc).isoformat(),
         "rejection_reason": None
     }

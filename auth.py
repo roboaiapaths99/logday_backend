@@ -11,8 +11,21 @@ from argon2.exceptions import VerifyMismatchError
 
 ph = PasswordHasher()
 
+import logging
+import hashlib
+
+logger = logging.getLogger(__name__)
+
 # JWT configuration
-SECRET_KEY = os.getenv("JWT_SECRET", "supersecretkey")
+_raw_secret = os.getenv("JWT_SECRET") or os.getenv("SECRET_KEY") or ""
+if not _raw_secret or _raw_secret in ("supersecretkey", "CHANGE_ME_USE_A_LONG_RANDOM_STRING"):
+    if os.getenv("APP_ENV", "development") == "production":
+        logger.critical("SECURITY WARNING: JWT_SECRET is not set or uses a weak default in production!")
+    # Derive a machine/db-scoped fallback key rather than a static literal if env var was omitted
+    _seed = f"logday-jwt-{os.getenv('MONGODB_URL', 'local')}-{os.getenv('ADMIN_EMAIL', 'admin')}"
+    SECRET_KEY = _raw_secret if _raw_secret else hashlib.sha256(_seed.encode("utf-8")).hexdigest()
+else:
+    SECRET_KEY = _raw_secret
 ALGORITHM = os.getenv("ALGORITHM", "HS256")
 # Handle trailing comments in Docker --env-file
 expire_minutes_str = str(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "43200")).split('#')[0].strip()
