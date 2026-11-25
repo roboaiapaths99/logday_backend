@@ -130,6 +130,18 @@ app.include_router(flyfield_router)
 
 
 # Configure CORS - Allow all origins dynamically with regex for Web, Vercel, Electron & Mobile
+_env_origins = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
+allowed_origins = set(_env_origins + [
+    "http://localhost:3000",
+    "http://localhost:5173",
+    "http://localhost:5180",
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:5173",
+    "http://127.0.0.1:5180",
+    "https://logday-api.duckdns.org",
+])
+_ALLOWED_REGEX_COMPILED = re.compile(r"^https?://.*")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -177,10 +189,6 @@ async def add_cors_and_cache_headers(request: Request, call_next):
     response.headers["Pragma"] = "no-cache"
     response.headers["Expires"] = "0"
     return response
-
-@app.get("/health")
-async def health_check():
-    return {"status": "healthy", "timestamp": datetime.now(timezone.utc).isoformat()}
 
 # --- GEOCODING PROXY ---
 
@@ -3002,7 +3010,12 @@ async def get_admin_me(current_admin: Admin = Depends(get_current_admin)):
     }
     # owner, superadmin, and admin get all features by default
     if current_admin.role in ["owner", "superadmin", "admin"]:
-        admin_data["allowed_features"] = ["dashboard", "employees", "attendance", "leaves", "expenses", "reports", "war_room", "territory", "nudge", "leaderboard", "sub_admins", "settings"]
+        admin_data["allowed_features"] = [
+            "dashboard", "employees", "attendance", "leaves", "expenses", "reports",
+            "announcements", "war_room", "territory", "nudge", "leaderboard", "flyfield",
+            "onboarding", "exit_management", "payroll", "document_verification",
+            "wfh_management", "wfh_monitoring", "sub_admins", "settings"
+        ]
     else:
         admin_data["allowed_features"] = current_admin.allowed_features or ["dashboard", "employees", "attendance"]
     return admin_data
@@ -3459,18 +3472,19 @@ async def admin_upload_logo(file: bytes = File(...), current_admin: Admin = Depe
         if not org_id:
             raise HTTPException(status_code=403, detail="Organization context required")
 
-        # Generate unique filename
+        # Generate unique filename inside public logos folder
         file_extension = "png" # Default, or we could extract from headers
+        logos_dir = os.path.join(UPLOAD_DIR, "logos")
+        os.makedirs(logos_dir, exist_ok=True)
         filename = f"logo_{org_id}_{uuid.uuid4().hex[:8]}.{file_extension}"
-        file_path = os.path.join(UPLOAD_DIR, filename)
+        file_path = os.path.join(logos_dir, filename)
         
         with open(file_path, "wb") as buffer:
             buffer.write(file)
             
-        # Generate full URL
-        # In production this should be the full domain, for now relative or configured base
-        base_url = os.getenv("API_BASE_URL", "http://localhost:8000")
-        logo_url = f"{base_url}/uploads/{filename}"
+        # Generate full URL (placed in /uploads/logos/ so PUBLIC_UPLOAD_FOLDERS allows unauthenticated access)
+        base_url = os.getenv("API_BASE_URL", "http://localhost:8001")
+        logo_url = f"{base_url}/uploads/logos/{filename}"
         
         return {"logo_url": logo_url}
     except Exception as e:
@@ -4970,6 +4984,7 @@ async def get_my_leave_requests(employee=Depends(get_current_employee)):
     requests = await leave_requests_collection.find({"employee_id": employee["email"]}).sort("created_at", -1).to_list(length=100)
     for r in requests:
         r["_id"] = str(r["_id"])
+        r["id"] = r["_id"]
         if isinstance(r.get("created_at"), datetime):
             r["created_at"] = r["created_at"].isoformat()
     return requests
@@ -5038,6 +5053,7 @@ async def get_pending_leaves(manager=Depends(get_current_employee)):
     
     for r in requests:
         r["_id"] = str(r["_id"])
+        r["id"] = r["_id"]
         if isinstance(r.get("created_at"), datetime):
             r["created_at"] = r["created_at"].isoformat()
     return requests
@@ -6467,60 +6483,8 @@ async def get_field_live_status(admin=Depends(get_current_admin)):
 
 # -----------------------------------------------------------------------------
 # FIELD LEADERBOARD
+# (Consolidated into AREA 3: LEADERBOARD below)
 # -----------------------------------------------------------------------------
-
-@app.get("/api/field/leaderboard")
-async def get_field_leaderboard(employee=Depends(get_current_employee)):
-    """Get the live leaderboard for field agents for the current week."""
-    try:
-        now = datetime.now(timezone.utc)
-        start_of_week = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
-        end_of_week = start_of_week + timedelta(days=6, hours=23, minutes=59, seconds=59)
-
-        employees_cursor = employees_collection.find({
-            "organization_id": employee["organization_id"],
-            "employee_type": EmployeeType.FIELD
-        })
-        
-        leaderboard = []
-        async for emp in employees_cursor:
-            visits_count = await visit_logs_collection.count_documents({
-                "employee_id": emp["email"],
-                "timestamp": {"$gte": start_of_week, "$lte": end_of_week},
-                "action": "check_in"
-            })
-            
-            claims_cursor = km_reimbursements_collection.find({
-                "employee_id": emp["email"],
-                "date": {"$gte": start_of_week.strftime("%Y-%m-%d"), "$lte": end_of_week.strftime("%Y-%m-%d")}
-            })
-            total_km = 0
-            async for claim in claims_cursor:
-                total_km += float(claim.get("total_km", 0))
-                
-            leaderboard.append({
-                "employee_id": emp["email"],
-                "name": emp.get("full_name", "Unknown"),
-                "designation": emp.get("designation", "Field Agent"),
-                "visits_completed": visits_count,
-                "leads_captured": 0,
-                "distance_km": round(total_km, 1),
-                "is_me": emp["email"] == employee["email"]
-            })
-            
-        leaderboard.sort(key=lambda x: x["visits_completed"], reverse=True)
-        
-        for i, entry in enumerate(leaderboard):
-            entry["rank"] = i + 1
-            
-        return {
-            "week_start": start_of_week.strftime("%b %d"),
-            "week_end": end_of_week.strftime("%b %d"),
-            "leaderboard": leaderboard
-        }
-    except Exception as e:
-        logger.error(f"Failed to fetch leaderboard: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Failed to load leaderboard data")
 
 # -----------------------------------------------------------------------------
 # EXPENSE CLAIM MANAGEMENT

@@ -1,14 +1,28 @@
+import base64
 import calendar
+import io
+import os
+import smtplib
+import ssl
+import urllib.request
 from datetime import datetime, timezone, timedelta
-from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, status
+from email.message import EmailMessage
+from typing import Any, List, Optional, Tuple
+from fastapi import APIRouter, Body, Depends, HTTPException, status
+from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import StreamingResponse
 from bson import ObjectId
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image as RLImage
+from reportlab.lib import colors
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 
 from database import (
     payrolls_collection, employees_collection,
     attendance_logs_collection, leave_requests_collection,
     km_reimbursements_collection, expense_claims_collection,
-    holidays_collection, leave_policies_collection, settings_collection
+    holidays_collection, leave_policies_collection, settings_collection,
+    salary_structures_collection, wfh_alerts_collection, organizations_collection
 )
 from models import Admin
 from auth import get_current_admin
@@ -450,9 +464,169 @@ async def fetch_attendance_data(employee_email: str, org_id: str, payroll_month:
     
     return working_days, present_days, paid_leave_days, unpaid_leave_days, absent_days, short_leave_penalty_days
 
+async def _resolve_employee_salary_structure(emp: dict) -> dict:
+    """Resolve salary_structure from employee record or salary_structures_collection, with safe defaults."""
+    sal = emp.get("salary_structure")
+    if isinstance(sal, dict) and sal.get("ctc") is not None:
+        return sal
+    sal_doc = await salary_structures_collection.find_one({"employee_email": emp["email"]})
+    if sal_doc and sal_doc.get("ctc") is not None:
+        return sal_doc
+    # Check if top-level ctc or monthly_salary exists on employee doc
+    raw_ctc = float(emp.get("ctc") or (float(emp.get("monthly_salary") or emp.get("salary") or 0.0) * 12.0))
+    monthly = raw_ctc / 12.0
+    basic = round(monthly * 0.40, 2)
+    hra = round(basic * 0.50, 2)
+    special = max(0.0, round(monthly - basic - hra, 2))
+    return {
+        "ctc": raw_ctc,
+        "monthly_salary": round(monthly, 2),
+        "basic_salary": basic,
+        "hra": hra,
+        "special_allowance": special,
+        "pf_enabled": False if raw_ctc == 0 else True,
+        "esi_enabled": False,
+        "professional_tax_enabled": False if raw_ctc == 0 else True,
+        "bank_name": (sal or {}).get("bank_name") or emp.get("bank_name"),
+        "bank_account": (sal or {}).get("bank_account") or emp.get("bank_account"),
+        "bank_ifsc": (sal or {}).get("bank_ifsc") or emp.get("bank_ifsc"),
+        "pan_number": (sal or {}).get("pan_number") or emp.get("pan_number"),
+    }
+
+
+async def _auto_generate_missing_payrolls(payroll_month: str, current_admin: Admin, department: Optional[str] = None):
+    """Ensure every active employee in the organization has an auto-calculated payroll record for payroll_month."""
+    try:
+        year, month = map(int, payroll_month.split("-"))
+        if month < 1 or month > 12:
+            return
+    except Exception:
+        return
+
+    org_id = current_admin.organization_id
+    emp_query: dict = {
+        "$or": [
+            {"status": {"$in": ["Active", "active", None]}},
+            {"status": {"$exists": False}}
+        ]
+    }
+    if not (current_admin.role == "superadmin" or org_id == "system_org"):
+        emp_query["organization_id"] = org_id
+    if department:
+        emp_query["department"] = department
+
+    employees = await employees_collection.find(emp_query).to_list(length=1000)
+    if not employees:
+        return
+
+    existing_docs = await payrolls_collection.find({
+        **get_org_filter(current_admin),
+        "payroll_month": payroll_month
+    }, {"employee_email": 1}).to_list(length=1000)
+    existing_emails = {d.get("employee_email", "").strip().lower() for d in existing_docs}
+
+    for emp in employees:
+        emp_email = (emp.get("email") or "").strip().lower()
+        if not emp_email or emp_email in existing_emails:
+            continue
+        try:
+            emp_org_id = emp.get("organization_id") or org_id or "system_org"
+            w_days, p_days, paid_l, unpaid_l, a_days, short_pen = await fetch_attendance_data(emp_email, emp_org_id, payroll_month)
+            salary_structure = await _resolve_employee_salary_structure(emp)
+            travel_reimb, exp_claims = await fetch_approved_claims_and_reimbursements(emp_email, emp_org_id, payroll_month)
+            reimbursements = travel_reimb + exp_claims
+
+            results = calculate_payslip_fields(
+                ctc=float(salary_structure.get("ctc") or 0.0),
+                working_days=w_days,
+                present_days=p_days,
+                paid_leave_days=paid_l,
+                unpaid_leave_days=unpaid_l,
+                short_leave_penalty_days=short_pen,
+                other_earnings=0.0,
+                reimbursements=reimbursements,
+                salary_structure=salary_structure
+            )
+
+            payroll_doc = {
+                "organization_id": emp_org_id,
+                "employee_email": emp_email,
+                "employee_name": emp.get("full_name") or emp_email.split("@")[0],
+                "employee_id": emp.get("employee_id", "EMP"),
+                "department": emp.get("department", "General"),
+                "designation": emp.get("designation", "Employee"),
+                "payroll_month": payroll_month,
+                "working_days": w_days,
+                "present_days": p_days,
+                "leave_days": paid_l + unpaid_l,
+                "paid_leave_days": results["paid_leave_days"],
+                "unpaid_leave_days": results["unpaid_leave_days"],
+                "short_leave_penalty_days": results["short_leave_penalty_days"],
+                "absent_days": results["absent_days"],
+                "lop_days": results["lop_days"],
+                "ctc": results["ctc"],
+                "monthly_salary": results["monthly_salary"],
+                "basic_salary": results["basic_salary"],
+                "hra": results["hra"],
+                "special_allowance": results["special_allowance"],
+                "daily_wage": results["daily_wage"],
+                "lop_deduction": results["lop_deduction"],
+                "attendance_salary": results["attendance_salary"],
+                "overtime_hours": 0.0,
+                "overtime_amount": 0.0,
+                "bonus": 0.0,
+                "other_earnings": 0.0,
+                "travel_reimbursement": travel_reimb,
+                "expense_claims": exp_claims,
+                "reimbursements": reimbursements,
+                "gross_salary": results["gross_salary"],
+                "pf_employee": results["pf_employee"],
+                "pf_employer": results["pf_employer"],
+                "esi_employee": results["esi_employee"],
+                "esi_employer": results["esi_employer"],
+                "professional_tax": results["professional_tax"],
+                "income_tax_tds": results["income_tax_tds"],
+                "loan_deductions": 0.0,
+                "advance_deductions": 0.0,
+                "other_deductions": 0.0,
+                "total_deductions": results["total_deductions"],
+                "calculated_net_salary": results["net_salary"],
+                "admin_adjustment": 0.0,
+                "net_salary": results["net_salary"],
+                "status": PayrollStatus.DRAFT,
+                "email_sent": False,
+                "last_sent_at": None,
+                "sent_to_email": None,
+                "approved_by": None,
+                "approved_at": None,
+                "locked_by": None,
+                "locked_at": None,
+                "payment_date": None,
+                "payment_reference": None,
+                "bank_name": salary_structure.get("bank_name"),
+                "bank_account": salary_structure.get("bank_account"),
+                "bank_ifsc": salary_structure.get("bank_ifsc"),
+                "pan_number": salary_structure.get("pan_number"),
+                "created_at": datetime.now(timezone.utc),
+                "created_by": current_admin.email
+            }
+            await payrolls_collection.insert_one(payroll_doc)
+        except Exception:
+            continue
+
+
 @router.get("")
-async def list_payrolls(payroll_month: Optional[str] = None, department: Optional[str] = None, status: Optional[str] = None, current_admin: Admin = Depends(get_current_admin)):
-    """List payroll records for a month and/or department."""
+async def list_payrolls(
+    payroll_month: Optional[str] = None,
+    department: Optional[str] = None,
+    status: Optional[str] = None,
+    auto_sync: bool = True,
+    current_admin: Admin = Depends(get_current_admin)
+):
+    """List payroll records for a month and/or department. Automatically calculates missing employee drafts."""
+    if payroll_month and auto_sync:
+        await _auto_generate_missing_payrolls(payroll_month, current_admin, department)
+
     org_filter = get_org_filter(current_admin)
     query = {**org_filter}
     
@@ -463,10 +637,18 @@ async def list_payrolls(payroll_month: Optional[str] = None, department: Optiona
     if status:
         query["status"] = status
         
-    cursor = payrolls_collection.find(query).sort("net_salary", -1)
+    cursor = payrolls_collection.find(query).sort([("employee_name", 1)])
     payrolls = await cursor.to_list(length=1000)
-    for p in payrolls:
-        p["_id"] = str(p["_id"])
+    if payrolls:
+        sample = await _attach_company_logo_to_payroll({"organization_id": current_admin.organization_id or payrolls[0].get("organization_id")})
+        c_logo = sample.get("company_logo_url")
+        c_name = sample.get("company_name")
+        for p in payrolls:
+            p["_id"] = str(p["_id"])
+            if c_logo and not p.get("company_logo_url"):
+                p["company_logo_url"] = c_logo
+            if c_name and not p.get("company_name"):
+                p["company_name"] = c_name
     return payrolls
 
 @router.get("/stats")
@@ -550,6 +732,81 @@ async def save_days_off(req: DaysOffSaveRequest, current_admin: Admin = Depends(
     )
     return {"message": "Days off saved successfully", "days_off": req.days_off}
 
+
+async def _get_org_smtp_config(org_id: str) -> dict:
+    """Resolve SMTP settings from organization settings in DB or environment variables."""
+    settings_doc = await settings_collection.find_one({"organization_id": org_id})
+    if not settings_doc and org_id != "system_org":
+        settings_doc = await settings_collection.find_one({"organization_id": "system_org"})
+    smtp_db = (settings_doc or {}).get("smtp_config") or {}
+
+    host = smtp_db.get("smtp_host") or os.getenv("SMTP_HOST", "smtp.gmail.com")
+    port = int(smtp_db.get("smtp_port") or os.getenv("SMTP_PORT", "587"))
+    user = smtp_db.get("smtp_user") or os.getenv("SMTP_USER", "")
+    password = smtp_db.get("smtp_password") or os.getenv("SMTP_PASSWORD") or os.getenv("SMTP_PASS", "")
+    from_email = smtp_db.get("smtp_from_email") or os.getenv("SMTP_FROM_EMAIL") or user
+    from_name = smtp_db.get("smtp_from_name") or os.getenv("SMTP_FROM_NAME", "LogDay Payroll & HR")
+
+    return {
+        "smtp_host": host,
+        "smtp_port": port,
+        "smtp_user": user,
+        "smtp_password": password,
+        "smtp_from_email": from_email,
+        "smtp_from_name": from_name,
+        "configured": bool(host and user and password),
+    }
+
+
+@router.get("/smtp-settings")
+async def get_payroll_smtp_settings(current_admin: Admin = Depends(get_current_admin)):
+    """Fetch current SMTP configuration status for sending salary slips via email."""
+    org_id = current_admin.organization_id or "system_org"
+    cfg = await _get_org_smtp_config(org_id)
+    return {
+        "smtp_host": cfg["smtp_host"],
+        "smtp_port": cfg["smtp_port"],
+        "smtp_user": cfg["smtp_user"],
+        "smtp_from_email": cfg["smtp_from_email"],
+        "smtp_from_name": cfg["smtp_from_name"],
+        "configured": cfg["configured"],
+        "has_password": bool(cfg["smtp_password"]),
+    }
+
+
+@router.post("/smtp-settings")
+async def save_payroll_smtp_settings(req: dict, current_admin: Admin = Depends(get_current_admin)):
+    """Save SMTP configuration for sending salary slips to employee login emails."""
+    org_id = current_admin.organization_id or "system_org"
+    existing = await _get_org_smtp_config(org_id)
+
+    new_password = req.get("smtp_password")
+    if not new_password or new_password == "••••••••":
+        new_password = existing.get("smtp_password", "")
+
+    smtp_config = {
+        "smtp_host": (req.get("smtp_host") or "smtp.gmail.com").strip(),
+        "smtp_port": int(req.get("smtp_port") or 587),
+        "smtp_user": (req.get("smtp_user") or "").strip(),
+        "smtp_password": new_password.strip(),
+        "smtp_from_email": (req.get("smtp_from_email") or req.get("smtp_user") or "").strip(),
+        "smtp_from_name": (req.get("smtp_from_name") or "LogDay Payroll & HR").strip(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "updated_by": current_admin.email,
+    }
+
+    await settings_collection.update_one(
+        {"organization_id": org_id},
+        {"$set": {"smtp_config": smtp_config}},
+        upsert=True,
+    )
+    return {
+        "status": "success",
+        "message": "Email (SMTP) settings saved successfully.",
+        "configured": bool(smtp_config["smtp_host"] and smtp_config["smtp_user"] and smtp_config["smtp_password"]),
+    }
+
+
 @router.get("/{id}")
 async def get_payroll(id: str, current_admin: Admin = Depends(get_current_admin)):
     """Fetch details of a single employee's payroll record."""
@@ -564,6 +821,7 @@ async def get_payroll(id: str, current_admin: Admin = Depends(get_current_admin)
         raise HTTPException(status_code=404, detail="Payroll record not found")
         
     p["_id"] = str(p["_id"])
+    await _attach_company_logo_to_payroll(p)
     return p
 
 @router.post("/calculate")
@@ -715,11 +973,16 @@ async def calculate_employee_payroll(payload: PayrollCreate, current_admin: Admi
 
 @router.post("/run-monthly")
 async def run_monthly_payroll(payload: PayrollRunRequest, current_admin: Admin = Depends(get_current_admin)):
-    """Run bulk payroll calculations for all employees configured with CTC."""
+    """Run bulk payroll calculations for all active employees according to salary and attendance."""
     org_id = current_admin.organization_id
     
-    # Query matching employees
-    emp_query = {"status": "Active", "salary_structure": {"$ne": None}}
+    # Query all active employees (including those whose salary structure will be initialized or updated)
+    emp_query: dict = {
+        "$or": [
+            {"status": {"$in": ["Active", "active", None]}},
+            {"status": {"$exists": False}}
+        ]
+    }
     if not (current_admin.role == "superadmin" or org_id == "system_org"):
         emp_query["organization_id"] = org_id
         
@@ -736,25 +999,29 @@ async def run_monthly_payroll(payload: PayrollRunRequest, current_admin: Admin =
     
     for emp in employees:
         try:
-            emp_org_id = emp["organization_id"]
+            emp_org_id = emp.get("organization_id") or org_id or "system_org"
+            emp_email = (emp.get("email") or "").strip().lower()
+            if not emp_email:
+                continue
+
             # Check if payroll already exists for this employee/month
             existing = await payrolls_collection.find_one({
-                "employee_email": emp["email"],
+                "employee_email": emp_email,
                 "organization_id": emp_org_id,
                 "payroll_month": payload.payroll_month
             })
-            if existing and existing["status"] != PayrollStatus.DRAFT:
-                continue # Skip approved/paid records
+            if existing and existing["status"] in [PayrollStatus.LOCKED, PayrollStatus.PAID]:
+                continue  # Skip locked/paid records
                 
-            w_days, p_days, paid_l, unpaid_l, a_days, short_pen = await fetch_attendance_data(emp["email"], emp_org_id, payload.payroll_month)
-            salary_structure = emp["salary_structure"]
+            w_days, p_days, paid_l, unpaid_l, a_days, short_pen = await fetch_attendance_data(emp_email, emp_org_id, payload.payroll_month)
+            salary_structure = await _resolve_employee_salary_structure(emp)
             
             # Fetch travel reimbursements and expenses
-            travel_reimb, exp_claims = await fetch_approved_claims_and_reimbursements(emp["email"], emp_org_id, payload.payroll_month)
+            travel_reimb, exp_claims = await fetch_approved_claims_and_reimbursements(emp_email, emp_org_id, payload.payroll_month)
             reimbursements = travel_reimb + exp_claims
 
             results = calculate_payslip_fields(
-                ctc=salary_structure.get("ctc", 0.0),
+                ctc=float(salary_structure.get("ctc") or 0.0),
                 working_days=w_days,
                 present_days=p_days,
                 paid_leave_days=paid_l,
@@ -767,8 +1034,8 @@ async def run_monthly_payroll(payload: PayrollRunRequest, current_admin: Admin =
             
             payroll_doc = {
                 "organization_id": emp_org_id,
-                "employee_email": emp["email"],
-                "employee_name": emp["full_name"],
+                "employee_email": emp_email,
+                "employee_name": emp.get("full_name") or emp_email.split("@")[0],
                 "employee_id": emp.get("employee_id", "EMP"),
                 "department": emp.get("department", "General"),
                 "designation": emp.get("designation", "Employee"),
@@ -812,11 +1079,16 @@ async def run_monthly_payroll(payload: PayrollRunRequest, current_admin: Admin =
                 "other_deductions": 0.0,
                 "total_deductions": results["total_deductions"],
                 
+                "calculated_net_salary": results["net_salary"],
+                "admin_adjustment": 0.0,
                 "net_salary": results["net_salary"],
                 
-                "status": PayrollStatus.APPROVED if payload.auto_approve else PayrollStatus.DRAFT,
-                "approved_by": current_admin.email if payload.auto_approve else None,
-                "approved_at": datetime.now(timezone.utc) if payload.auto_approve else None,
+                "status": PayrollStatus.APPROVED if payload.auto_approve else (existing.get("status") if existing else PayrollStatus.DRAFT),
+                "email_sent": existing.get("email_sent", False) if existing else False,
+                "last_sent_at": existing.get("last_sent_at") if existing else None,
+                "sent_to_email": existing.get("sent_to_email") if existing else None,
+                "approved_by": current_admin.email if payload.auto_approve else (existing.get("approved_by") if existing else None),
+                "approved_at": datetime.now(timezone.utc) if payload.auto_approve else (existing.get("approved_at") if existing else None),
                 "locked_by": None,
                 "locked_at": None,
                 "payment_date": None,
@@ -837,18 +1109,18 @@ async def run_monthly_payroll(payload: PayrollRunRequest, current_admin: Admin =
                 await payrolls_collection.insert_one(payroll_doc)
             processed_count += 1
         except Exception as e:
-            errors.append(f"Error processing {emp['email']}: {str(e)}")
+            errors.append(f"Error processing {emp.get('email')}: {str(e)}")
 
             
     return {
-        "message": f"Successfully processed monthly payroll for {processed_count} employees.",
+        "message": f"Successfully calculated monthly payroll for {processed_count} employees.",
         "processed_count": processed_count,
         "errors": errors
     }
 
 @router.put("/{id}")
 async def edit_payroll_draft(id: str, updates: dict, current_admin: Admin = Depends(get_current_admin)):
-    """Edit draft payroll adjustments (bonus, overtime, deductions)."""
+    """Edit payroll salary, attendance days, bonuses/deductions, or override the final net payable amount directly."""
     org_filter = get_org_filter(current_admin)
     try:
         obj_id = ObjectId(id)
@@ -859,27 +1131,70 @@ async def edit_payroll_draft(id: str, updates: dict, current_admin: Admin = Depe
     if not p:
         raise HTTPException(status_code=404, detail="Payroll record not found")
         
-    if p["status"] != PayrollStatus.DRAFT:
-        raise HTTPException(status_code=400, detail="Can only edit draft payroll records")
+    if p["status"] == PayrollStatus.PAID:
+        raise HTTPException(status_code=400, detail="Cannot edit a payroll record that has already been marked as Paid")
         
-    # Apply manual values
-    bonus = updates.get("bonus", p.get("bonus", 0.0))
-    other_earnings = updates.get("other_earnings", p.get("other_earnings", 0.0))
-    overtime_hours = updates.get("overtime_hours", p.get("overtime_hours", 0.0))
-    loan_deductions = updates.get("loan_deductions", p.get("loan_deductions", 0.0))
-    advance_deductions = updates.get("advance_deductions", p.get("advance_deductions", 0.0))
-    other_deductions = updates.get("other_deductions", p.get("other_deductions", 0.0))
-    
-    reimbursements = p.get("travel_reimbursement", 0.0) + p.get("expense_claims", 0.0)
+    # Allow admin to update Monthly Base Salary or Annual CTC directly
+    new_ctc = float(p.get("ctc", 0.0))
+    salary_updated = False
+    if updates.get("monthly_salary") is not None:
+        new_ctc = float(updates["monthly_salary"]) * 12.0
+        salary_updated = True
+    elif updates.get("ctc") is not None:
+        new_ctc = float(updates["ctc"])
+        salary_updated = True
 
-    # Recalculate using existing parameters
+    working_days = int(updates.get("working_days", p.get("working_days", 30)) or 30)
+    present_days = float(updates.get("present_days", p.get("present_days", working_days)))
+    paid_leave_days = float(updates.get("paid_leave_days", p.get("paid_leave_days", p.get("leave_days", 0.0))))
+    unpaid_leave_days = float(updates.get("unpaid_leave_days", p.get("unpaid_leave_days", 0.0)))
+    short_leave_penalty_days = float(updates.get("short_leave_penalty_days", p.get("short_leave_penalty_days", 0.0)))
+
+    # Apply manual earnings / deduction values
+    bonus = float(updates.get("bonus", p.get("bonus", 0.0)) or 0.0)
+    other_earnings = float(updates.get("other_earnings", p.get("other_earnings", 0.0)) or 0.0)
+    overtime_hours = float(updates.get("overtime_hours", p.get("overtime_hours", 0.0)) or 0.0)
+    loan_deductions = float(updates.get("loan_deductions", p.get("loan_deductions", 0.0)) or 0.0)
+    advance_deductions = float(updates.get("advance_deductions", p.get("advance_deductions", 0.0)) or 0.0)
+    other_deductions = float(updates.get("other_deductions", p.get("other_deductions", 0.0)) or 0.0)
+    
+    reimbursements = float(p.get("travel_reimbursement", 0.0)) + float(p.get("expense_claims", 0.0))
+
+    pf_enabled = updates.get("pf_enabled") if updates.get("pf_enabled") is not None else (p.get("pf_employee", 0.0) > 0)
+    esi_enabled = updates.get("esi_enabled") if updates.get("esi_enabled") is not None else (p.get("esi_employee", 0.0) > 0)
+    pt_enabled = updates.get("professional_tax_enabled") if updates.get("professional_tax_enabled") is not None else (p.get("professional_tax", 0.0) > 0)
+
+    basic_override = float(updates["basic_salary"]) if updates.get("basic_salary") is not None else (None if salary_updated else p.get("basic_salary"))
+    hra_override = float(updates["hra"]) if updates.get("hra") is not None else (None if salary_updated else p.get("hra"))
+
+    # Persist updated base salary structure back to employee document so future calculations use it
+    if salary_updated:
+        monthly_val = round(new_ctc / 12.0, 2)
+        basic_val = round(monthly_val * 0.40, 2)
+        hra_val = round(basic_val * 0.50, 2)
+        special_val = max(0.0, round(monthly_val - basic_val - hra_val, 2))
+        await employees_collection.update_one(
+            {"email": p["employee_email"], "organization_id": p["organization_id"]},
+            {"$set": {
+                "salary_structure.ctc": round(new_ctc, 2),
+                "salary_structure.monthly_salary": monthly_val,
+                "salary_structure.basic_salary": basic_val,
+                "salary_structure.hra": hra_val,
+                "salary_structure.special_allowance": special_val,
+                "salary_structure.pf_enabled": bool(pf_enabled),
+                "salary_structure.esi_enabled": bool(esi_enabled),
+                "salary_structure.professional_tax_enabled": bool(pt_enabled),
+            }}
+        )
+
+    # Recalculate using parameters
     results = calculate_payslip_fields(
-        ctc=p["ctc"],
-        working_days=p["working_days"],
-        present_days=p["present_days"],
-        paid_leave_days=p.get("paid_leave_days", p.get("leave_days", 0.0)),
-        unpaid_leave_days=p.get("unpaid_leave_days", 0.0),
-        short_leave_penalty_days=p.get("short_leave_penalty_days", 0.0),
+        ctc=new_ctc,
+        working_days=working_days,
+        present_days=present_days,
+        paid_leave_days=paid_leave_days,
+        unpaid_leave_days=unpaid_leave_days,
+        short_leave_penalty_days=short_leave_penalty_days,
         overtime_hours=overtime_hours,
         bonus=bonus,
         other_earnings=other_earnings,
@@ -888,15 +1203,39 @@ async def edit_payroll_draft(id: str, updates: dict, current_admin: Admin = Depe
         advance_deductions=advance_deductions,
         other_deductions=other_deductions,
         salary_structure={
-            "pf_enabled": p.get("pf_employee", 0.0) > 0,
-            "esi_enabled": p.get("esi_employee", 0.0) > 0,
-            "professional_tax_enabled": p.get("professional_tax", 0.0) > 0,
-            "basic_salary": p.get("basic_salary"),
-            "hra": p.get("hra")
+            "pf_enabled": bool(pf_enabled),
+            "esi_enabled": bool(esi_enabled),
+            "professional_tax_enabled": bool(pt_enabled),
+            "basic_salary": basic_override,
+            "hra": hra_override
         }
     )
+
+    calculated_net = results["net_salary"]
+    final_net = calculated_net
+    admin_adjustment = 0.0
+
+    # Direct final amount override if admin changed the final net salary price directly
+    if updates.get("custom_net_salary") is not None and str(updates.get("custom_net_salary")).strip() != "":
+        custom_net = round(float(updates["custom_net_salary"]), 2)
+        if abs(custom_net - calculated_net) >= 0.01:
+            final_net = custom_net
+            admin_adjustment = round(custom_net - calculated_net, 2)
     
     updated_fields = {
+        "ctc": results["ctc"],
+        "monthly_salary": results["monthly_salary"],
+        "basic_salary": results["basic_salary"],
+        "hra": results["hra"],
+        "special_allowance": results["special_allowance"],
+        "daily_wage": results["daily_wage"],
+        "working_days": working_days,
+        "present_days": present_days,
+        "paid_leave_days": results["paid_leave_days"],
+        "unpaid_leave_days": results["unpaid_leave_days"],
+        "leave_days": results["paid_leave_days"] + results["unpaid_leave_days"],
+        "absent_days": results["absent_days"],
+        "lop_days": results["lop_days"],
         "bonus": bonus,
         "other_earnings": other_earnings,
         "overtime_hours": overtime_hours,
@@ -914,7 +1253,9 @@ async def edit_payroll_draft(id: str, updates: dict, current_admin: Admin = Depe
         "professional_tax": results["professional_tax"],
         "income_tax_tds": results["income_tax_tds"],
         "total_deductions": results["total_deductions"],
-        "net_salary": results["net_salary"],
+        "calculated_net_salary": calculated_net,
+        "admin_adjustment": admin_adjustment,
+        "net_salary": final_net,
         "updated_at": datetime.now(timezone.utc),
         "updated_by": current_admin.email
     }
@@ -923,6 +1264,7 @@ async def edit_payroll_draft(id: str, updates: dict, current_admin: Admin = Depe
     
     p_updated = await payrolls_collection.find_one({"_id": obj_id})
     p_updated["_id"] = str(p_updated["_id"])
+    await _attach_company_logo_to_payroll(p_updated)
     return p_updated
 
 @router.post("/{id}/approve")
@@ -952,8 +1294,14 @@ async def approve_payroll(id: str, current_admin: Admin = Depends(get_current_ad
     return {"message": "Payroll approved successfully", "status": PayrollStatus.APPROVED}
 
 @router.post("/bulk-approve")
-async def bulk_approve_payrolls(ids: List[str], current_admin: Admin = Depends(get_current_admin)):
-    """Approve multiple draft payroll records at once."""
+async def bulk_approve_payrolls(payload: Any = Body(...), current_admin: Admin = Depends(get_current_admin)):
+    """Approve multiple draft payroll records at once. Accepts either ['id1', ...] or {'ids': ['id1', ...]}."""
+    if isinstance(payload, dict):
+        ids = payload.get("ids") or []
+    elif isinstance(payload, list):
+        ids = payload
+    else:
+        ids = []
     org_filter = get_org_filter(current_admin)
     obj_ids = []
     for sid in ids:
@@ -1042,7 +1390,467 @@ async def get_payslip_data(id: str, current_admin: Admin = Depends(get_current_a
         raise HTTPException(status_code=404, detail="Payroll record not found")
         
     p["_id"] = str(p["_id"])
+    await _attach_company_logo_to_payroll(p)
     return p
+
+
+async def _attach_company_logo_to_payroll(p: dict) -> dict:
+    """Resolve the company's actual logo_url and name from organizations_collection / settings_collection."""
+    if not p:
+        return p
+    org_id = p.get("organization_id") or "system_org"
+    logo_url = None
+    company_name = None
+
+    if org_id != "system_org" and ObjectId.is_valid(str(org_id)):
+        org_doc = await organizations_collection.find_one({"_id": ObjectId(str(org_id))})
+        if org_doc:
+            logo_url = org_doc.get("logo_url")
+            company_name = org_doc.get("name")
+
+    if not logo_url:
+        settings_doc = await settings_collection.find_one({"organization_id": org_id})
+        if not settings_doc and org_id == "system_org":
+            settings_doc = await settings_collection.find_one({"id": "config"})
+        if settings_doc and settings_doc.get("logo_url"):
+            logo_url = settings_doc.get("logo_url")
+
+    p["company_logo_url"] = logo_url
+    if company_name:
+        p["company_name"] = company_name
+    return p
+
+
+def _resolve_company_logo_source(p: Optional[dict] = None) -> Any:
+    """Return a file path or BytesIO object for the company's logo to embed in ReportLab PDF."""
+    base_dir = os.path.dirname(os.path.abspath("hrms_payroll.py"))
+    logo_url = (p or {}).get("company_logo_url")
+
+    if logo_url and isinstance(logo_url, str):
+        logo_url = logo_url.strip()
+        # 1. Base64 data URI
+        if logo_url.startswith("data:image") and "," in logo_url:
+            try:
+                b64_data = logo_url.split(",", 1)[1]
+                return io.BytesIO(base64.b64decode(b64_data))
+            except Exception:
+                pass
+
+        # 2. Local /uploads/... path (relative or full URL pointing to /uploads/...)
+        if "/uploads/" in logo_url:
+            rel_upload = logo_url.split("/uploads/", 1)[1].split("?", 1)[0].lstrip("/\\")
+            local_upload_path = os.path.join(base_dir, "uploads", rel_upload)
+            if os.path.exists(local_upload_path):
+                return local_upload_path
+
+        # 3. External HTTP/HTTPS URL
+        if logo_url.startswith("http://") or logo_url.startswith("https://"):
+            try:
+                req = urllib.request.Request(logo_url, headers={"User-Agent": "LogDayPayroll/1.0"})
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    return io.BytesIO(resp.read())
+            except Exception:
+                pass
+
+    # 4. Default Company Logo fallback (same /logday_logo.png used in Admin Sidebar)
+    candidates = [
+        os.path.join(base_dir, "uploads", "logos", "logday_logo.png"),
+        os.path.abspath(os.path.join(base_dir, "..", "attendence_inofice__admin_desk", "public", "logday_logo.png")),
+        os.path.join(base_dir, "uploads", "logos", "technula_logo.png"),
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def _number_to_inr_words(amount: float) -> str:
+    """Convert a numeric INR amount into formal Indian Rupee words (e.g. 'Rupees Fifty-Two Thousand Fifty Only')."""
+    n = int(round(max(0.0, float(amount or 0.0))))
+    if n == 0:
+        return "Rupees Zero Only"
+
+    ones = [
+        "", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine",
+        "Ten", "Eleven", "Twelve", "Thirteen", "Fourteen", "Fifteen", "Sixteen",
+        "Seventeen", "Eighteen", "Nineteen"
+    ]
+    tens = ["", "", "Twenty", "Thirty", "Forty", "Fifty", "Sixty", "Seventy", "Eighty", "Ninety"]
+
+    def two_digits(num: int) -> str:
+        if num < 20:
+            return ones[num]
+        return tens[num // 10] + ("-" + ones[num % 10] if num % 10 != 0 else "")
+
+    def three_digits(num: int) -> str:
+        h = num // 100
+        rem = num % 100
+        if h and rem:
+            return f"{ones[h]} Hundred {two_digits(rem)}"
+        elif h:
+            return f"{ones[h]} Hundred"
+        return two_digits(rem)
+
+    parts = []
+    crore = n // 10000000
+    n %= 10000000
+    lakh = n // 100000
+    n %= 100000
+    thousand = n // 1000
+    n %= 1000
+    rest = n
+
+    if crore:
+        parts.append(f"{three_digits(crore)} Crore")
+    if lakh:
+        parts.append(f"{two_digits(lakh)} Lakh")
+    if thousand:
+        parts.append(f"{two_digits(thousand)} Thousand")
+    if rest:
+        parts.append(three_digits(rest))
+
+    return f"Rupees {' '.join(parts)} Only"
+
+
+def generate_payslip_pdf_bytes(p: dict) -> bytes:
+    """Build a simple, clean ONE-TABLE PDF salary slip with the root Technula logo."""
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=letter, rightMargin=45, leftMargin=45, topMargin=40, bottomMargin=40)
+    elements = []
+
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "PayslipTitle",
+        parent=styles["Heading1"],
+        fontSize=16,
+        textColor=colors.HexColor("#004B87"),
+        alignment=1,
+        spaceAfter=4,
+    )
+    sub_style = ParagraphStyle(
+        "PayslipSub",
+        parent=styles["Normal"],
+        fontSize=10,
+        textColor=colors.HexColor("#64748B"),
+        alignment=1,
+        spaceAfter=14,
+    )
+    normal_style = styles["Normal"]
+    right_style = ParagraphStyle("RightCell", parent=normal_style, alignment=2)
+
+    logo_source = _resolve_company_logo_source(p)
+    if logo_source:
+        try:
+            logo_img = RLImage(logo_source, width=180, height=52)
+            logo_img.hAlign = "CENTER"
+            elements.append(logo_img)
+            elements.append(Spacer(1, 6))
+        except Exception:
+            pass
+
+    elements.append(Paragraph(f"<b>SALARY SLIP — {p.get('payroll_month', 'N/A')}</b>", title_style))
+    elements.append(Paragraph(f"Login Email: {p.get('employee_email', 'N/A')}", sub_style))
+
+    monthly_base = float(p.get("monthly_salary") or (float(p.get("ctc", 0.0)) / 12.0))
+    working_days = p.get("working_days", 30)
+    present_days = p.get("present_days", 0)
+    paid_leaves = p.get("paid_leave_days", p.get("leave_days", 0))
+    lop_days = p.get("lop_days", p.get("absent_days", 0))
+    lop_deduction = float(p.get("lop_deduction", 0.0))
+    attendance_salary = float(p.get("attendance_salary", max(0.0, monthly_base - lop_deduction)))
+    additions = float(p.get("bonus", 0.0)) + float(p.get("overtime_amount", 0.0)) + float(p.get("other_earnings", 0.0)) + float(p.get("reimbursements", 0.0))
+    deductions = float(p.get("total_deductions", 0.0))
+    admin_adj = float(p.get("admin_adjustment", 0.0) or 0.0)
+    net_salary = float(p.get("net_salary", 0.0))
+
+    table_rows = [
+        [Paragraph("<font color='#334155'><b>PARTICULARS</b></font>", normal_style), Paragraph("<font color='#334155'><b>DETAILS / AMOUNT (INR)</b></font>", right_style)],
+        [Paragraph("Employee Name", normal_style), Paragraph(f"<b>{p.get('employee_name', 'N/A')} ({p.get('employee_id', 'EMP')})</b>", right_style)],
+        [Paragraph("Login Email", normal_style), Paragraph(f"<font color='#004B87'><b>{p.get('employee_email', 'N/A')}</b></font>", right_style)],
+        [Paragraph("Department & Designation", normal_style), Paragraph(f"<b>{p.get('department', 'General')} — {p.get('designation', 'Employee')}</b>", right_style)],
+        [Paragraph("Attendance (Present / Working)", normal_style), Paragraph(f"<b>{present_days} / {working_days} Days  (Paid Leave: {paid_leaves}, LOP: {lop_days})</b>", right_style)],
+        [Paragraph("Monthly Base Salary", normal_style), Paragraph(f"<b>Rs. {monthly_base:,.2f}</b>", right_style)],
+        [Paragraph("Loss of Pay (LOP) Deduction", normal_style), Paragraph(f"<font color='#E11D48'><b>-Rs. {lop_deduction:,.2f}</b></font>", right_style)],
+        [Paragraph("Attendance Pro-Rated Salary", normal_style), Paragraph(f"<b>Rs. {attendance_salary:,.2f}</b>", right_style)],
+        [Paragraph("Additions (Bonus / OT / Claims)", normal_style), Paragraph(f"<font color='#059669'><b>+Rs. {additions:,.2f}</b></font>", right_style)],
+        [Paragraph("Deductions (PF / Tax / Advance)", normal_style), Paragraph(f"<font color='#E11D48'><b>-Rs. {deductions:,.2f}</b></font>", right_style)],
+    ]
+    if abs(admin_adj) >= 0.01:
+        sign = "+" if admin_adj > 0 else "-"
+        col_hex = "#059669" if admin_adj > 0 else "#E11D48"
+        table_rows.append([
+            Paragraph("Admin Salary Adjustment (Edited)", normal_style),
+            Paragraph(f"<font color='{col_hex}'><b>{sign}Rs. {abs(admin_adj):,.2f}</b></font>", right_style),
+        ])
+
+    table_rows.append([
+        Paragraph("<font size=11 color=white><b>FINAL NET SALARY PAYABLE</b></font>", normal_style),
+        Paragraph(f"<font size=13 color=white><b>Rs. {net_salary:,.2f}</b></font>", right_style),
+    ])
+
+    t_single = Table(table_rows, colWidths=[260, 260])
+    t_single.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#F1F5F9")),
+                ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#004B87")),
+                ("LINEBELOW", (0, 0), (-1, -2), 0.75, colors.HexColor("#E2E8F0")),
+                ("BOX", (0, 0), (-1, -1), 1.5, colors.HexColor("#94A3B8")),
+                ("TOPPADDING", (0, 0), (-1, -2), 9),
+                ("BOTTOMPADDING", (0, 0), (-1, -2), 9),
+                ("TOPPADDING", (0, -1), (-1, -1), 12),
+                ("BOTTOMPADDING", (0, -1), (-1, -1), 12),
+                ("LEFTPADDING", (0, 0), (-1, -1), 14),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 14),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ]
+        )
+    )
+    elements.append(t_single)
+
+    doc.build(elements)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def _send_smtp_email_sync(smtp_cfg: dict, to_email: str, subject: str, html_body: str, pdf_bytes: bytes, pdf_filename: str) -> Tuple[bool, str]:
+    """Send salary slip email with PDF attachment over SMTP."""
+    try:
+        msg = EmailMessage()
+        msg["Subject"] = subject
+        msg["From"] = f"{smtp_cfg['smtp_from_name']} <{smtp_cfg['smtp_from_email']}>"
+        msg["To"] = to_email
+        msg.set_content("Please view this salary slip in an HTML-compatible email client. Your PDF salary slip is attached.")
+        msg.add_alternative(html_body, subtype="html")
+        msg.add_attachment(pdf_bytes, maintype="application", subtype="pdf", filename=pdf_filename)
+
+        host = smtp_cfg["smtp_host"]
+        port = int(smtp_cfg["smtp_port"])
+        user = smtp_cfg["smtp_user"]
+        password = smtp_cfg["smtp_password"]
+
+        if port == 465:
+            context = ssl.create_default_context()
+            with smtplib.SMTP_SSL(host, port, context=context, timeout=15) as server:
+                server.login(user, password)
+                server.send_message(msg)
+        else:
+            with smtplib.SMTP(host, port, timeout=15) as server:
+                server.ehlo()
+                server.starttls(context=ssl.create_default_context())
+                server.ehlo()
+                server.login(user, password)
+                server.send_message(msg)
+        return True, f"Emailed salary slip to {to_email}"
+    except Exception as e:
+        return False, f"SMTP delivery error: {str(e)}"
+
+
+async def _dispatch_single_payslip(p: dict, current_admin: Admin) -> dict:
+    """Generate PDF, send email to employee's LogDay login email, and publish to their in-app Payslips."""
+    to_email = (p.get("employee_email") or "").strip().lower()
+    if not to_email:
+        raise HTTPException(status_code=400, detail="Employee login email is missing on this payroll record")
+
+    month_str = p.get("payroll_month", "")
+    emp_name = p.get("employee_name", to_email)
+    net_amt = float(p.get("net_salary", 0.0))
+    gross_amt = float(p.get("gross_salary", 0.0))
+    ded_amt = float(p.get("total_deductions", 0.0))
+    pres_days = p.get("present_days", 0)
+    work_days = p.get("working_days", 0)
+    lop_days = p.get("lop_days", p.get("absent_days", 0))
+
+    await _attach_company_logo_to_payroll(p)
+    pdf_bytes = await run_in_threadpool(generate_payslip_pdf_bytes, p)
+    pdf_filename = f"SalarySlip_{emp_name.replace(' ', '_')}_{month_str}.pdf"
+    comp_name = p.get("company_name") or "LogDay"
+    comp_logo = p.get("company_logo_url") or ""
+    logo_html = f'<img src="{comp_logo}" alt="{comp_name}" style="max-height: 44px; margin-bottom: 8px; display: block;" />' if comp_logo else ""
+
+    html_body = f"""
+    <div style="font-family: 'Segoe UI', Arial, sans-serif; max-width: 600px; margin: 0 auto; border: 1px solid #e2e8f0; border-radius: 16px; overflow: hidden; background: #ffffff;">
+      <div style="background: #004B87; color: #ffffff; padding: 24px;">
+        {logo_html}
+        <h2 style="margin: 0; font-size: 20px;">{comp_name} — Official Salary Slip</h2>
+        <p style="margin: 4px 0 0; font-size: 13px; opacity: 0.9;">Pay Period: {month_str} • Account: {to_email}</p>
+      </div>
+      <div style="padding: 24px; color: #1e293b;">
+        <p style="font-size: 14px; margin-top: 0;">Hello <b>{emp_name}</b>,</p>
+        <p style="font-size: 13px; color: #475569; line-height: 1.5;">
+          Your salary slip for <b>{month_str}</b> has been calculated and finalized based on your attendance and salary structure. The certified PDF salary slip is attached to this email and is also available in your LogDay app under <b>Payslips</b>.
+        </p>
+        <table style="width: 100%; border-collapse: collapse; margin: 16px 0; font-size: 13px;">
+          <tr style="background: #f8fafc; border-bottom: 1px solid #e2e8f0;">
+            <td style="padding: 10px 12px; color: #64748b;">Attendance Recorded</td>
+            <td style="padding: 10px 12px; text-align: right; font-weight: bold;">{pres_days} / {work_days} Days (LOP: {lop_days})</td>
+          </tr>
+          <tr style="border-bottom: 1px solid #e2e8f0;">
+            <td style="padding: 10px 12px; color: #64748b;">Monthly Base Salary</td>
+            <td style="padding: 10px 12px; text-align: right; font-weight: bold;">₹{float(p.get('monthly_salary', 0.0)):,.2f}</td>
+          </tr>
+          <tr style="background: #f8fafc; border-bottom: 1px solid #e2e8f0;">
+            <td style="padding: 10px 12px; color: #64748b;">Gross Earnings</td>
+            <td style="padding: 10px 12px; text-align: right; font-weight: bold;">₹{gross_amt:,.2f}</td>
+          </tr>
+          <tr style="border-bottom: 1px solid #e2e8f0;">
+            <td style="padding: 10px 12px; color: #64748b;">Total Deductions (PF / Tax / LOP)</td>
+            <td style="padding: 10px 12px; text-align: right; font-weight: bold; color: #e11d48;">-₹{ded_amt:,.2f}</td>
+          </tr>
+          <tr style="background: #ecfdf5; border-top: 2px solid #10b981;">
+            <td style="padding: 14px 12px; font-weight: bold; color: #065f46; font-size: 15px;">Final Net Payable Salary</td>
+            <td style="padding: 14px 12px; text-align: right; font-weight: 900; color: #059669; font-size: 18px;">₹{net_amt:,.2f}</td>
+          </tr>
+        </table>
+        <p style="font-size: 12px; color: #94a3b8; margin-top: 20px;">
+          Log in to your LogDay Mobile or WFH Desktop app using <b>{to_email}</b> to view or download your salary slip anytime.
+        </p>
+      </div>
+    </div>
+    """
+
+    org_id = p.get("organization_id") or current_admin.organization_id or "system_org"
+    smtp_cfg = await _get_org_smtp_config(org_id)
+
+    email_sent = False
+    delivery_note = ""
+    if smtp_cfg["configured"]:
+        email_sent, delivery_note = await run_in_threadpool(
+            _send_smtp_email_sync,
+            smtp_cfg,
+            to_email,
+            f"Salary Slip for {month_str} — {emp_name} (Rs. {net_amt:,.2f})",
+            html_body,
+            pdf_bytes,
+            pdf_filename,
+        )
+    else:
+        delivery_note = f"Published to {to_email}'s LogDay app Payslips hub (Configure SMTP settings to also send external email)."
+
+    now_utc = datetime.now(timezone.utc)
+    new_status = p.get("status")
+    if new_status == PayrollStatus.DRAFT:
+        new_status = PayrollStatus.APPROVED
+
+    update_doc = {
+        "status": new_status,
+        "email_sent": True,
+        "smtp_delivered": email_sent,
+        "last_sent_at": now_utc.isoformat(),
+        "sent_to_email": to_email,
+        "sent_by": current_admin.email,
+        "delivery_note": delivery_note,
+    }
+    if not p.get("approved_by"):
+        update_doc["approved_by"] = current_admin.email
+        update_doc["approved_at"] = now_utc
+
+    await payrolls_collection.update_one({"_id": ObjectId(str(p["_id"]))}, {"$set": update_doc})
+
+    # Also send an in-app notification to the employee's LogDay account
+    try:
+        await wfh_alerts_collection.insert_one({
+            "employee_email": to_email,
+            "employee_name": emp_name,
+            "organization_id": org_id,
+            "type": "SALARY_SLIP_RELEASED",
+            "severity": "low",
+            "status": "pending",
+            "details": f"Your salary slip for {month_str} (Net Payout: ₹{net_amt:,.2f}) has been sent to {to_email} and is ready for download.",
+            "timestamp": now_utc,
+            "created_at": now_utc,
+        })
+    except Exception:
+        pass
+
+    return {
+        "payroll_id": str(p["_id"]),
+        "sent_to": to_email,
+        "email_sent": True,
+        "smtp_delivered": email_sent,
+        "smtp_configured": smtp_cfg["configured"],
+        "status": new_status,
+        "message": delivery_note,
+    }
+
+
+@router.get("/{id}/download-pdf")
+async def admin_download_payslip_pdf(id: str, current_admin: Admin = Depends(get_current_admin)):
+    """Download the PDF salary slip from the Admin Panel."""
+    org_filter = get_org_filter(current_admin)
+    try:
+        obj_id = ObjectId(id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid ID format")
+
+    p = await payrolls_collection.find_one({**org_filter, "_id": obj_id})
+    if not p:
+        raise HTTPException(status_code=404, detail="Payroll record not found")
+
+    await _attach_company_logo_to_payroll(p)
+    pdf_bytes = await run_in_threadpool(generate_payslip_pdf_bytes, p)
+    filename = f"payslip_{p.get('employee_name', 'employee').replace(' ', '_')}_{p.get('payroll_month', '')}.pdf"
+    return StreamingResponse(
+        io.BytesIO(pdf_bytes),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
+
+
+@router.post("/{id}/send")
+async def send_payroll_to_employee(id: str, current_admin: Admin = Depends(get_current_admin)):
+    """Send the calculated/adjusted salary slip to the employee's LogDay login email and release in-app."""
+    org_filter = get_org_filter(current_admin)
+    try:
+        obj_id = ObjectId(id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid ID format")
+
+    p = await payrolls_collection.find_one({**org_filter, "_id": obj_id})
+    if not p:
+        raise HTTPException(status_code=404, detail="Payroll record not found")
+
+    result = await _dispatch_single_payslip(p, current_admin)
+    return result
+
+
+@router.post("/bulk-send")
+async def bulk_send_payrolls_to_employees(payload: Any = Body(...), current_admin: Admin = Depends(get_current_admin)):
+    """Send multiple salary slips at once to employees' LogDay login emails."""
+    if isinstance(payload, dict):
+        ids = payload.get("ids") or []
+    elif isinstance(payload, list):
+        ids = payload
+    else:
+        ids = []
+
+    org_filter = get_org_filter(current_admin)
+    obj_ids = []
+    for sid in ids:
+        try:
+            obj_ids.append(ObjectId(sid))
+        except Exception:
+            pass
+
+    cursor = payrolls_collection.find({"_id": {"$in": obj_ids}, **org_filter})
+    records = await cursor.to_list(length=500)
+
+    sent_count = 0
+    smtp_count = 0
+    results = []
+    for rec in records:
+        res = await _dispatch_single_payslip(rec, current_admin)
+        sent_count += 1
+        if res.get("smtp_delivered"):
+            smtp_count += 1
+        results.append(res)
+
+    return {
+        "message": f"Sent {sent_count} salary slips to employee login emails ({smtp_count} delivered via SMTP, {sent_count} published in-app).",
+        "sent_count": sent_count,
+        "smtp_delivered_count": smtp_count,
+        "results": results,
+    }
 
 
 

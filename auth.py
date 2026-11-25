@@ -149,6 +149,10 @@ async def get_current_admin(request: Request, token: str = Depends(admin_oauth2_
         elif path.startswith("/admin/leaderboard"):
             if "leaderboard" not in allowed:
                 raise HTTPException(403, "Access denied for 'leaderboard'")
+
+        elif path.startswith("/admin/flyfield"):
+            if "flyfield" not in allowed and "war_room" not in allowed:
+                raise HTTPException(403, "Access denied for 'flyfield'")
                 
         # 6. HRMS (onboarding, exit_management, payroll, document_verification)
         elif path.startswith("/admin/onboarding") or path.startswith("/hrms/onboarding"):

@@ -122,6 +122,7 @@ def is_dummy_embedding(embedding):
 
 def verify_face(img_base64, stored_embedding, threshold=0.60):
     """Verifies a face against a stored embedding using cosine similarity."""
+    env = os.getenv("APP_ENV", "development").lower()
     new_embedding = get_face_embedding(img_base64)
     if new_embedding is None:
         logger.warning("No face detected in the provided image.")

@@ -402,9 +402,9 @@ async def complete_onboarding(id: str, current_admin: Admin = Depends(require_fe
         for doc in onb.get("documents_submitted", []):
             if doc.get("verified") and doc.get("extracted_details"):
                 details = doc["extracted_details"]
-                if doc["type"] == "pan_card":
+                if doc["type"] in ("pan_card", "pan"):
                     pan_num = details.get("pan_number")
-                elif doc["type"] == "bank_details":
+                elif doc["type"] in ("bank_details", "bank_passbook", "bank"):
                     bank_acc = details.get("account_number")
                     bank_ifsc = details.get("ifsc_code")
                     if bank_ifsc:
@@ -457,9 +457,9 @@ async def complete_onboarding(id: str, current_admin: Admin = Depends(require_fe
         for doc in onb.get("documents_submitted", []):
             if doc.get("verified") and doc.get("extracted_details"):
                 details = doc["extracted_details"]
-                if doc["type"] == "pan_card":
+                if doc["type"] in ("pan_card", "pan"):
                     pan_num = details.get("pan_number")
-                elif doc["type"] == "bank_details":
+                elif doc["type"] in ("bank_details", "bank_passbook", "bank"):
                     bank_acc = details.get("account_number")
                     bank_ifsc = details.get("ifsc_code")
                     if bank_ifsc:
@@ -899,7 +899,7 @@ async def digilocker_callback(code: str, state: str):
     import logging
     logger = logging.getLogger(__name__)
 
-    employee_id = state
+    employee_id = state.split(":")[0] if ":" in state else state
     try:
         obj_id = ObjectId(employee_id)
     except Exception:
@@ -1161,7 +1161,7 @@ async def get_my_onboarding(employee=Depends(get_current_employee)):
     if not onb:
         # Check if we should auto-initialize a default onboarding record for this employee
         emp_id = str(employee.get("_id", ""))
-        default_docs = ["aadhaar", "pan", "bank_passbook", "photo"]
+        default_docs = ["pan_card", "aadhaar", "bank_details", "offer_letter", "photo"]
         default_tasks = []
         for cat, t_list in DEFAULT_ONBOARDING_TASKS.items():
             for t_title in t_list:

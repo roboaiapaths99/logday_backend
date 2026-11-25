@@ -29,6 +29,7 @@ ALL_FEATURES = [
     {"id": "territory", "label": "Territory Management", "category": "Field Force", "icon": "📍"},
     {"id": "nudge", "label": "Nudge Center", "category": "Field Force", "icon": "⚡"},
     {"id": "leaderboard", "label": "Team Leaderboard", "category": "Field Force", "icon": "🏆"},
+    {"id": "flyfield", "label": "FlyField Operations", "category": "Field Force", "icon": "🛰️"},
 
     # HRMS
     {"id": "onboarding", "label": "Onboarding", "category": "HRMS", "icon": "🚀"},

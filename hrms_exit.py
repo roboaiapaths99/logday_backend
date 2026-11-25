@@ -527,12 +527,13 @@ async def apply_my_resignation(req: dict, employee=Depends(get_current_employee)
     import copy
     clearances = copy.deepcopy(DEFAULT_CLEARANCES)
     
-    last_working_day = req.get("last_working_day") or datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    reason = req.get("reason", "Resignation")
-    handover_notes = req.get("handover_notes", "")
+    last_working_day = req.get("last_working_day") or req.get("proposed_lwd") or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    reason = req.get("reason") or req.get("exit_reason") or "Resignation"
+    handover_notes = req.get("handover_notes") or req.get("notes") or ""
+    now_iso = datetime.now(timezone.utc).isoformat()
 
     new_exit = {
-        "employee_id": str(employee.get("_id", "")),
+        "employee_id": employee.get("employee_id") or str(employee.get("_id", "")),
         "employee_name": employee.get("full_name") or employee.get("name", "Employee"),
         "employee_email": clean_email,
         "organization_id": org_id,
@@ -541,12 +542,24 @@ async def apply_my_resignation(req: dict, employee=Depends(get_current_employee)
         "joining_date": employee.get("date_of_joining") or employee.get("joining_date") or "N/A",
         "resignation_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
         "last_working_day": last_working_day,
+        "notice_period_days": 30,
+        "notice_served_days": 30,
+        "exit_reason": reason,
         "reason": reason,
         "handover_notes": handover_notes,
         "status": ExitStatus.PENDING,
         "progress": 0.0,
+        "assigned_to": "",
         "clearances": clearances,
         "final_settlement": {
+            "calculated": False,
+            "salary_dues": 0.0,
+            "leave_encashment": 0.0,
+            "bonus_due": 0.0,
+            "gratuity": 0.0,
+            "notice_period_recovery": 0.0,
+            "other_deductions": 0.0,
+            "total_payable": 0.0,
             "gross_payable": 0.0,
             "deductions": 0.0,
             "net_payable": 0.0,
@@ -555,11 +568,17 @@ async def apply_my_resignation(req: dict, employee=Depends(get_current_employee)
         },
         "exit_interview": {
             "conducted": False,
+            "interviewer": None,
             "date": None,
-            "feedback": None
+            "reason_for_leaving": None,
+            "feedback": None,
+            "would_rejoin": None,
+            "improvement_suggestions": None
         },
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "updated_at": datetime.now(timezone.utc).isoformat()
+        "documents_issued": [],
+        "created_at": now_iso,
+        "updated_at": now_iso,
+        "created_by": clean_email
     }
     
     res = await exit_managements_collection.insert_one(new_exit)
