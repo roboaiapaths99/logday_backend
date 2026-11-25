@@ -298,33 +298,7 @@ async def general_exception_handler(request: Request, exc: Exception):
     return response
 
 # --- STARTUP EVENT ---
-@app.on_event("startup")
-async def startup_event():
-    """Ensure database indexes are present for performance optimization."""
-    # Each index op is isolated so a MongoDB SSL/network issue won't crash startup
-    index_ops = [
-        ("employees_email", employees_collection, [("email", 1)], {"unique": True, "sparse": True, "background": True}),
-        ("attendance_logs", attendance_logs_collection, [("user_id", 1), ("timestamp", -1)], {"background": True}),
-        ("visit_plans", visit_plans_collection, [("employee_id", 1), ("status", 1)], {"background": True}),
-        ("visit_logs", visit_logs_collection, [("employee_id", 1), ("timestamp", -1)], {"background": True}),
-        ("location_pings", location_pings_collection, [("employee_id", 1), ("recorded_at", -1)], {"background": True}),
-        ("km_reimbursements", km_reimbursements_collection, [("employee_id", 1), ("date", -1)], {"background": True}),
-    ]
-    for name, col, keys, kwargs in index_ops:
-        try:
-            await col.create_index(keys, **kwargs)
-        except Exception as e:
-            logger.warning(f"Index '{name}' skipped (non-fatal): {type(e).__name__}: {str(e)[:60]}")
-
-    # Scheduler startup
-    try:
-        if not scheduler.running:
-            scheduler.start()
-        logger.info("Scheduler started successfully.")
-    except Exception as e:
-        logger.warning(f"Scheduler startup failed (non-fatal): {e}")
-
-    logger.info(f"Application startup complete. ENV={APP_ENV}")
+# (Consolidated into startup_db_client below so all indexes and APScheduler jobs register cleanly in one pass)
 
 # --- HEALTH CHECK ENDPOINT ---
 # (Moved to line 284 for consolidation)
@@ -662,7 +636,7 @@ async def purge_old_screenshots():
 
 @app.on_event("startup")
 async def startup_db_client():
-    """Create indexes on startup (non-fatal if DB is temporarily unreachable)."""
+    """Create indexes and start background scheduler jobs on startup (non-fatal if DB is temporarily unreachable)."""
     # WFH & Employee indexes
     try:
         await ensure_employee_indexes()
@@ -671,14 +645,16 @@ async def startup_db_client():
 
     # Core & GIS Indexes with isolated error handling so one failure never blocks others
     db_indexes = [
-        (employees_collection, "email", {"unique": True, "sparse": True}),
         (employees_collection, "employee_id", {}),
         (attendance_logs_collection, [("user_id", 1), ("timestamp", -1)], {}),
         (employees_collection, "organization_id", {}),
         (attendance_logs_collection, "organization_id", {}),
+        (visit_plans_collection, [("employee_id", 1), ("status", 1)], {}),
+        (visit_logs_collection, [("employee_id", 1), ("timestamp", -1)], {}),
+        (visit_logs_collection, [("check_in_location", "2dsphere")], {}),
         (location_pings_collection, [("location", "2dsphere")], {}),
         (location_pings_collection, [("employee_id", 1), ("recorded_at", -1)], {}),
-        (visit_logs_collection, [("check_in_location", "2dsphere")], {}),
+        (km_reimbursements_collection, [("employee_id", 1), ("date", -1)], {}),
         (otps_collection, "expires_at", {"expireAfterSeconds": 0}),
     ]
     for col, keys, kwargs in db_indexes:
@@ -688,16 +664,17 @@ async def startup_db_client():
             logger.warning(f"Index creation skipped ({keys}): {type(e).__name__}: {str(e)[:80]}")
     logger.info("MongoDB Enterprise & GIS Indexes checked/created.")
 
-    # Start Scheduler
+    # Register & Start Scheduler Jobs
     try:
+        scheduler.add_job(check_missed_visits, "interval", hours=1, id="check_missed_visits", replace_existing=True)
+        scheduler.add_job(purge_old_screenshots, "cron", hour=2, minute=0, id="purge_old_screenshots", replace_existing=True)
         if not scheduler.running:
-            scheduler.add_job(check_missed_visits, 'interval', hours=1)
-            scheduler.add_job(purge_old_screenshots, 'cron', hour=2, minute=0)
             scheduler.start()
         logger.info("APScheduler started: check_missed_visits scheduled hourly, purge_old_screenshots daily at 2 AM.")
     except Exception as e:
-        logger.warning(f"Scheduler already running or failed to start: {e}")
-    
+        logger.warning(f"Scheduler startup warning: {e}")
+
+    logger.info(f"Application startup complete. ENV={APP_ENV}")
     print("Startup complete.")
 
 

@@ -66,7 +66,9 @@ async def ensure_employee_indexes():
     # Core employee indexes
     await employees_collection.create_index("checked_in")
     await employees_collection.create_index("session_id")
-    await employees_collection.create_index("email", unique=True, sparse=True)
+    existing_emp_indexes = await employees_collection.index_information()
+    if "email_1" not in existing_emp_indexes and "employees_email" not in existing_emp_indexes:
+        await employees_collection.create_index("email", unique=True, sparse=True)
     await employees_collection.create_index([("organization_id", 1), ("employee_type", 1)])
 
     # WFH Sessions: queries by employee_id+status, and by email+status

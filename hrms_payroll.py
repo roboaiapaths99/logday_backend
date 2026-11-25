@@ -1515,7 +1515,6 @@ def _resolve_company_logo_source(p: Optional[dict] = None) -> Any:
     candidates = [
         os.path.join(base_dir, "uploads", "logos", "logday_logo.png"),
         os.path.abspath(os.path.join(base_dir, "..", "attendence_inofice__admin_desk", "public", "logday_logo.png")),
-        os.path.join(base_dir, "uploads", "logos", "technula_logo.png"),
     ]
     for path in candidates:
         if os.path.exists(path):
@@ -1825,6 +1824,7 @@ async def _dispatch_single_payslip(p: dict, current_admin: Admin) -> dict:
     smtp_cfg = await _get_org_smtp_config(org_id)
 
     email_sent = False
+    delivery_error = None
     delivery_note = ""
     if smtp_cfg["configured"]:
         email_sent, delivery_note = await run_in_threadpool(
@@ -1836,6 +1836,8 @@ async def _dispatch_single_payslip(p: dict, current_admin: Admin) -> dict:
             pdf_bytes,
             pdf_filename,
         )
+        if not email_sent:
+            delivery_error = delivery_note
     else:
         delivery_note = f"Published to {to_email}'s LogDay app Payslips hub (Configure Brevo email settings to also send external email)."
 
@@ -1846,12 +1848,14 @@ async def _dispatch_single_payslip(p: dict, current_admin: Admin) -> dict:
 
     update_doc = {
         "status": new_status,
-        "email_sent": True,
-        "smtp_delivered": email_sent,
+        "published_in_app": True,
+        "email_sent": bool(email_sent),
+        "smtp_delivered": bool(email_sent),
         "last_sent_at": now_utc.isoformat(),
         "sent_to_email": to_email,
         "sent_by": current_admin.email,
         "delivery_note": delivery_note,
+        "delivery_error": delivery_error,
     }
     if not p.get("approved_by"):
         update_doc["approved_by"] = current_admin.email
@@ -1868,7 +1872,7 @@ async def _dispatch_single_payslip(p: dict, current_admin: Admin) -> dict:
             "type": "SALARY_SLIP_RELEASED",
             "severity": "low",
             "status": "pending",
-            "details": f"Your salary slip for {month_str} (Net Payout: ₹{net_amt:,.2f}) has been sent to {to_email} and is ready for download.",
+            "details": f"Your salary slip for {month_str} (Net Payout: ₹{net_amt:,.2f}) has been released to {to_email} and is ready for download.",
             "timestamp": now_utc,
             "created_at": now_utc,
         })
@@ -1878,9 +1882,12 @@ async def _dispatch_single_payslip(p: dict, current_admin: Admin) -> dict:
     return {
         "payroll_id": str(p["_id"]),
         "sent_to": to_email,
-        "email_sent": True,
-        "smtp_delivered": email_sent,
+        "published_in_app": True,
+        "email_sent": bool(email_sent),
+        "smtp_delivered": bool(email_sent),
         "smtp_configured": smtp_cfg["configured"],
+        "provider": smtp_cfg.get("provider", "none"),
+        "delivery_error": delivery_error,
         "status": new_status,
         "message": delivery_note,
     }
@@ -1949,18 +1956,27 @@ async def bulk_send_payrolls_to_employees(payload: Any = Body(...), current_admi
 
     sent_count = 0
     smtp_count = 0
+    failed_count = 0
     results = []
     for rec in records:
         res = await _dispatch_single_payslip(rec, current_admin)
         sent_count += 1
         if res.get("smtp_delivered"):
             smtp_count += 1
+        elif res.get("smtp_configured"):
+            failed_count += 1
         results.append(res)
 
+    msg = f"Processed {sent_count} salary slips ({smtp_count} emailed via Brevo, {sent_count} published in-app"
+    if failed_count:
+        msg += f", {failed_count} email delivery failed"
+    msg += ")."
+
     return {
-        "message": f"Sent {sent_count} salary slips to employee login emails ({smtp_count} delivered via SMTP, {sent_count} published in-app).",
+        "message": msg,
         "sent_count": sent_count,
         "smtp_delivered_count": smtp_count,
+        "failed_count": failed_count,
         "results": results,
     }
 
