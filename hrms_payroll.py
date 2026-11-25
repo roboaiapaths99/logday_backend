@@ -1,9 +1,11 @@
 import base64
 import calendar
 import io
+import json
 import os
 import smtplib
 import ssl
+import urllib.error
 import urllib.request
 from datetime import datetime, timezone, timedelta
 from email.message import EmailMessage
@@ -733,78 +735,135 @@ async def save_days_off(req: DaysOffSaveRequest, current_admin: Admin = Depends(
     return {"message": "Days off saved successfully", "days_off": req.days_off}
 
 
+MASKED_SECRET = "••••••••"
+DEFAULT_SENDER_NAME = "LogDay Payroll & HR"
+
+
 async def _get_org_smtp_config(org_id: str) -> dict:
-    """Resolve SMTP settings from organization settings in DB or environment variables."""
+    """Resolve email delivery settings (Brevo first, SMTP as legacy fallback) from DB or environment."""
     settings_doc = await settings_collection.find_one({"organization_id": org_id})
     if not settings_doc and org_id != "system_org":
         settings_doc = await settings_collection.find_one({"organization_id": "system_org"})
     smtp_db = (settings_doc or {}).get("smtp_config") or {}
 
-    host = smtp_db.get("smtp_host") or os.getenv("SMTP_HOST", "smtp.gmail.com")
+    # --- Brevo (primary) ---
+    brevo_api_key = smtp_db.get("brevo_api_key") or os.getenv("BREVO_API_KEY", "")
+    brevo_sender_email = (
+        smtp_db.get("brevo_sender_email")
+        or os.getenv("BREVO_SENDER_EMAIL")
+        or smtp_db.get("smtp_from_email")
+        or ""
+    )
+    brevo_sender_name = (
+        smtp_db.get("brevo_sender_name")
+        or os.getenv("BREVO_SENDER_NAME")
+        or smtp_db.get("smtp_from_name")
+        or DEFAULT_SENDER_NAME
+    )
+    brevo_ready = bool(brevo_api_key and brevo_sender_email)
+
+    # --- Legacy SMTP (fallback, env or old DB config) ---
+    host = smtp_db.get("smtp_host") or os.getenv("SMTP_HOST", "")
     port = int(smtp_db.get("smtp_port") or os.getenv("SMTP_PORT", "587"))
     user = smtp_db.get("smtp_user") or os.getenv("SMTP_USER", "")
     password = smtp_db.get("smtp_password") or os.getenv("SMTP_PASSWORD") or os.getenv("SMTP_PASS", "")
     from_email = smtp_db.get("smtp_from_email") or os.getenv("SMTP_FROM_EMAIL") or user
-    from_name = smtp_db.get("smtp_from_name") or os.getenv("SMTP_FROM_NAME", "LogDay Payroll & HR")
+    from_name = smtp_db.get("smtp_from_name") or os.getenv("SMTP_FROM_NAME", DEFAULT_SENDER_NAME)
+    smtp_ready = bool(host and user and password)
+
+    provider = "brevo" if brevo_ready else ("smtp" if smtp_ready else "none")
 
     return {
+        "provider": provider,
+        "brevo_api_key": brevo_api_key,
+        "brevo_sender_email": brevo_sender_email,
+        "brevo_sender_name": brevo_sender_name,
         "smtp_host": host,
         "smtp_port": port,
         "smtp_user": user,
         "smtp_password": password,
         "smtp_from_email": from_email,
         "smtp_from_name": from_name,
-        "configured": bool(host and user and password),
+        "configured": provider != "none",
+    }
+
+
+def _public_email_settings(cfg: dict) -> dict:
+    """Email settings safe to return to the admin UI (no secrets)."""
+    return {
+        "provider": cfg["provider"],
+        "brevo_sender_email": cfg["brevo_sender_email"],
+        "brevo_sender_name": cfg["brevo_sender_name"],
+        "has_brevo_api_key": bool(cfg["brevo_api_key"]),
+        "configured": cfg["configured"],
     }
 
 
 @router.get("/smtp-settings")
 async def get_payroll_smtp_settings(current_admin: Admin = Depends(get_current_admin)):
-    """Fetch current SMTP configuration status for sending salary slips via email."""
+    """Fetch current email (Brevo) configuration status for sending salary slips."""
     org_id = current_admin.organization_id or "system_org"
     cfg = await _get_org_smtp_config(org_id)
-    return {
-        "smtp_host": cfg["smtp_host"],
-        "smtp_port": cfg["smtp_port"],
-        "smtp_user": cfg["smtp_user"],
-        "smtp_from_email": cfg["smtp_from_email"],
-        "smtp_from_name": cfg["smtp_from_name"],
-        "configured": cfg["configured"],
-        "has_password": bool(cfg["smtp_password"]),
-    }
+    return _public_email_settings(cfg)
 
 
 @router.post("/smtp-settings")
 async def save_payroll_smtp_settings(req: dict, current_admin: Admin = Depends(get_current_admin)):
-    """Save SMTP configuration for sending salary slips to employee login emails."""
+    """Save Brevo email configuration for sending salary slips to employee login emails."""
     org_id = current_admin.organization_id or "system_org"
-    existing = await _get_org_smtp_config(org_id)
+    settings_doc = await settings_collection.find_one({"organization_id": org_id}) or {}
+    stored = settings_doc.get("smtp_config") or {}
 
-    new_password = req.get("smtp_password")
-    if not new_password or new_password == "••••••••":
-        new_password = existing.get("smtp_password", "")
+    new_key = (req.get("brevo_api_key") or "").strip()
+    if not new_key or new_key == MASKED_SECRET:
+        new_key = stored.get("brevo_api_key", "")
 
-    smtp_config = {
-        "smtp_host": (req.get("smtp_host") or "smtp.gmail.com").strip(),
-        "smtp_port": int(req.get("smtp_port") or 587),
-        "smtp_user": (req.get("smtp_user") or "").strip(),
-        "smtp_password": new_password.strip(),
-        "smtp_from_email": (req.get("smtp_from_email") or req.get("smtp_user") or "").strip(),
-        "smtp_from_name": (req.get("smtp_from_name") or "LogDay Payroll & HR").strip(),
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-        "updated_by": current_admin.email,
+    sender_email = (req.get("brevo_sender_email") or "").strip().lower()
+    if not sender_email:
+        raise HTTPException(status_code=400, detail="Sender email is required (must be a verified sender in Brevo).")
+    if not new_key and not os.getenv("BREVO_API_KEY"):
+        raise HTTPException(status_code=400, detail="Brevo API key is required.")
+
+    updates = {
+        "smtp_config.brevo_api_key": new_key,
+        "smtp_config.brevo_sender_email": sender_email,
+        "smtp_config.brevo_sender_name": (req.get("brevo_sender_name") or DEFAULT_SENDER_NAME).strip(),
+        "smtp_config.updated_at": datetime.now(timezone.utc).isoformat(),
+        "smtp_config.updated_by": current_admin.email,
     }
+    await settings_collection.update_one({"organization_id": org_id}, {"$set": updates}, upsert=True)
 
-    await settings_collection.update_one(
-        {"organization_id": org_id},
-        {"$set": {"smtp_config": smtp_config}},
-        upsert=True,
-    )
+    cfg = await _get_org_smtp_config(org_id)
     return {
         "status": "success",
-        "message": "Email (SMTP) settings saved successfully.",
-        "configured": bool(smtp_config["smtp_host"] and smtp_config["smtp_user"] and smtp_config["smtp_password"]),
+        "message": "Brevo email settings saved successfully.",
+        **_public_email_settings(cfg),
     }
+
+
+@router.post("/smtp-settings/test")
+async def test_payroll_email_settings(req: dict = Body(default={}), current_admin: Admin = Depends(get_current_admin)):
+    """Send a test email via the configured provider (defaults to the logged-in admin's email)."""
+    org_id = current_admin.organization_id or "system_org"
+    cfg = await _get_org_smtp_config(org_id)
+    if not cfg["configured"]:
+        raise HTTPException(status_code=400, detail="Email is not configured. Save your Brevo API key and sender email first.")
+
+    to_email = (req.get("to_email") or current_admin.email or "").strip().lower()
+    if not to_email:
+        raise HTTPException(status_code=400, detail="No recipient email for the test message.")
+
+    html = (
+        "<div style=\"font-family: Arial, sans-serif; font-size: 14px; color: #1e293b;\">"
+        "<p>This is a test email from <b>LogDay Payroll</b>.</p>"
+        "<p>If you received it, salary slips will be delivered to employees successfully.</p></div>"
+    )
+    ok, note = await run_in_threadpool(
+        _send_email_sync, cfg, to_email, "LogDay Payroll — Test Email", html, None, None
+    )
+    if not ok:
+        raise HTTPException(status_code=502, detail=note)
+    return {"status": "success", "message": f"Test email sent to {to_email} via {cfg['provider'].upper()}."}
 
 
 @router.get("/{id}")
@@ -1613,8 +1672,60 @@ def generate_payslip_pdf_bytes(p: dict) -> bytes:
     return buffer.getvalue()
 
 
-def _send_smtp_email_sync(smtp_cfg: dict, to_email: str, subject: str, html_body: str, pdf_bytes: bytes, pdf_filename: str) -> Tuple[bool, str]:
-    """Send salary slip email with PDF attachment over SMTP."""
+BREVO_API_URL = "https://api.brevo.com/v3/smtp/email"
+
+
+def _send_brevo_email_sync(cfg: dict, to_email: str, subject: str, html_body: str, pdf_bytes: Optional[bytes], pdf_filename: Optional[str]) -> Tuple[bool, str]:
+    """Send a transactional email (optionally with PDF attachment) through the Brevo API."""
+    payload = {
+        "sender": {"name": cfg["brevo_sender_name"], "email": cfg["brevo_sender_email"]},
+        "to": [{"email": to_email}],
+        "subject": subject,
+        "htmlContent": html_body,
+        "textContent": "Please view this email in an HTML-compatible email client. Your PDF salary slip is attached.",
+    }
+    if pdf_bytes:
+        payload["attachment"] = [{
+            "name": pdf_filename or "SalarySlip.pdf",
+            "content": base64.b64encode(pdf_bytes).decode("ascii"),
+        }]
+
+    req = urllib.request.Request(
+        BREVO_API_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        method="POST",
+        headers={
+            "api-key": cfg["brevo_api_key"],
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            body = json.loads(resp.read().decode("utf-8") or "{}")
+            return True, f"Emailed salary slip to {to_email} via Brevo (id: {body.get('messageId', 'n/a')})"
+    except urllib.error.HTTPError as e:
+        try:
+            err = json.loads(e.read().decode("utf-8") or "{}")
+            detail = err.get("message") or err.get("code") or str(e)
+        except Exception:
+            detail = str(e)
+        return False, f"Brevo delivery error ({e.code}): {detail}"
+    except Exception as e:
+        return False, f"Brevo delivery error: {str(e)}"
+
+
+def _send_email_sync(cfg: dict, to_email: str, subject: str, html_body: str, pdf_bytes: Optional[bytes], pdf_filename: Optional[str]) -> Tuple[bool, str]:
+    """Route email through Brevo (preferred) or legacy SMTP."""
+    if cfg.get("provider") == "brevo":
+        return _send_brevo_email_sync(cfg, to_email, subject, html_body, pdf_bytes, pdf_filename)
+    if cfg.get("provider") == "smtp":
+        return _send_smtp_email_sync(cfg, to_email, subject, html_body, pdf_bytes, pdf_filename)
+    return False, "Email provider is not configured."
+
+
+def _send_smtp_email_sync(smtp_cfg: dict, to_email: str, subject: str, html_body: str, pdf_bytes: Optional[bytes], pdf_filename: Optional[str]) -> Tuple[bool, str]:
+    """Send salary slip email with PDF attachment over SMTP (legacy fallback)."""
     try:
         msg = EmailMessage()
         msg["Subject"] = subject
@@ -1622,7 +1733,8 @@ def _send_smtp_email_sync(smtp_cfg: dict, to_email: str, subject: str, html_body
         msg["To"] = to_email
         msg.set_content("Please view this salary slip in an HTML-compatible email client. Your PDF salary slip is attached.")
         msg.add_alternative(html_body, subtype="html")
-        msg.add_attachment(pdf_bytes, maintype="application", subtype="pdf", filename=pdf_filename)
+        if pdf_bytes:
+            msg.add_attachment(pdf_bytes, maintype="application", subtype="pdf", filename=pdf_filename or "SalarySlip.pdf")
 
         host = smtp_cfg["smtp_host"]
         port = int(smtp_cfg["smtp_port"])
@@ -1716,7 +1828,7 @@ async def _dispatch_single_payslip(p: dict, current_admin: Admin) -> dict:
     delivery_note = ""
     if smtp_cfg["configured"]:
         email_sent, delivery_note = await run_in_threadpool(
-            _send_smtp_email_sync,
+            _send_email_sync,
             smtp_cfg,
             to_email,
             f"Salary Slip for {month_str} — {emp_name} (Rs. {net_amt:,.2f})",
@@ -1725,7 +1837,7 @@ async def _dispatch_single_payslip(p: dict, current_admin: Admin) -> dict:
             pdf_filename,
         )
     else:
-        delivery_note = f"Published to {to_email}'s LogDay app Payslips hub (Configure SMTP settings to also send external email)."
+        delivery_note = f"Published to {to_email}'s LogDay app Payslips hub (Configure Brevo email settings to also send external email)."
 
     now_utc = datetime.now(timezone.utc)
     new_status = p.get("status")
