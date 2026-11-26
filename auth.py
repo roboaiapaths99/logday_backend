@@ -31,6 +31,11 @@ ALGORITHM = os.getenv("ALGORITHM", "HS256")
 expire_minutes_str = str(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "43200")).split('#')[0].strip()
 ACCESS_TOKEN_EXPIRE_MINUTES = int(expire_minutes_str)
 
+import time
+from collections import defaultdict
+from fastapi import Request, HTTPException
+from fastapi.concurrency import run_in_threadpool
+
 def verify_password(plain_password, hashed_password):
     try:
         return ph.verify(hashed_password, plain_password)
@@ -43,6 +48,59 @@ def verify_password(plain_password, hashed_password):
 
 def get_password_hash(password):
     return ph.hash(password)
+
+async def verify_password_async(plain_password, hashed_password):
+    """Non-blocking Argon2 verification executed in a worker thread."""
+    return await run_in_threadpool(verify_password, plain_password, hashed_password)
+
+async def get_password_hash_async(password):
+    """Non-blocking Argon2 hashing executed in a worker thread."""
+    return await run_in_threadpool(get_password_hash, password)
+
+# ─── In-Memory Sliding-Window Brute-Force Login Rate Limiter ─────────────────
+_FAILED_LOGINS: dict[tuple[str, str], list[float]] = defaultdict(list)
+_LOGIN_WINDOW_SECONDS = 300  # 5 minutes
+_MAX_FAILED_ATTEMPTS = 15
+
+def _get_client_ip(request: Request) -> str:
+    if not request:
+        return "unknown"
+    xff = request.headers.get("x-forwarded-for")
+    if xff:
+        return xff.split(",")[0].strip()
+    if request.client and request.client.host:
+        return request.client.host
+    return "unknown"
+
+def check_login_rate_limit(request: Request, email: str):
+    """Raise HTTP 429 if this (ip, email) exceeded 15 failed login attempts in the last 5 minutes."""
+    ip = _get_client_ip(request)
+    key = (ip, (email or "").strip().lower())
+    now_ts = time.time()
+    attempts = [t for t in _FAILED_LOGINS.get(key, []) if now_ts - t < _LOGIN_WINDOW_SECONDS]
+    if attempts:
+        _FAILED_LOGINS[key] = attempts
+    elif key in _FAILED_LOGINS:
+        del _FAILED_LOGINS[key]
+    if len(attempts) >= _MAX_FAILED_ATTEMPTS:
+        logger.warning(f"[SECURITY] Brute-force rate limit triggered for email='{key[1]}' from IP={ip}")
+        raise HTTPException(
+            status_code=429,
+            detail="Too many failed login attempts. Please wait 5 minutes before trying again."
+        )
+
+def record_failed_login(request: Request, email: str):
+    ip = _get_client_ip(request)
+    key = (ip, (email or "").strip().lower())
+    now_ts = time.time()
+    attempts = [t for t in _FAILED_LOGINS.get(key, []) if now_ts - t < _LOGIN_WINDOW_SECONDS]
+    attempts.append(now_ts)
+    _FAILED_LOGINS[key] = attempts
+
+def clear_failed_logins(request: Request, email: str):
+    ip = _get_client_ip(request)
+    key = (ip, (email or "").strip().lower())
+    _FAILED_LOGINS.pop(key, None)
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode = data.copy()
@@ -106,8 +164,8 @@ async def get_current_admin(request: Request, token: str = Depends(admin_oauth2_
         path = request.url.path
         
         # 1. Attendance & Dashboard
-        if path.startswith("/admin/stats") or path.startswith("/admin/me"):
-            if "dashboard" not in allowed:
+        if path.startswith("/admin/stats") or path.startswith("/admin/me") or path.startswith("/admin/system/diagnostics"):
+            if "dashboard" not in allowed and "settings" not in allowed:
                 raise HTTPException(403, "Access denied for 'dashboard'")
                 
         elif path.startswith("/admin/logs") or path.startswith("/admin/attendance") or path.startswith("/admin/live-feed") or path.startswith("/admin/export-logs"):

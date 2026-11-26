@@ -177,7 +177,7 @@ async def _has_approved_leave_today(emp: dict, today_str: str) -> bool:
 async def _get_remaining_paid_leaves(email: str, org_id: str, today_str: str) -> float:
     """Calculate the employee's remaining paid leave balance (Total Leave remaining)."""
     try:
-        from main import calculate_leave_balance
+        from services.common_helpers import calculate_leave_balance
         year = int(today_str[:4])
         month = today_str[:7]
         bal = await calculate_leave_balance(email, org_id, year=year, month=month)

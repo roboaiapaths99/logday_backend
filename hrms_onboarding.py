@@ -539,17 +539,19 @@ async def auto_verify_document_file(filepath: str, doc_type: str, employee: dict
         return False, "Unsupported file format for auto-verification.", {}
         
     extracted_text = ""
-    # Try calling OCR.space API
+    # Try calling OCR.space API in threadpool so it never blocks the async event loop
     try:
+        from fastapi.concurrency import run_in_threadpool
         url = "https://api.ocr.space/parse/image"
-        with open(filepath, 'rb') as f:
-            # OCR.space supports PDF, PNG, JPG
-            r = requests.post(
-                url, 
-                files={"file": f}, 
-                data={"apikey": "helloworld", "language": "eng"},
-                timeout=10
-            )
+        def _post_ocr_space():
+            with open(filepath, 'rb') as f:
+                return requests.post(
+                    url,
+                    files={"file": f},
+                    data={"apikey": "helloworld", "language": "eng"},
+                    timeout=10
+                )
+        r = await run_in_threadpool(_post_ocr_space)
         if r.status_code == 200:
             res = r.json()
             parsed_results = res.get("ParsedResults", [])
@@ -1131,7 +1133,8 @@ async def upload_document_ocr(
             except Exception:
                 raise HTTPException(status_code=400, detail="Could not resolve file_url host")
             try:
-                r = requests.get(file_url, timeout=10)
+                from fastapi.concurrency import run_in_threadpool
+                r = await run_in_threadpool(requests.get, file_url, timeout=10)
                 if r.status_code == 200:
                     image_data = r.content
                 else:
@@ -1142,7 +1145,8 @@ async def upload_document_ocr(
                  raise HTTPException(status_code=400, detail=f"Error downloading image: {e}")
 
     try:
-        ocr_result = process_document_ocr(image_data, doc_type)
+        from fastapi.concurrency import run_in_threadpool
+        ocr_result = await run_in_threadpool(process_document_ocr, image_data, doc_type)
     except Exception as e:
          raise HTTPException(status_code=500, detail=f"OCR analysis failed: {e}")
 

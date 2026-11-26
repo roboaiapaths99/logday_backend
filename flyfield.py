@@ -654,14 +654,40 @@ async def get_admin_flyfield_live(admin = Depends(get_current_admin)):
     idle_count = 0
     on_visit_count = 0
 
+    agent_emails = [a["email"] for a in agents if a.get("email")]
+
+    # Batch-fetch 1: Today's attendance logs for all FlyField agents in one query
+    all_today_logs = await attendance_logs_collection.find({
+        "email": {"$in": agent_emails},
+        "timestamp": {"$gte": today_start_utc, "$lt": today_end_utc}
+    }).sort("timestamp", 1).to_list(length=5000) if agent_emails else []
+    logs_by_email = {}
+    for l_doc in all_today_logs:
+        logs_by_email.setdefault(l_doc.get("email"), []).append(l_doc)
+
+    # Batch-fetch 2: Today's FlyField visits for all agents in one query
+    all_today_visits = await visit_logs_collection.find({
+        "employee_email": {"$in": agent_emails},
+        "date": today_str,
+        "visit_mode": "flyfield"
+    }).to_list(length=10000) if agent_emails else []
+    visits_by_email = {}
+    for v_doc in all_today_visits:
+        visits_by_email.setdefault(v_doc.get("employee_email"), []).append(v_doc)
+
+    # Batch-fetch 3: Latest location ping per agent in a single aggregation
+    latest_pings_agg = await location_pings_collection.aggregate([
+        {"$match": {"employee_id": {"$in": agent_emails}}},
+        {"$sort": {"recorded_at": -1}},
+        {"$group": {"_id": "$employee_id", "doc": {"$first": "$$ROOT"}}}
+    ]).to_list(length=len(agent_emails)) if agent_emails else []
+    last_ping_by_email = {item["_id"]: item["doc"] for item in latest_pings_agg if item.get("_id") and item.get("doc")}
+
     for agent in agents:
         email = agent["email"]
 
-        # 1. Today's attendance
-        today_logs = await attendance_logs_collection.find({
-            "email": email,
-            "timestamp": {"$gte": today_start_utc, "$lt": today_end_utc}
-        }).sort("timestamp", 1).to_list(length=10)
+        # 1. Today's attendance (from pre-fetched map)
+        today_logs = logs_by_email.get(email, [])
 
         in_log = next((l for l in today_logs if l.get("type") in ["check-in", "IN"]), None)
         out_log = next((l for l in reversed(today_logs) if l.get("type") in ["check-out", "OUT"]), None)
@@ -672,21 +698,14 @@ async def get_admin_flyfield_live(admin = Depends(get_current_admin)):
         elif in_log and out_log:
             day_status = "Day Ended"
 
-        # 2. Today's visits
-        visits = await visit_logs_collection.find({
-            "employee_email": email,
-            "date": today_str,
-            "visit_mode": "flyfield"
-        }).to_list(length=100)
+        # 2. Today's visits (from pre-fetched map)
+        visits = visits_by_email.get(email, [])
 
         active_visit = next((v for v in visits if v.get("status") == "in_progress"), None)
         completed_visits_count = sum(1 for v in visits if v.get("status") == "completed")
 
         # 3. Latest Location Ping with fallbacks to active/recent visits and attendance
-        last_ping = await location_pings_collection.find_one(
-            {"employee_id": email},
-            sort=[("recorded_at", -1)]
-        )
+        last_ping = last_ping_by_email.get(email)
 
         lat = agent.get("territory_center_lat", 0.0)
         lng = agent.get("territory_center_lng", 0.0)
