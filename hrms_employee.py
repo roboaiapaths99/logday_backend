@@ -38,33 +38,32 @@ if not os.path.exists(ONBOARDING_UPLOAD_DIR):
 
 @router.get("/salary-structure")
 async def get_salary_structure(employee=Depends(get_current_employee)):
-    """Fetch current salary structure details."""
-    salary = employee.get("salary_structure")
-    if not salary:
-        from database import salary_structures_collection
-        sal_doc = await salary_structures_collection.find_one({"employee_email": employee["email"]})
-        if sal_doc:
-            sal_doc["_id"] = str(sal_doc["_id"])
-            return sal_doc
-        return {
-            "ctc": 0.0,
-            "monthly_salary": 0.0,
-            "basic_salary": 0.0,
-            "hra": 0.0,
-            "special_allowance": 0.0,
-            "bank_name": "Not Configured",
-            "bank_account": "•••• ••••",
-            "bank_ifsc": "N/A"
-        }
-    return salary
+    """Fetch current salary structure details, falling back to _resolve_employee_salary_structure or latest payroll."""
+    from hrms_payroll import _resolve_employee_salary_structure
+    clean_email = (employee.get("email") or "").strip().lower()
+    sal = await _resolve_employee_salary_structure(employee)
+    if not sal.get("ctc"):
+        latest_p = await payrolls_collection.find_one(
+            {"employee_email": clean_email},
+            sort=[("payroll_month", -1)]
+        )
+        if latest_p and latest_p.get("ctc"):
+            sal["ctc"] = float(latest_p.get("ctc", 0.0))
+            sal["monthly_salary"] = float(latest_p.get("monthly_salary") or round(sal["ctc"] / 12.0, 2))
+            sal["basic_salary"] = float(latest_p.get("basic_salary") or round(sal["monthly_salary"] * 0.40, 2))
+            sal["hra"] = float(latest_p.get("hra") or round(sal["basic_salary"] * 0.50, 2))
+            sal["special_allowance"] = float(latest_p.get("special_allowance") or max(0.0, round(sal["monthly_salary"] - sal["basic_salary"] - sal["hra"], 2)))
+    if "_id" in sal:
+        sal["_id"] = str(sal["_id"])
+    return sal
 
 
 @router.get("/payslips")
 async def get_my_payslips(employee=Depends(get_current_employee)):
-    """List all processed monthly payslips (LOCKED or PAID status)."""
+    """List all processed monthly payslips (APPROVED, LOCKED, or PAID status)."""
+    clean_email = (employee.get("email") or "").strip().lower()
     cursor = payrolls_collection.find({
-        "employee_email": employee["email"],
-        "organization_id": employee["organization_id"],
+        "employee_email": {"$in": [clean_email, employee.get("email", "")]},
         "status": {"$in": ["locked", "paid", "approved", "processed"]}
     }).sort("payroll_month", -1)
     
@@ -82,10 +81,10 @@ async def download_payslip_pdf(id: str, employee=Depends(get_current_employee)):
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid ID format")
 
+    clean_email = (employee.get("email") or "").strip().lower()
     p = await payrolls_collection.find_one({
         "_id": obj_id,
-        "employee_email": employee["email"],
-        "organization_id": employee["organization_id"]
+        "employee_email": {"$in": [clean_email, employee.get("email", "")]}
     })
     if not p:
         raise HTTPException(status_code=404, detail="Payslip record not found.")

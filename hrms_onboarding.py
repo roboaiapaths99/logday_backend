@@ -640,12 +640,13 @@ async def auto_verify_document_file(filepath: str, doc_type: str, employee: dict
 @router.get("/documents/all")
 async def get_all_documents(
     status: Optional[str] = None,
+    source: Optional[str] = None,
     summary: Optional[bool] = None,
     current_admin: Admin = Depends(get_current_admin)
 ):
     """
     Get all onboarding documents for all employees in the admin's organization.
-    Filters: status (pending, verified, rejected)
+    Filters: status (pending, verified, rejected), source (digilocker, ocr, manual)
     """
     from permissions import require_feature
     # Server-side sub-admin feature control check
@@ -660,22 +661,25 @@ async def get_all_documents(
         digilocker_verified = 0
         ocr_pending = 0
         manual_pending = 0
+        verified_docs = 0
         rejected_docs = 0
 
         for onb in onboardings:
             docs = onb.get("documents_submitted", [])
             for doc in docs:
                 total_docs += 1
-                source = doc.get("verification_source", "manual")
-                doc_status = doc.get("status", "pending")
+                raw_source = str(doc.get("verification_source", "manual")).lower()
+                doc_status = "verified" if doc.get("verified") else str(doc.get("status", "pending")).lower()
                 
-                if source == "digilocker":
+                if doc_status == "verified":
+                    verified_docs += 1
+                if raw_source in ("digilocker", "digilocker_sandbox"):
                     digilocker_verified += 1
-                elif source == "ocr" and doc_status == "pending_review":
+                elif raw_source == "ocr" and doc_status in ("pending", "pending_review", "review"):
                     ocr_pending += 1
                 elif doc_status == "rejected":
                     rejected_docs += 1
-                elif doc_status == "pending":
+                elif doc_status in ("pending", "pending_review", "review"):
                     manual_pending += 1
                     
         return {
@@ -683,7 +687,16 @@ async def get_all_documents(
             "digilocker_verified": digilocker_verified,
             "ocr_pending_review": ocr_pending,
             "manual_pending": manual_pending,
-            "rejected": rejected_docs
+            "verified": verified_docs,
+            "rejected": rejected_docs,
+            "stats": {
+                "total": total_docs,
+                "digilocker": digilocker_verified,
+                "ocr_pending": ocr_pending,
+                "manual_pending": manual_pending,
+                "verified": verified_docs,
+                "rejected": rejected_docs
+            }
         }
 
     results = []
@@ -692,19 +705,35 @@ async def get_all_documents(
         emp_docs = []
         for doc in docs:
             doc_status = "verified" if doc.get("verified") else doc.get("status", "pending")
+            raw_source = str(doc.get("verification_source", "manual")).lower()
+            norm_source = (
+                "digilocker" if raw_source in ("digilocker", "digilocker_sandbox")
+                else ("ocr" if raw_source == "ocr" else "manual")
+            )
             
-            if status and doc_status != status:
+            if status:
+                if status == "pending" and doc_status not in ("pending", "pending_review", "review"):
+                    continue
+                elif status != "pending" and doc_status != status:
+                    continue
+
+            if source and norm_source != source.lower():
                 continue
                 
+            dtype = doc.get("type") or doc.get("doc_type") or doc.get("document_type")
             emp_docs.append({
-                "doc_id": doc.get("type"),
-                "doc_type": doc.get("type"),
+                "id": dtype,
+                "_id": dtype,
+                "doc_id": dtype,
+                "doc_type": dtype,
+                "document_type": dtype,
                 "file_url": doc.get("file_url"),
                 "status": doc_status,
-                "verification_source": doc.get("verification_source", "manual"),
+                "verification_source": norm_source,
+                "raw_verification_source": raw_source,
                 "digilocker_uri": doc.get("digilocker_uri"),
                 "digilocker_data": doc.get("digilocker_data"),
-                "ocr_data": doc.get("ocr_data"),
+                "ocr_data": doc.get("ocr_data") or doc.get("extracted_details"),
                 "ocr_confidence": doc.get("ocr_confidence"),
                 "submitted_at": doc.get("submitted_at"),
                 "verified_by": doc.get("verified_by"),
@@ -712,7 +741,7 @@ async def get_all_documents(
                 "rejection_reason": doc.get("rejection_reason"),
             })
             
-        if emp_docs or not status:
+        if emp_docs or (not status and not source):
             results.append({
                 "employee_id": str(onb["_id"]),
                 "employee_name": onb.get("employee_name"),
@@ -748,15 +777,19 @@ async def get_employee_documents(
     formatted_docs = []
     for doc in docs:
         doc_status = "verified" if doc.get("verified") else doc.get("status", "pending")
+        dtype = doc.get("type") or doc.get("doc_type") or doc.get("document_type")
         formatted_docs.append({
-            "doc_id": doc.get("type"),
-            "doc_type": doc.get("type"),
+            "id": dtype,
+            "_id": dtype,
+            "doc_id": dtype,
+            "doc_type": dtype,
+            "document_type": dtype,
             "file_url": doc.get("file_url"),
             "status": doc_status,
             "verification_source": doc.get("verification_source", "manual"),
             "digilocker_uri": doc.get("digilocker_uri"),
             "digilocker_data": doc.get("digilocker_data"),
-            "ocr_data": doc.get("ocr_data"),
+            "ocr_data": doc.get("ocr_data") or doc.get("extracted_details"),
             "ocr_confidence": doc.get("ocr_confidence"),
             "submitted_at": doc.get("submitted_at"),
             "verified_by": doc.get("verified_by"),

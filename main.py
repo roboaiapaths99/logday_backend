@@ -118,6 +118,7 @@ from hrms_exit import router as exit_router, employee_exit_router
 from hrms_employee import router as employee_router
 from hrms_wfh import router as wfh_router
 from flyfield import router as flyfield_router
+from absence_alerts import router as absence_alerts_router, check_uninformed_absences_4pm
 
 app.include_router(onboarding_router)
 app.include_router(employee_onboarding_router)
@@ -127,6 +128,7 @@ app.include_router(employee_exit_router)
 app.include_router(employee_router)
 app.include_router(wfh_router)
 app.include_router(flyfield_router)
+app.include_router(absence_alerts_router)
 
 
 # Configure CORS - Allow all origins dynamically with regex for Web, Vercel, Electron & Mobile
@@ -540,16 +542,19 @@ async def delete_file_from_storage(image_url: str):
 async def check_missed_visits(force: bool = False):
     """
     Scheduled job to check for missed visits.
-    A visit is considered missed if it was approved for today but not checked in by 12:00 PM UTC (~5:30 PM IST).
+    A visit is considered missed if it was approved for today (in local org time, default IST +5:30)
+    but not checked in by 5:30 PM local time (12:00 PM UTC).
     """
     try:
         now = datetime.now(timezone.utc)
-        if not force and now.hour < 12:
+        local_now = now + timedelta(minutes=330)
+        if not force and local_now.hour < 17:
             return
 
         logger.info("Running scheduled job: check_missed_visits")
-        today_str = now.strftime("%Y-%m-%d")
-        day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        today_str = local_now.strftime("%Y-%m-%d")
+        local_day_start = datetime(local_now.year, local_now.month, local_now.day, 0, 0, 0, tzinfo=timezone.utc)
+        day_start = local_day_start - timedelta(minutes=330)
 
         approved_plans_cursor = visit_plans_collection.find({
             "date": today_str,
@@ -603,8 +608,6 @@ async def purge_old_screenshots():
     """Daily clean-up of expired screenshots from DB and local storage based on organization retention policy."""
     logger.info("Starting scheduled job: purge_old_screenshots")
     try:
-        import os
-        from bson import ObjectId
         orgs = await organizations_collection.find({}).to_list(length=1000)
         purged_count = 0
         now = datetime.now(timezone.utc)
@@ -612,7 +615,7 @@ async def purge_old_screenshots():
         for org in orgs:
             org_id = str(org["_id"])
             policy = org.get("wfh_policy", {}) or {}
-            retention_days = policy.get("screenshot_retention_days", 5)
+            retention_days = int(policy.get("screenshot_retention_days", 5) or 5)
             
             cutoff_date = now - timedelta(days=retention_days)
             query = {
@@ -620,14 +623,16 @@ async def purge_old_screenshots():
                 "timestamp": {"$lt": cutoff_date}
             }
             
-            cursor = wfh_screenshots_collection.find(query)
-            expired_screens = await cursor.to_list(length=1000)
-            
-            for screen in expired_screens:
-                image_url = screen.get("image_url", "")
-                await delete_file_from_storage(image_url)
-                await wfh_screenshots_collection.delete_one({"_id": screen["_id"]})
-                purged_count += 1
+            # Process in batches of 500 until all expired screenshots for this org are purged
+            for _ in range(20):
+                expired_screens = await wfh_screenshots_collection.find(query).to_list(length=500)
+                if not expired_screens:
+                    break
+                for screen in expired_screens:
+                    image_url = screen.get("image_url", "")
+                    await delete_file_from_storage(image_url)
+                    await wfh_screenshots_collection.delete_one({"_id": screen["_id"]})
+                    purged_count += 1
                 
         logger.info(f"Finished scheduled job: purge_old_screenshots. Purged {purged_count} screenshots.")
     except Exception as e:
@@ -668,9 +673,10 @@ async def startup_db_client():
     try:
         scheduler.add_job(check_missed_visits, "interval", hours=1, id="check_missed_visits", replace_existing=True)
         scheduler.add_job(purge_old_screenshots, "cron", hour=2, minute=0, id="purge_old_screenshots", replace_existing=True)
+        scheduler.add_job(check_uninformed_absences_4pm, "interval", minutes=5, id="check_uninformed_absences_4pm", replace_existing=True)
         if not scheduler.running:
             scheduler.start()
-        logger.info("APScheduler started: check_missed_visits scheduled hourly, purge_old_screenshots daily at 2 AM.")
+        logger.info("APScheduler started: check_missed_visits hourly, check_uninformed_absences_4pm every 5 mins, purge_old_screenshots daily at 2 AM.")
     except Exception as e:
         logger.warning(f"Scheduler startup warning: {e}")
 
@@ -1921,7 +1927,7 @@ async def smart_attendance(req: VerifyPresenceRequest, request: Request, backgro
                 })
                 if not active_session:
                     now_val = datetime.now(timezone.utc)
-                    today_val = now_val.strftime("%Y-%m-%d")
+                    today_val = today_date_str
                     session_doc = {
                         "employee_id": str(user["_id"]),
                         "employee_email": clean_email,
@@ -5786,9 +5792,11 @@ async def calculate_leave_balance(
         applied_half_day_dates = set()
 
         try:
-            m_start_utc = datetime.strptime(f"{month}-01", "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            local_m_start = datetime.strptime(f"{month}-01", "%Y-%m-%d").replace(tzinfo=timezone.utc)
             yr_int, mo_int = map(int, month.split("-"))
-            next_m_utc = datetime(yr_int + 1, 1, 1, tzinfo=timezone.utc) if mo_int == 12 else datetime(yr_int, mo_int + 1, 1, tzinfo=timezone.utc)
+            local_next_m = datetime(yr_int + 1, 1, 1, tzinfo=timezone.utc) if mo_int == 12 else datetime(yr_int, mo_int + 1, 1, tzinfo=timezone.utc)
+            m_start_utc = local_m_start - timedelta(minutes=tz_offset)
+            next_m_utc = local_next_m - timedelta(minutes=tz_offset)
 
             month_att_logs = await attendance_logs_collection.find({
                 "$or": [
@@ -5802,7 +5810,10 @@ async def calculate_leave_balance(
             for l in month_att_logs:
                 l_ts = l["timestamp"]
                 if l_ts.tzinfo is None: l_ts = l_ts.replace(tzinfo=timezone.utc)
-                l_date = (l_ts + timedelta(minutes=tz_offset)).strftime("%Y-%m-%d")
+                local_l_ts = l_ts + timedelta(minutes=tz_offset)
+                if local_l_ts.year != yr_int or local_l_ts.month != mo_int:
+                    continue
+                l_date = local_l_ts.strftime("%Y-%m-%d")
                 if l.get("is_short_leave") or l.get("attendance_status") == "Short Leave":
                     att_short_leave_dates.add(l_date)
                     short_leave_dates.add(l_date)
@@ -5821,13 +5832,13 @@ async def calculate_leave_balance(
             
             try:
                 c_dt = max(datetime.strptime(l_start[:10], "%Y-%m-%d"), datetime.strptime(f"{month}-01", "%Y-%m-%d"))
-                e_dt = min(datetime.strptime(l_end[:10], "%Y-%m-%d"), next_m_utc.replace(tzinfo=None) - timedelta(days=1))
+                e_dt = min(datetime.strptime(l_end[:10], "%Y-%m-%d"), local_next_m.replace(tzinfo=None) - timedelta(days=1))
                 while c_dt <= e_dt:
                     d_str = c_dt.strftime("%Y-%m-%d")
                     if dur_type == "short_leave":
                         applied_short_leave_dates.add(d_str)
                         short_leave_dates.add(d_str)
-                    elif dur_type in ["first_half", "second_half", "half_day"] or l.get("duration") == 0.5:
+                    elif (dur_type in ["first_half", "second_half", "half_day"] or l.get("duration") == 0.5) and not l.get("is_uninformed_absence_penalty"):
                         applied_half_day_dates.add(d_str)
                         half_day_dates.add(d_str)
                     c_dt += timedelta(days=1)
@@ -5877,9 +5888,11 @@ async def calculate_leave_balance(
 
         # Count attendance-based and applied short leaves / half days in target month
         try:
-            m_start_utc = datetime.strptime(f"{month}-01", "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            local_m_start = datetime.strptime(f"{month}-01", "%Y-%m-%d").replace(tzinfo=timezone.utc)
             yr_int, mo_int = map(int, month.split("-"))
-            next_m_utc = datetime(yr_int + 1, 1, 1, tzinfo=timezone.utc) if mo_int == 12 else datetime(yr_int, mo_int + 1, 1, tzinfo=timezone.utc)
+            local_next_m = datetime(yr_int + 1, 1, 1, tzinfo=timezone.utc) if mo_int == 12 else datetime(yr_int, mo_int + 1, 1, tzinfo=timezone.utc)
+            m_start_utc = local_m_start - timedelta(minutes=tz_offset)
+            next_m_utc = local_next_m - timedelta(minutes=tz_offset)
 
             att_short_leaves = await attendance_logs_collection.count_documents({
                 "$or": [
@@ -5904,7 +5917,7 @@ async def calculate_leave_balance(
             att_half_days = 0
 
         applied_short_leaves = sum(1 for l in leaves if str(l.get("duration_type", "")).lower().strip() == "short_leave" and str(l.get("start_date", "")).startswith(month))
-        applied_half_days = sum(1 for l in leaves if str(l.get("duration_type", "")).lower().strip() in ["first_half", "second_half", "half_day"] and str(l.get("start_date", "")).startswith(month))
+        applied_half_days = sum(1 for l in leaves if str(l.get("duration_type", "")).lower().strip() in ["first_half", "second_half", "half_day"] and not l.get("is_uninformed_absence_penalty") and str(l.get("start_date", "")).startswith(month))
 
         total_short_leaves = att_short_leaves + applied_short_leaves
         total_half_days = att_half_days + applied_half_days

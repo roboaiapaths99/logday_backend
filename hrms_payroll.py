@@ -91,7 +91,8 @@ def calculate_payslip_fields(ctc: float, working_days: int, present_days: float,
                              overtime_hours: float = 0.0, bonus: float = 0.0, other_earnings: float = 0.0,
                              reimbursements: float = 0.0,
                              loan_deductions: float = 0.0, advance_deductions: float = 0.0, other_deductions: float = 0.0,
-                             salary_structure: dict = None):
+                             salary_structure: dict = None,
+                             absent_days_override: Optional[float] = None):
     """Core enterprise salary engine with Loss of Pay (LOP) integration."""
     monthly_salary = ctc / 12.0
     
@@ -113,7 +114,10 @@ def calculate_payslip_fields(ctc: float, working_days: int, present_days: float,
         paid_leave_days = float(leave_days)
 
     # Calculate unexcused absent days
-    absent_days = max(0.0, float(working_days) - float(present_days) - float(paid_leave_days) - float(unpaid_leave_days))
+    if absent_days_override is not None:
+        absent_days = max(0.0, float(absent_days_override))
+    else:
+        absent_days = max(0.0, float(working_days) - float(present_days) - float(paid_leave_days) - float(unpaid_leave_days))
     
     # Total Loss of Pay (LOP) Days = Unexcused Absents + Unpaid Leaves + Short Leave penalties
     lop_days = round(absent_days + float(unpaid_leave_days) + float(short_leave_penalty_days), 2)
@@ -266,15 +270,7 @@ async def fetch_attendance_data(employee_email: str, org_id: str, payroll_month:
         if dt.weekday() == 6:  # Sunday
             days_off.add(day)
 
-    # Dates for querying logs (UTC boundaries)
-    start_dt = datetime(year, month, 1, tzinfo=timezone.utc)
-    if month == 12:
-        end_dt = datetime(year + 1, 1, 1, tzinfo=timezone.utc)
-    else:
-        end_dt = datetime(year, month + 1, 1, tzinfo=timezone.utc)
-
-    # Fetch Leave Policy
-    # Fetch Leave Policy & System Settings
+    # Fetch Leave Policy & System Settings first so we know timezone_offset
     policy = await leave_policies_collection.find_one({
         "$or": [
             {"organization_id": org_id, "year": year},
@@ -289,6 +285,17 @@ async def fetch_attendance_data(employee_email: str, org_id: str, payroll_month:
             {"organization_id": "system_org"}
         ]
     })
+    tz_offset = int((org_settings or {}).get("timezone_offset", 330))
+
+    # Local month boundaries [00:00 on 1st local .. 00:00 on next month 1st local) converted to UTC
+    local_start_dt = datetime(year, month, 1, tzinfo=timezone.utc)
+    if month == 12:
+        local_end_dt = datetime(year + 1, 1, 1, tzinfo=timezone.utc)
+    else:
+        local_end_dt = datetime(year, month + 1, 1, tzinfo=timezone.utc)
+    start_dt = local_start_dt - timedelta(minutes=tz_offset)
+    end_dt = local_end_dt - timedelta(minutes=tz_offset)
+
     paid_leave_types = ["sick", "casual", "on_duty", "duty"]
     short_leave_monthly_limit = 2
     short_leave_penalty_rule = "half_day_per_2_excess"
@@ -315,8 +322,9 @@ async def fetch_attendance_data(employee_email: str, org_id: str, payroll_month:
 
     paid_leave_days = 0.0
     unpaid_leave_days = 0.0
-    start_month_str = start_dt.strftime("%Y-%m-%d")
-    end_month_str = (end_dt - timedelta(days=1)).strftime("%Y-%m-%d")
+    calendar_leave_by_day = {}
+    start_month_str = local_start_dt.strftime("%Y-%m-%d")
+    end_month_str = (local_end_dt - timedelta(days=1)).strftime("%Y-%m-%d")
 
     # Map approved leaves by date YYYY-MM-DD
     leaves_by_date = {}
@@ -345,21 +353,26 @@ async def fetch_attendance_data(employee_email: str, org_id: str, payroll_month:
                         dur += 1.0
                     cur_dt += timedelta(days=1)
 
-            # Map to individual days for attendance classifier lookup
-            cur_dt = max(datetime.strptime(l_start[:10], "%Y-%m-%d"), datetime.strptime(start_month_str, "%Y-%m-%d"))
-            end_dt_loop = min(datetime.strptime(l_end[:10], "%Y-%m-%d"), datetime.strptime(end_month_str, "%Y-%m-%d"))
-            while cur_dt <= end_dt_loop:
-                d_str = cur_dt.strftime("%Y-%m-%d")
-                leaves_by_date[d_str] = l
-                if dur_type == "short_leave":
-                    short_leave_days_set.add(cur_dt.day)
-                cur_dt += timedelta(days=1)
-
             l_type = str(l.get("leave_type", "other")).lower().strip()
             if l.get("is_paid") is not None:
                 is_p = bool(l.get("is_paid"))
             else:
                 is_p = any(pt in l_type for pt in paid_leave_types)
+
+            # Map to individual days for attendance classifier lookup & covered calendar leave days
+            cur_dt = max(datetime.strptime(l_start[:10], "%Y-%m-%d"), datetime.strptime(start_month_str, "%Y-%m-%d"))
+            end_dt_loop = min(datetime.strptime(l_end[:10], "%Y-%m-%d"), datetime.strptime(end_month_str, "%Y-%m-%d"))
+            while cur_dt <= end_dt_loop:
+                d_str = cur_dt.strftime("%Y-%m-%d")
+                # Prefer keeping paid or non-penalty leave in leaves_by_date if multiple exist on same date
+                if d_str not in leaves_by_date or is_p:
+                    leaves_by_date[d_str] = l
+                if dur_type == "short_leave":
+                    short_leave_days_set.add(cur_dt.day)
+                elif cur_dt.day not in days_off and "on_duty" not in l_type and "duty" not in l_type:
+                    cov_val = 0.5 if dur_type in ["first_half", "second_half", "half_day"] else 1.0
+                    calendar_leave_by_day[cur_dt.day] = min(1.0, calendar_leave_by_day.get(cur_dt.day, 0.0) + cov_val)
+                cur_dt += timedelta(days=1)
 
             if is_p and "on_duty" not in l_type and "duty" not in l_type:
                 paid_leave_days += dur
@@ -376,12 +389,13 @@ async def fetch_attendance_data(employee_email: str, org_id: str, payroll_month:
     }).sort("timestamp", 1)
     logs = await cursor_logs.to_list(length=1000)
 
-    tz_offset = int((org_settings or {}).get("timezone_offset", 330))
     daily_logs = {}
     for log in logs:
         ts = log["timestamp"]
         if ts.tzinfo is None: ts = ts.replace(tzinfo=timezone.utc)
         local_ts = ts + timedelta(minutes=tz_offset)
+        if local_ts.year != year or local_ts.month != month:
+            continue
         d_num = local_ts.day
         if d_num not in daily_logs:
             daily_logs[d_num] = []
@@ -461,8 +475,10 @@ async def fetch_attendance_data(employee_email: str, org_id: str, payroll_month:
         else:  # half_day_per_2_excess / default
             short_leave_penalty_days = round((excess_short // 2) * 0.5, 2)
 
+    covered_calendar_leave_days = sum(calendar_leave_by_day.values())
+
     actual_work_days = num_days - len(days_off)
-    absent_days = max(0.0, float(actual_work_days) - float(check_ins_presence) - float(paid_leave_days) - float(unpaid_leave_days))
+    absent_days = max(0.0, float(actual_work_days) - float(check_ins_presence) - float(covered_calendar_leave_days))
     
     return working_days, present_days, paid_leave_days, unpaid_leave_days, absent_days, short_leave_penalty_days
 
@@ -524,19 +540,41 @@ async def _auto_generate_missing_payrolls(payroll_month: str, current_admin: Adm
     existing_docs = await payrolls_collection.find({
         **get_org_filter(current_admin),
         "payroll_month": payroll_month
-    }, {"employee_email": 1}).to_list(length=1000)
-    existing_emails = {d.get("employee_email", "").strip().lower() for d in existing_docs}
+    }).to_list(length=1000)
+    existing_by_email = {
+        (d.get("employee_email") or "").strip().lower(): d
+        for d in existing_docs
+        if d.get("employee_email")
+    }
 
     for emp in employees:
         emp_email = (emp.get("email") or "").strip().lower()
-        if not emp_email or emp_email in existing_emails:
+        if not emp_email:
             continue
+        existing_rec = existing_by_email.get(emp_email)
+        # Skip if already finalized/approved/sent or manually edited by admin
+        if existing_rec:
+            is_unmodified_draft = (
+                existing_rec.get("status") == PayrollStatus.DRAFT
+                and not existing_rec.get("email_sent")
+                and not existing_rec.get("updated_by")
+                and abs(float(existing_rec.get("admin_adjustment") or 0.0)) < 0.01
+            )
+            if not is_unmodified_draft:
+                continue
         try:
             emp_org_id = emp.get("organization_id") or org_id or "system_org"
             w_days, p_days, paid_l, unpaid_l, a_days, short_pen = await fetch_attendance_data(emp_email, emp_org_id, payroll_month)
             salary_structure = await _resolve_employee_salary_structure(emp)
             travel_reimb, exp_claims = await fetch_approved_claims_and_reimbursements(emp_email, emp_org_id, payroll_month)
             reimbursements = travel_reimb + exp_claims
+
+            bonus_val = float((existing_rec or {}).get("bonus") or 0.0)
+            ot_hours_val = float((existing_rec or {}).get("overtime_hours") or 0.0)
+            other_earn_val = float((existing_rec or {}).get("other_earnings") or 0.0)
+            loan_ded_val = float((existing_rec or {}).get("loan_deductions") or 0.0)
+            adv_ded_val = float((existing_rec or {}).get("advance_deductions") or 0.0)
+            other_ded_val = float((existing_rec or {}).get("other_deductions") or 0.0)
 
             results = calculate_payslip_fields(
                 ctc=float(salary_structure.get("ctc") or 0.0),
@@ -545,74 +583,116 @@ async def _auto_generate_missing_payrolls(payroll_month: str, current_admin: Adm
                 paid_leave_days=paid_l,
                 unpaid_leave_days=unpaid_l,
                 short_leave_penalty_days=short_pen,
-                other_earnings=0.0,
+                overtime_hours=ot_hours_val,
+                bonus=bonus_val,
+                other_earnings=other_earn_val,
                 reimbursements=reimbursements,
-                salary_structure=salary_structure
+                loan_deductions=loan_ded_val,
+                advance_deductions=adv_ded_val,
+                other_deductions=other_ded_val,
+                salary_structure=salary_structure,
+                absent_days_override=a_days
             )
 
-            payroll_doc = {
-                "organization_id": emp_org_id,
-                "employee_email": emp_email,
-                "employee_name": emp.get("full_name") or emp_email.split("@")[0],
-                "employee_id": emp.get("employee_id", "EMP"),
-                "department": emp.get("department", "General"),
-                "designation": emp.get("designation", "Employee"),
-                "payroll_month": payroll_month,
-                "working_days": w_days,
-                "present_days": p_days,
-                "leave_days": paid_l + unpaid_l,
-                "paid_leave_days": results["paid_leave_days"],
-                "unpaid_leave_days": results["unpaid_leave_days"],
-                "short_leave_penalty_days": results["short_leave_penalty_days"],
-                "absent_days": results["absent_days"],
-                "lop_days": results["lop_days"],
-                "ctc": results["ctc"],
-                "monthly_salary": results["monthly_salary"],
-                "basic_salary": results["basic_salary"],
-                "hra": results["hra"],
-                "special_allowance": results["special_allowance"],
-                "daily_wage": results["daily_wage"],
-                "lop_deduction": results["lop_deduction"],
-                "attendance_salary": results["attendance_salary"],
-                "overtime_hours": 0.0,
-                "overtime_amount": 0.0,
-                "bonus": 0.0,
-                "other_earnings": 0.0,
-                "travel_reimbursement": travel_reimb,
-                "expense_claims": exp_claims,
-                "reimbursements": reimbursements,
-                "gross_salary": results["gross_salary"],
-                "pf_employee": results["pf_employee"],
-                "pf_employer": results["pf_employer"],
-                "esi_employee": results["esi_employee"],
-                "esi_employer": results["esi_employer"],
-                "professional_tax": results["professional_tax"],
-                "income_tax_tds": results["income_tax_tds"],
-                "loan_deductions": 0.0,
-                "advance_deductions": 0.0,
-                "other_deductions": 0.0,
-                "total_deductions": results["total_deductions"],
-                "calculated_net_salary": results["net_salary"],
-                "admin_adjustment": 0.0,
-                "net_salary": results["net_salary"],
-                "status": PayrollStatus.DRAFT,
-                "email_sent": False,
-                "last_sent_at": None,
-                "sent_to_email": None,
-                "approved_by": None,
-                "approved_at": None,
-                "locked_by": None,
-                "locked_at": None,
-                "payment_date": None,
-                "payment_reference": None,
-                "bank_name": salary_structure.get("bank_name"),
-                "bank_account": salary_structure.get("bank_account"),
-                "bank_ifsc": salary_structure.get("bank_ifsc"),
-                "pan_number": salary_structure.get("pan_number"),
-                "created_at": datetime.now(timezone.utc),
-                "created_by": current_admin.email
-            }
-            await payrolls_collection.insert_one(payroll_doc)
+            if existing_rec:
+                await payrolls_collection.update_one(
+                    {"_id": existing_rec["_id"]},
+                    {"$set": {
+                        "working_days": w_days,
+                        "present_days": p_days,
+                        "leave_days": paid_l + unpaid_l,
+                        "paid_leave_days": results["paid_leave_days"],
+                        "unpaid_leave_days": results["unpaid_leave_days"],
+                        "short_leave_penalty_days": results["short_leave_penalty_days"],
+                        "absent_days": results["absent_days"],
+                        "lop_days": results["lop_days"],
+                        "ctc": results["ctc"],
+                        "monthly_salary": results["monthly_salary"],
+                        "basic_salary": results["basic_salary"],
+                        "hra": results["hra"],
+                        "special_allowance": results["special_allowance"],
+                        "daily_wage": results["daily_wage"],
+                        "lop_deduction": results["lop_deduction"],
+                        "attendance_salary": results["attendance_salary"],
+                        "travel_reimbursement": travel_reimb,
+                        "expense_claims": exp_claims,
+                        "reimbursements": reimbursements,
+                        "gross_salary": results["gross_salary"],
+                        "pf_employee": results["pf_employee"],
+                        "pf_employer": results["pf_employer"],
+                        "esi_employee": results["esi_employee"],
+                        "esi_employer": results["esi_employer"],
+                        "professional_tax": results["professional_tax"],
+                        "income_tax_tds": results["income_tax_tds"],
+                        "total_deductions": results["total_deductions"],
+                        "calculated_net_salary": results["net_salary"],
+                        "net_salary": results["net_salary"],
+                    }}
+                )
+            else:
+                payroll_doc = {
+                    "organization_id": emp_org_id,
+                    "employee_email": emp_email,
+                    "employee_name": emp.get("full_name") or emp_email.split("@")[0],
+                    "employee_id": emp.get("employee_id", "EMP"),
+                    "department": emp.get("department", "General"),
+                    "designation": emp.get("designation", "Employee"),
+                    "payroll_month": payroll_month,
+                    "working_days": w_days,
+                    "present_days": p_days,
+                    "leave_days": paid_l + unpaid_l,
+                    "paid_leave_days": results["paid_leave_days"],
+                    "unpaid_leave_days": results["unpaid_leave_days"],
+                    "short_leave_penalty_days": results["short_leave_penalty_days"],
+                    "absent_days": results["absent_days"],
+                    "lop_days": results["lop_days"],
+                    "ctc": results["ctc"],
+                    "monthly_salary": results["monthly_salary"],
+                    "basic_salary": results["basic_salary"],
+                    "hra": results["hra"],
+                    "special_allowance": results["special_allowance"],
+                    "daily_wage": results["daily_wage"],
+                    "lop_deduction": results["lop_deduction"],
+                    "attendance_salary": results["attendance_salary"],
+                    "overtime_hours": 0.0,
+                    "overtime_amount": 0.0,
+                    "bonus": 0.0,
+                    "other_earnings": 0.0,
+                    "travel_reimbursement": travel_reimb,
+                    "expense_claims": exp_claims,
+                    "reimbursements": reimbursements,
+                    "gross_salary": results["gross_salary"],
+                    "pf_employee": results["pf_employee"],
+                    "pf_employer": results["pf_employer"],
+                    "esi_employee": results["esi_employee"],
+                    "esi_employer": results["esi_employer"],
+                    "professional_tax": results["professional_tax"],
+                    "income_tax_tds": results["income_tax_tds"],
+                    "loan_deductions": 0.0,
+                    "advance_deductions": 0.0,
+                    "other_deductions": 0.0,
+                    "total_deductions": results["total_deductions"],
+                    "calculated_net_salary": results["net_salary"],
+                    "admin_adjustment": 0.0,
+                    "net_salary": results["net_salary"],
+                    "status": PayrollStatus.DRAFT,
+                    "email_sent": False,
+                    "last_sent_at": None,
+                    "sent_to_email": None,
+                    "approved_by": None,
+                    "approved_at": None,
+                    "locked_by": None,
+                    "locked_at": None,
+                    "payment_date": None,
+                    "payment_reference": None,
+                    "bank_name": salary_structure.get("bank_name"),
+                    "bank_account": salary_structure.get("bank_account"),
+                    "bank_ifsc": salary_structure.get("bank_ifsc"),
+                    "pan_number": salary_structure.get("pan_number"),
+                    "created_at": datetime.now(timezone.utc),
+                    "created_by": current_admin.email
+                }
+                await payrolls_collection.insert_one(payroll_doc)
         except Exception:
             continue
 
@@ -696,23 +776,46 @@ async def get_days_off(payroll_month: str, organization_id: Optional[str] = None
     if (current_admin.role == "superadmin" or org_id == "system_org") and organization_id:
         org_id = organization_id
         
-    doc = await holidays_collection.find_one({"organization_id": org_id, "payroll_month": payroll_month})
+    doc = await holidays_collection.find_one({
+        "organization_id": org_id,
+        "payroll_month": payroll_month,
+        "days_off": {"$exists": True}
+    })
     if doc:
         return {"days_off": doc.get("days_off", [])}
     
-    # Return default Sundays
+    # Return default Sundays + any named holidays configured for this month
     year, month = map(int, payroll_month.split("-"))
     num_days = calendar.monthrange(year, month)[1]
-    days_off = []
+    days_off_set = set()
     for day in range(1, num_days + 1):
         dt = datetime(year, month, day)
         if dt.weekday() == 6: # Sunday
-            days_off.append(day)
-    return {"days_off": days_off}
+            days_off_set.add(day)
+
+    try:
+        named_h = await holidays_collection.find({
+            "$or": [
+                {"organization_id": org_id, "payroll_month": payroll_month, "date": {"$exists": True}},
+                {"organization_id": "system_org", "payroll_month": payroll_month, "date": {"$exists": True}}
+            ]
+        }).to_list(length=100)
+        for nh in named_h:
+            if "day" in nh and nh["day"] is not None:
+                days_off_set.add(int(nh["day"]))
+            elif "date" in nh and nh["date"]:
+                try:
+                    days_off_set.add(int(str(nh["date"]).split("-")[2]))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    return {"days_off": sorted(list(days_off_set))}
 
 @router.post("/days-off")
 async def save_days_off(req: DaysOffSaveRequest, current_admin: Admin = Depends(get_current_admin)):
-    """Save custom days off configuration for the month."""
+    """Save custom days off configuration for the month without overwriting named holiday documents."""
     org_id = current_admin.organization_id
     if (current_admin.role == "superadmin" or org_id == "system_org") and req.organization_id:
         org_id = req.organization_id
@@ -728,11 +831,16 @@ async def save_days_off(req: DaysOffSaveRequest, current_admin: Admin = Depends(
             raise HTTPException(status_code=400, detail=f"Invalid day {d} for month {req.payroll_month}")
             
     await holidays_collection.update_one(
-        {"organization_id": org_id, "payroll_month": req.payroll_month},
-        {"$set": {"days_off": req.days_off}},
+        {"organization_id": org_id, "payroll_month": req.payroll_month, "days_off": {"$exists": True}},
+        {"$set": {
+            "organization_id": org_id,
+            "payroll_month": req.payroll_month,
+            "days_off": sorted(list(set(req.days_off))),
+            "updated_at": datetime.now(timezone.utc)
+        }},
         upsert=True
     )
-    return {"message": "Days off saved successfully", "days_off": req.days_off}
+    return {"message": "Days off saved successfully", "days_off": sorted(list(set(req.days_off)))}
 
 
 MASKED_SECRET = "••••••••"
@@ -741,9 +849,12 @@ DEFAULT_SENDER_NAME = "LogDay Payroll & HR"
 
 async def _get_org_smtp_config(org_id: str) -> dict:
     """Resolve email delivery settings (Brevo first, SMTP as legacy fallback) from DB or environment."""
-    settings_doc = await settings_collection.find_one({"organization_id": org_id})
-    if not settings_doc and org_id != "system_org":
-        settings_doc = await settings_collection.find_one({"organization_id": "system_org"})
+    if not org_id or org_id == "system_org":
+        settings_doc = await settings_collection.find_one({"$or": [{"organization_id": "system_org"}, {"id": "config"}]})
+    else:
+        settings_doc = await settings_collection.find_one({"organization_id": org_id})
+        if not settings_doc:
+            settings_doc = await settings_collection.find_one({"$or": [{"organization_id": "system_org"}, {"id": "config"}]})
     smtp_db = (settings_doc or {}).get("smtp_config") or {}
 
     # --- Brevo (primary) ---
@@ -811,7 +922,10 @@ async def get_payroll_smtp_settings(current_admin: Admin = Depends(get_current_a
 async def save_payroll_smtp_settings(req: dict, current_admin: Admin = Depends(get_current_admin)):
     """Save Brevo email configuration for sending salary slips to employee login emails."""
     org_id = current_admin.organization_id or "system_org"
-    settings_doc = await settings_collection.find_one({"organization_id": org_id}) or {}
+    if org_id == "system_org":
+        settings_doc = await settings_collection.find_one({"$or": [{"organization_id": "system_org"}, {"id": "config"}]}) or {}
+    else:
+        settings_doc = await settings_collection.find_one({"organization_id": org_id}) or {}
     stored = settings_doc.get("smtp_config") or {}
 
     new_key = (req.get("brevo_api_key") or "").strip()
@@ -831,7 +945,14 @@ async def save_payroll_smtp_settings(req: dict, current_admin: Admin = Depends(g
         "smtp_config.updated_at": datetime.now(timezone.utc).isoformat(),
         "smtp_config.updated_by": current_admin.email,
     }
-    await settings_collection.update_one({"organization_id": org_id}, {"$set": updates}, upsert=True)
+    if org_id == "system_org":
+        await settings_collection.update_one(
+            {"id": "config"} if settings_doc.get("id") == "config" else {"organization_id": "system_org"},
+            {"$set": {**updates, "organization_id": "system_org"}},
+            upsert=True,
+        )
+    else:
+        await settings_collection.update_one({"organization_id": org_id}, {"$set": updates}, upsert=True)
 
     cfg = await _get_org_smtp_config(org_id)
     return {
@@ -910,6 +1031,7 @@ async def calculate_employee_payroll(payload: PayrollCreate, current_admin: Admi
     paid_l_days = 0.0
     unpaid_l_days = 0.0
     short_penalty_days = 0.0
+    fetched_a_override = None
     
     if w_days is None or p_days is None or l_days is None:
         fetched_w, fetched_p, fetched_paid_l, fetched_unpaid_l, fetched_a, fetched_short_pen = await fetch_attendance_data(email_clean, org_id, payload.payroll_month)
@@ -918,6 +1040,7 @@ async def calculate_employee_payroll(payload: PayrollCreate, current_admin: Admi
         paid_l_days = fetched_paid_l
         unpaid_l_days = fetched_unpaid_l
         short_penalty_days = fetched_short_pen
+        fetched_a_override = fetched_a
         l_days = l_days if l_days is not None else (fetched_paid_l + fetched_unpaid_l)
     else:
         paid_l_days = float(l_days)
@@ -942,7 +1065,8 @@ async def calculate_employee_payroll(payload: PayrollCreate, current_admin: Admi
         loan_deductions=payload.loan_deductions,
         advance_deductions=payload.advance_deductions,
         other_deductions=payload.other_deductions,
-        salary_structure=salary_structure
+        salary_structure=salary_structure,
+        absent_days_override=fetched_a_override
     )
 
     # Document details
@@ -1088,7 +1212,8 @@ async def run_monthly_payroll(payload: PayrollRunRequest, current_admin: Admin =
                 short_leave_penalty_days=short_pen,
                 other_earnings=0.0,
                 reimbursements=reimbursements,
-                salary_structure=salary_structure
+                salary_structure=salary_structure,
+                absent_days_override=a_days
             )
             
             payroll_doc = {

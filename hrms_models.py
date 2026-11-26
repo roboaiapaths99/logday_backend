@@ -94,9 +94,9 @@ class PayrollCreate(BaseModel):
     employee_email: str
     payroll_month: str  # "YYYY-MM"
     working_days: Optional[int] = None
-    present_days: Optional[int] = None
-    leave_days: Optional[int] = None
-    absent_days: Optional[int] = None
+    present_days: Optional[float] = None
+    leave_days: Optional[float] = None
+    absent_days: Optional[float] = None
     overtime_hours: float = 0.0
     bonus: float = 0.0
     other_earnings: float = 0.0

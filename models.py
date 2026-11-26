@@ -447,6 +447,11 @@ class SystemSettings(BaseModel):
     office_wifi_bssid: Optional[str] = None
     geofence_radius: float = 40.0
 
+    # 4:00 PM Absentee Admin Alert & 1.5-Day Penalty Policy (Per Organization)
+    absence_alert_enabled: bool = True
+    absence_alert_time: str = "16:00"
+    absence_notification_emails: List[str] = []
+
 
 # Field Force Specific Models
 class VisitPlanStop(BaseModel):

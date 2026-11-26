@@ -189,8 +189,8 @@ async def get_current_admin(request: Request, token: str = Depends(admin_oauth2_
                 raise HTTPException(403, "Access denied for 'wfh_monitoring'")
                 
         # 8. Settings & Admin
-        elif path.startswith("/admin/settings") or path.startswith("/admin/upload-logo"):
-            if "settings" not in allowed:
+        elif path.startswith("/admin/settings") or path.startswith("/admin/upload-logo") or path.startswith("/admin/absence-alerts"):
+            if "settings" not in allowed and "attendance" not in allowed:
                 raise HTTPException(403, "Access denied for 'settings'")
                 
         elif path.startswith("/admin/sub-admins"):

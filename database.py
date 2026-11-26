@@ -59,6 +59,7 @@ exit_managements_collection = db["exit_managements"]
 salary_structures_collection = db["salary_structures"]
 holidays_collection = db["holidays"]
 leave_policies_collection = db["leave_policies"]
+absence_alerts_collection = db["absence_alerts"]
 
 
 # Ensure indexes for employee check-in status and session tracking
@@ -101,4 +102,8 @@ async def ensure_employee_indexes():
     await wfh_app_usage_collection.create_index([("employee_id", 1), ("date", 1)])
 
     # Face checks: queries by employee_id
-    await wfh_face_checks_collection.create_index([("employee_id", 1), ("timestamp", -1)])
+    await wfh_face_checks_collection.create_index([("employee_id", 1), ("timestamp", -1)])
+
+    # 4:00 PM Absence Alerts: unique per org + employee + date, fast lookup by token
+    await absence_alerts_collection.create_index([("organization_id", 1), ("employee_email", 1), ("date", 1)])
+    await absence_alerts_collection.create_index("token", unique=True, sparse=True)

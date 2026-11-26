@@ -1,12 +1,14 @@
+import copy
 from datetime import datetime, timezone
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status
 from bson import ObjectId
 
-from database import exit_managements_collection, employees_collection
+from database import exit_managements_collection, employees_collection, payrolls_collection
 from models import Admin
 from auth import get_current_admin
 from hrms_models import ExitStatus, ClearanceStatus, ExitCreate, ClearanceUpdate
+from hrms_payroll import _resolve_employee_salary_structure
 from permissions import require_feature
 
 router = APIRouter(
@@ -157,7 +159,7 @@ async def initiate_exit(payload: ExitCreate, current_admin: Admin = Depends(get_
         "progress": 0.0,
         "assigned_to": payload.assigned_to,
         
-        "clearances": DEFAULT_CLEARANCES,
+        "clearances": copy.deepcopy(DEFAULT_CLEARANCES),
         
         "exit_interview": {
             "conducted": False,
@@ -238,7 +240,7 @@ async def update_department_clearance(id: str, payload: ClearanceUpdate, current
         
     clearances = exit_doc.get("clearances", {})
     if dept not in clearances:
-        clearances[dept] = DEFAULT_CLEARANCES[dept].copy()
+        clearances[dept] = copy.deepcopy(DEFAULT_CLEARANCES[dept])
         
     # Update status, cleared_by, notes
     clearances[dept]["status"] = payload.status
@@ -258,13 +260,17 @@ async def update_department_clearance(id: str, payload: ClearanceUpdate, current
     completed_count = sum(1 for d in clearances.values() if d.get("status") == ClearanceStatus.COMPLETED)
     progress = round((completed_count / 4.0) * 100, 2)
     
+    update_fields = {
+        "clearances": clearances,
+        "progress": progress,
+        "updated_at": datetime.now(timezone.utc)
+    }
+    if exit_doc.get("status") == ExitStatus.PENDING:
+        update_fields["status"] = ExitStatus.IN_PROGRESS
+
     await exit_managements_collection.update_one(
         {"_id": obj_id},
-        {"$set": {
-            "clearances": clearances,
-            "progress": progress,
-            "updated_at": datetime.now(timezone.utc)
-        }}
+        {"$set": update_fields}
     )
     
     updated = await exit_managements_collection.find_one({"_id": obj_id})
@@ -310,13 +316,17 @@ async def update_clearance_checklist_items(id: str, req: dict, current_admin: Ad
     completed_count = sum(1 for d in clearances.values() if d.get("status") == ClearanceStatus.COMPLETED)
     progress = round((completed_count / 4.0) * 100, 2)
 
+    update_fields = {
+        "clearances": clearances,
+        "progress": progress,
+        "updated_at": datetime.now(timezone.utc)
+    }
+    if exit_doc.get("status") == ExitStatus.PENDING:
+        update_fields["status"] = ExitStatus.IN_PROGRESS
+
     await exit_managements_collection.update_one(
         {"_id": obj_id},
-        {"$set": {
-            "clearances": clearances,
-            "progress": progress,
-            "updated_at": datetime.now(timezone.utc)
-        }}
+        {"$set": update_fields}
     )
     
     updated = await exit_managements_collection.find_one({"_id": obj_id})
@@ -336,13 +346,25 @@ async def calculate_settlement(id: str, req: dict, current_admin: Admin = Depend
     if not exit_doc:
         raise HTTPException(status_code=404, detail="Exit process not found")
         
-    # Get employee CTC
+    # Get employee salary structure (resolving flat base_salary or payroll records as fallback)
     emp = await employees_collection.find_one({"email": exit_doc["employee_email"], "organization_id": exit_doc["organization_id"]})
-    if not emp or not emp.get("salary_structure"):
-        raise HTTPException(status_code=400, detail="Employee or salary structure not found")
+    if not emp:
+        raise HTTPException(status_code=400, detail="Employee not found")
         
-    ctc = emp["salary_structure"].get("ctc", 0.0)
-    monthly_salary = ctc / 12.0
+    sal = _resolve_employee_salary_structure(emp)
+    if not sal:
+        latest_payroll = await payrolls_collection.find_one(
+            {"employee_email": exit_doc["employee_email"], "organization_id": exit_doc["organization_id"]},
+            sort=[("payroll_month", -1)]
+        )
+        if latest_payroll:
+            gross_val = float(latest_payroll.get("gross_salary") or latest_payroll.get("basic_salary") or 0.0)
+            sal = {"ctc": gross_val * 12.0, "gross_monthly": gross_val}
+        else:
+            sal = {"ctc": 0.0, "gross_monthly": 0.0}
+
+    ctc = float(sal.get("ctc", 0.0) or 0.0)
+    monthly_salary = float(sal.get("gross_monthly", 0.0) or (ctc / 12.0))
     daily_wage = monthly_salary / 30.0  # standard monthly divider
     
     # Inputs
@@ -367,8 +389,9 @@ async def calculate_settlement(id: str, req: dict, current_admin: Admin = Depend
     # We let it be passed or calculated
     gratuity = gratuity_override
     
-    total_payable = salary_dues + leave_encashment + bonus + gratuity - notice_recovery - other_deductions
-    total_payable = round(total_payable, 2)
+    gross_payable = round(salary_dues + leave_encashment + bonus + gratuity, 2)
+    total_deductions = round(notice_recovery + other_deductions, 2)
+    total_payable = round(gross_payable - total_deductions, 2)
     
     settlement = {
         "calculated": True,
@@ -378,6 +401,9 @@ async def calculate_settlement(id: str, req: dict, current_admin: Admin = Depend
         "gratuity": gratuity,
         "notice_period_recovery": round(notice_recovery, 2),
         "other_deductions": other_deductions,
+        "gross_payable": gross_payable,
+        "deductions": total_deductions,
+        "net_payable": total_payable,
         "total_payable": total_payable,
         "processed": req.get("processed", False),
         "processed_at": datetime.now(timezone.utc).isoformat() if req.get("processed") else None

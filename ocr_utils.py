@@ -328,7 +328,9 @@ def validate_ifsc_code(ifsc: str) -> bool:
 DOCUMENT_EXTRACTORS = {
     "aadhaar": extract_aadhaar_data,
     "pan": extract_pan_data,
+    "pan_card": extract_pan_data,
     "bank_passbook": extract_bank_details,
+    "bank_details": extract_bank_details,
     "salary_slip": extract_generic_document,
     "experience_letter": extract_generic_document,
     "relieving_letter": extract_generic_document,

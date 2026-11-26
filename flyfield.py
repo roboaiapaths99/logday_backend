@@ -887,20 +887,23 @@ async def admin_close_stuck_visit(visit_id: str, admin = Depends(get_current_adm
 # ==============================================================================
 
 async def build_daily_timeline(email: str, date_str: Optional[str] = None) -> dict:
-    today_start_utc, today_end_utc, today_str = get_today_bounds()
+    # 1. Employee info & org timezone
+    emp = await employees_collection.find_one({"email": email})
+    emp_name = emp.get("full_name", email) if emp else email
+    org_id = emp.get("organization_id") if emp else None
+    s_doc = await settings_collection.find_one({"$or": [{"organization_id": org_id}, {"id": "config"}]}) if org_id else None
+    tz_offset = int((s_doc or {}).get("timezone_offset", 330))
+
+    today_start_utc, today_end_utc, today_str = get_today_bounds(tz_offset)
     target_date = date_str or today_str
 
     # Date range for target day
     try:
         target_dt = datetime.strptime(target_date, "%Y-%m-%d")
-        day_start = target_dt.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc) - timedelta(minutes=330)
+        day_start = target_dt.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc) - timedelta(minutes=tz_offset)
         day_end = day_start + timedelta(days=1)
     except Exception:
         day_start, day_end = today_start_utc, today_end_utc
-
-    # 1. Employee info
-    emp = await employees_collection.find_one({"email": email})
-    emp_name = emp.get("full_name", email) if emp else email
 
     # 2. Check-in & Check-out logs
     logs = await attendance_logs_collection.find({

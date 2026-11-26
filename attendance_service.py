@@ -108,7 +108,7 @@ def classify_attendance_day(
                     "classification_reason": f"Approved Short Leave ({l_type})",
                     "is_applied_leave": True
                 }
-            elif dur_type in ["first_half", "second_half", "half_day"] or approved_leave.get("duration") == 0.5:
+            elif (dur_type in ["first_half", "second_half", "half_day"] or approved_leave.get("duration") == 0.5) and not approved_leave.get("is_uninformed_absence_penalty"):
                 return {
                     "status": "Half Day",
                     "is_late": False,
@@ -240,7 +240,7 @@ def classify_attendance_day(
             elif slot == "evening":
                 is_early_leave = False
                 early_exit_mins = 0
-        elif dur_type in ["first_half", "second_half", "half_day"] or approved_leave.get("duration") == 0.5:
+        elif (dur_type in ["first_half", "second_half", "half_day"] or approved_leave.get("duration") == 0.5) and not approved_leave.get("is_uninformed_absence_penalty"):
             is_half_day = True
             half_day_type = f"{dur_type}_applied"
             is_applied_leave = True

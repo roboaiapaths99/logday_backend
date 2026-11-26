@@ -1,9 +1,9 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from typing import List, Optional
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from bson import ObjectId
 
-from database import wfh_requests_collection, employees_collection
+from database import wfh_requests_collection, employees_collection, settings_collection
 from auth import get_current_employee, get_current_admin
 from models import Admin, WFHStatus, EmployeeType
 from permissions import require_feature
@@ -254,7 +254,9 @@ async def get_wfh_calendar(
 async def get_wfh_stats(admin: Admin = Depends(require_feature("wfh_management"))):
     """Get dashboard stats for WFH management."""
     org_id = admin.organization_id
-    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    s_doc = await settings_collection.find_one({"$or": [{"organization_id": org_id}, {"id": "config"}]}) if org_id else None
+    tz_offset = int((s_doc or {}).get("timezone_offset", 330))
+    today_str = (datetime.now(timezone.utc) + timedelta(minutes=tz_offset)).strftime("%Y-%m-%d")
 
     # Counts
     today_wfh_approved = await wfh_requests_collection.count_documents({
