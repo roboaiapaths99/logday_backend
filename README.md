@@ -10,6 +10,9 @@ license: mit
 
 # OfficeFlow AI Attendance Backend
 
+Security rollout and verification status: [SECURITY_ROLLOUT.md](SECURITY_ROLLOUT.md).
+The new authentication contract rejects legacy tokens and requires employee invitations.
+
 FastAPI backend for OfficeFlow attendance app with face recognition, geofencing, and smart attendance features.
 
 ## Features

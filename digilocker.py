@@ -165,14 +165,16 @@ DUMMY_DATA_GENERATORS = {
 
 # ─── Core Functions ──────────────────────────────────────────────
 
-def generate_auth_url(employee_id: str, org_id: str) -> Dict[str, str]:
+async def generate_auth_url(employee_id: str, org_id: str) -> Dict[str, str]:
     """
     Generate DigiLocker OAuth2 authorization URL.
     
     Returns:
         dict with 'auth_url' and 'state' for tracking
     """
-    state = f"{employee_id}:{org_id}:{uuid.uuid4().hex[:8]}"
+    from oauth_state import create_oauth_state
+    code_verifier = uuid.uuid4().hex + uuid.uuid4().hex
+    state = await create_oauth_state(employee_id, org_id, code_verifier)
 
     if DIGILOCKER_MODE == "sandbox":
         # In sandbox mode, return a dummy callback URL
@@ -185,7 +187,6 @@ def generate_auth_url(employee_id: str, org_id: str) -> Dict[str, str]:
         }
 
     # Production mode
-    code_verifier = uuid.uuid4().hex + uuid.uuid4().hex
     code_challenge = base64.urlsafe_b64encode(
         hashlib.sha256(code_verifier.encode()).digest()
     ).decode().rstrip("=")
@@ -203,7 +204,6 @@ def generate_auth_url(employee_id: str, org_id: str) -> Dict[str, str]:
     return {
         "auth_url": auth_url,
         "state": state,
-        "code_verifier": code_verifier,
         "mode": "production"
     }
 

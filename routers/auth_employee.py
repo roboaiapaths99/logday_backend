@@ -1,3 +1,7 @@
+from upload_security import SecureMediaRoute
+from permissions import require_feature, require_any_feature, require_admin_session
+from auth import issue_access_token, resolve_access_token, ensure_active_account
+from invitations import validate_invitation, consume_invitation
 from fastapi import APIRouter, FastAPI, HTTPException, File, Depends, BackgroundTasks, Request, Query
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse, Response
@@ -113,7 +117,7 @@ from services.common_helpers import (
 )
 from services.scheduler_jobs import check_missed_visits, purge_old_screenshots
 
-router = APIRouter()
+router = APIRouter(route_class=SecureMediaRoute)
 
 @router.post("/register", response_model=LoginResponse)
 async def register(req: RegisterRequest):
@@ -121,6 +125,8 @@ async def register(req: RegisterRequest):
     try:
         clean_email = req.email.strip().lower()
         logger.info(f"Received registration request for: {clean_email}")
+
+        invitation = await validate_invitation(req.invitation_token, clean_email)
 
         # Check if employee already exists
         existing = await employees_collection.find_one({"email": clean_email})
@@ -131,20 +137,21 @@ async def register(req: RegisterRequest):
         if not req.face_image:
             raise HTTPException(status_code=400, detail="face_image is required for registration")
         
-        embedding = get_face_embedding(req.face_image)
+        embedding = await run_in_threadpool(get_face_embedding, req.face_image)
         if embedding is None:
             raise HTTPException(status_code=400, detail="No face detected in image. Please try again with a clear photo.")
 
         # Create employee record
         hashed_password = await get_password_hash_async(req.password)
+        invitation = await consume_invitation(req.invitation_token, clean_email)
         employee_dict = {
             "full_name": req.full_name,
             "email": clean_email,
-            "employee_id": req.employee_id,
-            "designation": req.designation,
-            "department": req.department,
-            "organization_id": req.organization_id or "system_org", # Default to system_org
-            "employee_type": req.employee_type,
+            "employee_id": invitation["employee_id"],
+            "designation": invitation["designation"],
+            "department": invitation["department"],
+            "organization_id": invitation["organization_id"],
+            "employee_type": invitation["employee_type"],
             "hashed_password": hashed_password,
             "face_embedding": embedding,
             "profile_image": req.face_image,
@@ -154,7 +161,7 @@ async def register(req: RegisterRequest):
         }
 
         # For Field employees, initialize default territory if not provided
-        if req.employee_type == EmployeeType.FIELD:
+        if invitation["employee_type"] == EmployeeType.FIELD:
             employee_dict.update({
                 "territory_type": TerritoryType.RADIUS,
                 "territory_radius_meters": 500, # Default 500m
@@ -165,7 +172,7 @@ async def register(req: RegisterRequest):
         logger.info(f"User {req.email} saved to database successfully as {req.employee_type}.")
 
         # Generate token
-        access_token = create_access_token(data={"sub": req.email})
+        access_token = await issue_access_token(employee_dict, "employee")
         
         response_data = {
             "access_token": access_token, 
@@ -239,79 +246,13 @@ async def login(req: LoginRequest, request: Request):
     check_login_rate_limit(request, clean_email)
     logger.info(f"--- Login attempt for '{clean_email}' (org={req.organization_id}) ---")
     
-    # 1. Try finding in employees
     user = await employees_collection.find_one({"email": clean_email})
     is_admin_login = False
-    
-    if not user:
-        # 2. Try finding in admins (Admins might want to log into the mobile app too)
-        logger.info(f"User '{clean_email}' not found in employees, checking admins...")
-        user = await admins_collection.find_one({"email": clean_email})
-        if user:
-            is_admin_login = True
-            logger.info(f"User found in admins collection. Role: {user.get('role')}")
-        else:
-            # 3. Last resort: check if it's the configured env superadmin
-            fallback_email = os.getenv("ADMIN_EMAIL", "admin@officeflow.ai").strip().lower()
-            fallback_pass = os.getenv("ADMIN_PASSWORD", "")
-            if clean_email == fallback_email and fallback_pass:
-                logger.info("System superadmin detected via email fallback.")
-                user = {
-                    "email": clean_email,
-                    "full_name": "System Super Admin",
-                    "role": "superadmin",
-                    "organization_id": "system_org",
-                    "employee_type": "desk"
-                }
-                is_admin_login = True
-            else:
-                record_failed_login(request, clean_email)
-                logger.warning(f"Login failed: User '{clean_email}' not found anywhere.")
-                raise HTTPException(status_code=401, detail="Account not found. Please contact your administrator.")
-    
-    logger.info(f"User identified. Stored Org ID: {user.get('organization_id')}, Is Admin: {is_admin_login}")
-    
-    if not is_admin_login:
-        if user.get("status") == "Inactive" or user.get("is_active") is False:
-            logger.warning(f"Login blocked: Employee account is deactivated for '{clean_email}'.")
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Your account has been deactivated. Access denied."
-            )
-
-    # Password check (non-blocking Argon2 verification in worker thread)
-    stored_hash = user.get("hashed_password")
-    is_valid = False
-    
-    if stored_hash:
-        is_valid = await verify_password_async(req.password, stored_hash)
-        if not is_valid:
-            logger.info(f"Password mismatch in { 'admins' if is_admin_login else 'employees' } collection for '{clean_email}'.")
-            # CROSS-COLLECTION FALLBACK: If they are in both, try the other hash
-            if not is_admin_login:
-                # We found them in employees, but password failed. Check if they have an admin account with this password.
-                other_user = await admins_collection.find_one({"email": clean_email})
-                if other_user and other_user.get("hashed_password"):
-                    if await verify_password_async(req.password, other_user.get("hashed_password")):
-                        logger.info(f"Cross-collection fallback: User '{clean_email}' authenticated via admins collection.")
-                        user = other_user
-                        is_admin_login = True
-                        is_valid = True
-            else:
-                # We found them in admins, but password failed. Check if they have an employee account with this password.
-                other_user = await employees_collection.find_one({"email": clean_email})
-                if other_user and other_user.get("hashed_password"):
-                    if await verify_password_async(req.password, other_user.get("hashed_password")):
-                        logger.info(f"Cross-collection fallback: User '{clean_email}' authenticated via employees collection.")
-                        user = other_user
-                        is_admin_login = False
-                        is_valid = True
-    elif is_admin_login:
-        fallback_email = os.getenv("ADMIN_EMAIL", "admin@officeflow.ai").strip().lower()
-        fallback_pass = os.getenv("ADMIN_PASSWORD", "")
-        if clean_email == fallback_email and fallback_pass and hmac.compare_digest(req.password, fallback_pass):
-            is_valid = True
-
+    if not user or not await verify_password_async(req.password, user.get("hashed_password", "")):
+        record_failed_login(request, clean_email)
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    ensure_active_account(user)
+    is_valid = True
     if not is_valid:
         record_failed_login(request, clean_email)
         logger.warning(f"Login failed: Invalid password for '{clean_email}'.")
@@ -320,33 +261,11 @@ async def login(req: LoginRequest, request: Request):
     clear_failed_logins(request, clean_email)
     logger.info(f"Authentication successful for '{clean_email}' (as {'admin' if is_admin_login else 'employee'}).")
 
-    # SUPERADMIN & GOOGLE PLAY REVIEWER BYPASS logic
-    is_reviewer = (clean_email == "google.review@logday.app")
-    is_superadmin = (user.get("role") == "superadmin") or (clean_email == os.getenv("ADMIN_EMAIL", "admin@officeflow.ai").strip().lower()) or is_reviewer
-
-    # Org-scoped security: user from one org cannot log in to another org
-    if req.organization_id and not is_superadmin:
-        emp_org = user.get("organization_id")
-        logger.info(f"Checking Org Match: App sent '{req.organization_id}', DB has '{emp_org}'")
-        if emp_org is None or emp_org == "":
-            # Auto-link employee to the requested organization ONLY if they had no organization assigned at all
-            logger.info(f"Auto-linking unassigned user {clean_email} to organization {req.organization_id}")
-            await employees_collection.update_one(
-                {"email": clean_email},
-                {"$set": {"organization_id": req.organization_id}}
-            )
-            user["organization_id"] = req.organization_id
-        elif emp_org != req.organization_id:
-            logger.warning(f"Login failed: Org mismatch. App: {req.organization_id}, DB: {emp_org}")
-            raise HTTPException(
-                status_code=403,
-                detail=f"Access denied. Your account belongs to another organization."
-            )
-    
-    if is_superadmin:
-        logger.info("Superadmin bypass: Organization check skipped.")
-    else:
-        logger.info("Organization match successful.")
+    # Employee login never grants admin privileges or changes organization membership.
+    is_reviewer = False
+    is_superadmin = False
+    if req.organization_id and user.get("organization_id") != req.organization_id:
+        raise HTTPException(403, "Access denied. Your account belongs to another organization.")
 
     # Device Binding Check
     if user.get("device_id") and req.device_id and user["device_id"] != req.device_id:
@@ -429,7 +348,7 @@ async def login(req: LoginRequest, request: Request):
             logger.info(f"WFH device already registered for {clean_email}, device_id={req.device_id}")
 
     logger.info("Login process complete. Generating token.")
-    access_token = create_access_token(data={"sub": clean_email})
+    access_token = await issue_access_token(user, "employee")
     
     # Check if this user is a manager (has subordinates)
     subordinates_count = await employees_collection.count_documents({"manager_id": clean_email})
@@ -662,12 +581,8 @@ async def get_public_settings(request: Request):
     if auth_header and auth_header.startswith("Bearer "):
         token = auth_header.split(" ")[1]
         try:
-            payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-            email = payload.get("sub")
-            if email:
-                user = await employees_collection.find_one({"email": email})
-                if user:
-                    org_id = user.get("organization_id")
+            user, _ = await resolve_access_token(token, "employee")
+            org_id = user.get("organization_id")
         except Exception:
             pass # Invalid token, fall back to global
             
@@ -733,7 +648,7 @@ async def search_organizations(q: str = None):
 
 
 @router.get("/organizations/debug")
-async def debug_organizations(current_admin: Admin = Depends(get_current_admin)):
+async def debug_organizations(current_admin: Admin = Depends(require_feature("settings"))):
     """Debug endpoint: List all organizations in database (superadmin only, disabled in prod)"""
     if APP_ENV == "production" or not _is_superadmin(current_admin):
         raise HTTPException(status_code=403, detail="Debug endpoint not available")

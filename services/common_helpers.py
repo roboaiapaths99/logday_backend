@@ -190,36 +190,8 @@ def get_s3_key_from_url(url: str) -> str:
 
 
 def get_screenshot_display_url(url: str, request: Request = None) -> str:
-    if not url:
-        return ""
-    if url.startswith("/uploads/"):
-        if request:
-            return build_static_upload_url(request, url)
-        return url
-    
-    # Generate Presigned URL for private S3/R2 storage
-    if S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY:
-        s3_key = get_s3_key_from_url(url)
-        if s3_key:
-            try:
-                from botocore.client import Config
-                s3_client = boto3.client(
-                    "s3",
-                    endpoint_url=S3_ENDPOINT_URL,
-                    aws_access_key_id=S3_ACCESS_KEY_ID,
-                    aws_secret_access_key=S3_SECRET_ACCESS_KEY,
-                    region_name=S3_REGION_NAME,
-                    config=Config(signature_version='s3v4')
-                )
-                presigned_url = s3_client.generate_presigned_url(
-                    'get_object',
-                    Params={'Bucket': S3_BUCKET_NAME, 'Key': s3_key},
-                    ExpiresIn=3600 # 1 hour
-                )
-                return presigned_url
-            except Exception as e:
-                logger.error(f"Failed to generate presigned URL for key {s3_key}: {e}")
-    return url
+    # Signing happens centrally after account and upload authorization.
+    return url or ""
 
 
 def _upload_file_to_storage_sync(image_bytes: bytes, filename: str, folder: str = "wfh_view") -> str:
@@ -273,53 +245,38 @@ def _upload_file_to_storage_sync(image_bytes: bytes, filename: str, folder: str 
     return f"/uploads/{folder}/{filename}"
 
 
-async def upload_file_to_storage(image_bytes: bytes, filename: str, folder: str = "wfh_view") -> str:
+async def upload_file_to_storage(image_bytes: bytes, filename: str, folder: str = "wfh_view", *, owner: dict, purpose: str) -> str:
     """
     Enterprise hybrid storage: Uploads to S3/MinIO/R2 if configured, otherwise falls back to local disk.
     Runs in threadpool so blocking S3/disk I/O never stalls the FastAPI async event loop.
     """
-    return await run_in_threadpool(_upload_file_to_storage_sync, image_bytes, filename, folder)
+    from upload_security import register_upload, validate_image_bytes
+    media_type = await run_in_threadpool(validate_image_bytes, image_bytes)
+    url = await run_in_threadpool(_upload_file_to_storage_sync, image_bytes, filename, folder)
+    await register_upload(url, owner, purpose, media_type, len(image_bytes))
+    return url
 
 
-def _delete_file_from_storage_sync(image_url: str):
-    if not image_url:
-        return
-
-    if image_url.startswith("/uploads/"):
-        local_path = image_url.lstrip("/")
-        if os.path.exists(local_path):
-            try:
-                os.remove(local_path)
-                logger.info(f"Deleted local file: {local_path}")
-            except Exception as delete_err:
-                logger.error(f"Failed to delete local screenshot file: {delete_err}")
-        return
-
-    if S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY and boto3 is not None:
-        key_start = image_url.find("/wfh_view/")
-        if key_start != -1:
-            s3_key = image_url[key_start + 1:]
-            try:
-                s3_client = boto3.client(
-                    "s3",
-                    endpoint_url=S3_ENDPOINT_URL,
-                    aws_access_key_id=S3_ACCESS_KEY_ID,
-                    aws_secret_access_key=S3_SECRET_ACCESS_KEY,
-                    region_name=S3_REGION_NAME
-                )
-                s3_client.delete_object(Bucket=S3_BUCKET_NAME, Key=s3_key)
-                logger.info(f"Successfully deleted {s3_key} from S3/R2 bucket {S3_BUCKET_NAME}")
-            except Exception as e:
-                logger.error(f"Failed to delete {s3_key} from S3/R2 bucket {S3_BUCKET_NAME}: {e}")
+def _delete_file_from_storage_sync(record):
+    from upload_security import safe_local_path, _s3_client
+    if record["storage_backend"] == "local":
+        path = safe_local_path("/uploads/" + record["storage_key"])
+        path.unlink(missing_ok=True)
+    elif record["storage_backend"] == "s3":
+        _s3_client().delete_object(Bucket=S3_BUCKET_NAME, Key=record["storage_key"])
+    else:
+        raise ValueError("Unknown storage backend")
 
 
 async def delete_file_from_storage(image_url: str):
-    """
-    Deletes the file from S3/R2 or local filesystem in a worker thread.
-    """
-    if not image_url:
-        return
-    await run_in_threadpool(_delete_file_from_storage_sync, image_url)
+    from database import uploads_collection
+    record = await uploads_collection.find_one({"url": image_url})
+    if not record:
+        logger.warning("Retention skipped an unregistered upload; ownership migration required")
+        return False
+    await uploads_collection.update_one({"_id": record["_id"]}, {"$set": {"revoked": True}})
+    await run_in_threadpool(_delete_file_from_storage_sync, record)
+    return True
 
 
 async def get_effective_org_settings(org_id: Optional[str]) -> dict:
@@ -433,17 +390,19 @@ def attendance_type_str(val):
 
 
 def _is_superadmin(admin: Admin) -> bool:
-    """Check if admin is a superadmin (by role or system_org binding)."""
-    return admin.role == AdminRole.SUPERADMIN or admin.organization_id == "system_org"
+    """Only an explicit superadmin role permits cross-organization access."""
+    return admin.role == AdminRole.SUPERADMIN
 
 
 def get_employee_filter(current_admin: Admin):
     """Returns a MongoDB filter based on admin role for multi-tenant segmenting."""
     org_id = current_admin.organization_id
-    if not org_id or _is_superadmin(current_admin):
+    if _is_superadmin(current_admin):
         # Superadmin / system_org sees all organizations
         return {}
     
+    if not org_id:
+        raise HTTPException(403, "Organization required")
     role = current_admin.role
     base_filter = {"organization_id": org_id}
     
@@ -482,22 +441,10 @@ def check_feature_access(admin: Admin, feature: str):
 
 
 async def get_current_any_user(token: str = Depends(employee_oauth2_scheme)):
-    """Try to decode as employee first, then admin."""
-    try:
-        user = await get_current_employee(token)
-        if user:
-            return user, "employee"
-    except Exception:
-        pass
-    
-    try:
-        admin = await get_current_admin(token)
-        if admin:
-            return admin, "admin"
-    except Exception:
-        pass
-        
-    raise HTTPException(status_code=401, detail="Invalid session")
+    """Resolve the token's explicit account type; never fall back by email."""
+    from auth import resolve_access_token
+    account, kind = await resolve_access_token(token)
+    return (Admin(**account) if kind == "admin" else account), kind
 
 
 def normalize_date_str(d_str: str) -> Optional[str]:
@@ -1169,60 +1116,30 @@ async def verify_wfh_device(employee_id: str, org_id: str, device_id: str):
     return device
 
 
-def _extract_screenshot_ocr_text_sync(image_path: str) -> str:
-    temp_file_path = None
+def _extract_screenshot_ocr_text_sync(image_bytes: bytes) -> str:
     try:
-        if image_path.startswith("http://") or image_path.startswith("https://"):
-            try:
-                download_url = get_screenshot_display_url(image_path)
-                fd, temp_file_path = tempfile.mkstemp(suffix=".jpg")
-                os.close(fd)
-                req = urllib.request.Request(
-                    download_url,
-                    headers={"User-Agent": "Mozilla/5.0"}
-                )
-                with urllib.request.urlopen(req, timeout=15) as response, open(temp_file_path, "wb") as out_file:
-                    out_file.write(response.read())
-                resolved_path = temp_file_path
-            except Exception as download_err:
-                logger.error(f"Failed to download screenshot from R2/HTTP for OCR: {download_err}")
-                resolved_path = ""
-        else:
-            if "uploads/" in image_path:
-                idx = image_path.find("uploads/")
-                image_path = image_path[idx:]
-            resolved_path = image_path
-            if not os.path.isabs(image_path) and not os.path.exists(image_path):
-                alternative_path = os.path.join("..", "wfh_desktop", "agent", image_path)
-                if os.path.exists(alternative_path):
-                    resolved_path = alternative_path
-
-        if not resolved_path or not os.path.exists(resolved_path):
-            logger.warning(f"Screenshot file not found for OCR: {image_path}")
-            return ""
-
-        try:
-            import pytesseract  # type: ignore[import-not-found]
-            from PIL import Image  # type: ignore[import-not-found]
-            with Image.open(resolved_path) as img:
-                return pytesseract.image_to_string(img) + "\n"
-        except ImportError:
-            logger.warning("pytesseract or PIL is not installed. Falling back to active window text threat check.")
-            return "\n"
-        except Exception as ocr_err:
-            logger.warning(f"Tesseract OCR engine not fully loaded or failed: {ocr_err}")
-            return "\n"
-    finally:
-        if temp_file_path and os.path.exists(temp_file_path):
-            try:
-                os.remove(temp_file_path)
-            except Exception as cleanup_err:
-                logger.warning(f"Failed to cleanup temp OCR screenshot file: {cleanup_err}")
+        import pytesseract
+        from PIL import Image
+        with Image.open(io.BytesIO(image_bytes)) as img:
+            return pytesseract.image_to_string(img) + "\n"
+    except ImportError:
+        logger.warning("OCR dependency unavailable")
+        return ""
+    except Exception:
+        logger.exception("Screenshot OCR failed")
+        return ""
 
 
 async def scan_screenshot_ocr_threats(screenshot_id: str, image_path: str, employee_id: str, org_id: str, email: str, device_id: str, session_id: str):
     try:
-        text = await run_in_threadpool(_extract_screenshot_ocr_text_sync, image_path)
+        from database import uploads_collection
+        from upload_security import read_upload_bytes
+        record = await uploads_collection.find_one({"url": image_path, "owner_id": employee_id,
+                                                     "organization_id": org_id, "purpose": "screenshot", "revoked": False})
+        if not record:
+            return
+        image_bytes = await run_in_threadpool(read_upload_bytes, record)
+        text = await run_in_threadpool(_extract_screenshot_ocr_text_sync, image_bytes)
         if not text:
             return
 

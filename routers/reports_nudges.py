@@ -1,3 +1,5 @@
+from upload_security import SecureMediaRoute
+from permissions import require_feature, require_any_feature, require_admin_session
 from fastapi import APIRouter, FastAPI, HTTPException, File, Depends, BackgroundTasks, Request, Query
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse, Response
@@ -111,14 +113,14 @@ from services.common_helpers import (
 )
 from services.scheduler_jobs import check_missed_visits, purge_old_screenshots
 
-router = APIRouter()
+router = APIRouter(route_class=SecureMediaRoute)
 
 @router.get("/admin/reports/attendance")
 async def attendance_report(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
     employee_type: Optional[str] = None,
-    admin=Depends(get_current_admin)
+    admin=Depends(require_feature("reports"))
 ):
     """Generate attendance report with filters."""
     query = {}
@@ -170,7 +172,7 @@ async def attendance_report(
 
 
 @router.get("/admin/reports/expenses")
-async def expense_report(admin=Depends(get_current_admin)):
+async def expense_report(admin=Depends(require_feature("reports"))):
     """Generate expense summary report."""
     scoped_emails = await get_scoped_employee_emails(admin)
     query = {
@@ -205,7 +207,7 @@ async def expense_report(admin=Depends(get_current_admin)):
 async def agent_performance_report(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
-    admin=Depends(get_current_admin)
+    admin=Depends(require_feature("reports"))
 ):
     """Aggregate visits and distance per agent."""
     org_id = admin.organization_id
@@ -299,7 +301,7 @@ async def agent_performance_report(
 async def leave_report(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
-    admin=Depends(get_current_admin)
+    admin=Depends(require_feature("reports"))
 ):
     """Generate leave analytics report."""
     scoped_emails = await get_scoped_employee_emails(admin)
@@ -352,7 +354,7 @@ async def leave_report(
 async def conversion_funnel_report(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
-    admin=Depends(get_current_admin)
+    admin=Depends(require_feature("reports"))
 ):
     """Aggregate visit outcomes for funnel visualization."""
     org_id = admin.organization_id
@@ -400,7 +402,7 @@ async def conversion_funnel_report(
 async def visit_frequency_report(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
-    admin=Depends(get_current_admin)
+    admin=Depends(require_feature("reports"))
 ):
     """Daily trends analysis."""
     org_id = admin.organization_id
@@ -545,7 +547,7 @@ async def get_nudge_history(manager=Depends(get_current_employee)):
 
 
 @router.post("/admin/nudge")
-async def admin_send_nudge(req: dict, admin=Depends(get_current_admin)):
+async def admin_send_nudge(req: dict, admin=Depends(require_feature("nudge"))):
     """
     Admin sends a motivational nudge/message to field team members in their organization.
     Supports private 1-to-1 nudge or broadcast to all field team employees.
@@ -634,7 +636,7 @@ async def admin_send_nudge(req: dict, admin=Depends(get_current_admin)):
 
 
 @router.get("/admin/nudge/history")
-async def admin_get_nudge_history(admin=Depends(get_current_admin)):
+async def admin_get_nudge_history(admin=Depends(require_feature("nudge"))):
     """Fetch history of nudges sent by admins in this organization."""
     query = {}
     if admin.organization_id:
@@ -731,7 +733,7 @@ async def mark_nudge_read(nudge_id: str, emp=Depends(get_current_employee)):
 
 
 @router.get("/admin/leaderboard")
-async def get_admin_leaderboard(admin=Depends(get_current_admin)):
+async def get_admin_leaderboard(admin=Depends(require_feature("leaderboard"))):
     """
     Weekly leaderboard for Admin Portal: Top 10 agents in the organization.
     """
@@ -807,7 +809,7 @@ async def get_admin_leaderboard(admin=Depends(get_current_admin)):
 async def get_employee_monthly_summary(
     email: str,
     month: str,  # Format: YYYY-MM
-    admin=Depends(get_current_admin)
+    admin=Depends(require_feature("reports"))
 ):
     """
     Get a detailed monthly summary for a specific employee.

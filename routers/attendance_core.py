@@ -1,3 +1,4 @@
+from upload_security import SecureMediaRoute
 from fastapi import APIRouter, FastAPI, HTTPException, File, Depends, BackgroundTasks, Request, Query
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse, Response
@@ -111,35 +112,15 @@ from services.common_helpers import (
 )
 from services.scheduler_jobs import check_missed_visits, purge_old_screenshots
 
-router = APIRouter()
+router = APIRouter(route_class=SecureMediaRoute)
 
 @router.post("/verify-presence")
-async def verify_presence(req: VerifyPresenceRequest, request: Request):
+async def verify_presence(req: VerifyPresenceRequest, request: Request, employee=Depends(get_current_employee)):
     """Verify user presence using face + GPS + WiFi telemetry."""
-    # Check caller authentication
-    clean_email = req.email.strip().lower() if req.email else ""
-    auth_header = request.headers.get("authorization", "")
-    token_email = None
-    if auth_header.startswith("Bearer "):
-        try:
-            token = auth_header.split(" ", 1)[1]
-            payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-            token_email = payload.get("sub", "").strip().lower()
-        except Exception:
-            pass
-
-    if token_email and clean_email and token_email != clean_email:
-        caller_admin = await admins_collection.find_one({"email": token_email})
-        if not caller_admin:
-            raise HTTPException(status_code=403, detail="Forbidden: Cannot mark attendance for another employee.")
-
-    if not clean_email and token_email:
-        clean_email = token_email
-
-    # 1. Find User
-    user = await employees_collection.find_one({"email": clean_email})
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found. Please register first.")
+    user = employee
+    clean_email = user["email"]
+    if req.email and req.email.strip().lower() != clean_email:
+        raise HTTPException(403, "Cannot verify another employee")
 
     # 2. Face Verification
     is_match, distance = verify_face(req.image, user["face_embedding"])
@@ -256,7 +237,7 @@ async def verify_presence(req: VerifyPresenceRequest, request: Request):
 
 
 @router.post("/smart-attendance")
-async def smart_attendance(req: VerifyPresenceRequest, request: Request, background_tasks: BackgroundTasks):
+async def smart_attendance(req: VerifyPresenceRequest, request: Request, background_tasks: BackgroundTasks, employee=Depends(get_current_employee)):
     """
     Unified endpoint for Enterprise Smart Attendance:
     - DESK: Strict WiFi (80%) + Office Geofence (4m).
@@ -272,79 +253,17 @@ async def smart_attendance(req: VerifyPresenceRequest, request: Request, backgro
         wifi_pct = 0
         office_wifi_ssid = None
         
-        # 1. Identity & Role Fetch
-        clean_email = req.email.strip().lower() if req.email else ""
-        auth_header = request.headers.get("authorization", "")
-        token_email = None
-        if auth_header.startswith("Bearer "):
-            try:
-                token = auth_header.split(" ", 1)[1]
-                payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-                token_email = payload.get("sub", "").strip().lower()
-            except Exception:
-                pass
-
-        if token_email and clean_email and token_email != clean_email:
-            caller_admin = await admins_collection.find_one({"email": token_email})
-            if not caller_admin:
-                raise HTTPException(status_code=403, detail="Forbidden: You cannot mark attendance for another employee.")
-
-        if not clean_email and token_email:
-            clean_email = token_email
-
-        user = await employees_collection.find_one({"email": clean_email}) if clean_email else None
+        user = employee
+        clean_email = employee["email"]
+        requested_email = (req.email or "").strip().lower()
+        if requested_email not in {"", "unknown", "auto", "smart@auto.com", clean_email}:
+            raise HTTPException(403, "Cannot mark attendance for another employee")
+        if req.organization_id and req.organization_id != employee.get("organization_id"):
+            raise HTTPException(403, "Organization mismatch")
         is_admin_user = False
-        
-        if not user:
-            # Try 1:N face search ONLY if email is blank/generic AND embedding is non-dummy
-            if req.image and (not clean_email or clean_email in ["unknown", "auto", ""]):
-                new_embedding = get_face_embedding(req.image)
-                if new_embedding is not None and not is_dummy_embedding(new_embedding):
-                    emp_query = {"face_embedding": {"$ne": None}}
-                    if req.organization_id:
-                        emp_query["organization_id"] = req.organization_id
-                    employees = await employees_collection.find(emp_query, {"_id": 1, "face_embedding": 1, "email": 1, "employee_type": 1, "organization_id": 1}).to_list(length=5000)
-                    for emp in employees:
-                        if emp.get("face_embedding") and not is_dummy_embedding(emp["face_embedding"]) and compare_faces(new_embedding, emp["face_embedding"]):
-                            user = emp
-                            clean_email = emp.get("email", "")
-                            break
-            
-            if not user and clean_email:
-                # Try Admin collection (Admins might be marking attendance for themselves)
-                user = await admins_collection.find_one({"email": clean_email})
-                if user:
-                    is_admin_user = True
-                    logger.info(f"Admin '{clean_email}' found in admins collection for attendance.")
+        is_reviewer = False
+        is_superadmin = False
 
-            # JWT Bearer Token Fallback: If user still not resolved (blank/generic email from app cold-start),
-            # extract identity from the Authorization header that the mobile app's Axios interceptor always attaches.
-            if not user:
-                auth_header = request.headers.get("authorization", "")
-                if auth_header.startswith("Bearer "):
-                    try:
-                        token = auth_header.split(" ", 1)[1]
-                        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-                        token_email = payload.get("sub", "").strip().lower()
-                        if token_email:
-                            logger.info(f"JWT fallback: Resolved email '{token_email}' from Bearer token (original email was '{clean_email}')")
-                            user = await employees_collection.find_one({"email": token_email})
-                            if not user:
-                                user = await admins_collection.find_one({"email": token_email})
-                                if user:
-                                    is_admin_user = True
-                            if user:
-                                clean_email = token_email
-                    except Exception as jwt_err:
-                        logger.warning(f"JWT fallback failed: {jwt_err}")
-
-            if not user:
-                raise HTTPException(status_code=404, detail="Identity not recognized. Please sign in or register.")
-
-        # Identity identified.
-        is_reviewer = (clean_email == "google.review@logday.app")
-        is_superadmin = (user.get("role") == "superadmin") or (clean_email == os.getenv("ADMIN_EMAIL", "admin@officeflow.ai")) or is_reviewer
-        
         # Fetch settings.
         org_id = user.get("organization_id")
         settings = await get_effective_org_settings(org_id)

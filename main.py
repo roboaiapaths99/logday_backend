@@ -1,3 +1,4 @@
+from permissions import require_feature, require_any_feature, require_admin_session
 from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
@@ -98,6 +99,9 @@ app = FastAPI(
     redoc_url="/redoc" if APP_ENV != "production" else None,
 )
 
+from body_limits import RequestBodyLimitMiddleware
+app.add_middleware(RequestBodyLimitMiddleware)
+
 # 1. Existing HRMS & Specialized Routers
 from hrms_onboarding import router as onboarding_router, employee_onboarding_router
 from hrms_payroll import router as payroll_router
@@ -107,6 +111,12 @@ from hrms_wfh import router as wfh_router
 from flyfield import router as flyfield_router
 from absence_alerts import router as absence_alerts_router, check_uninformed_absences_4pm
 
+from invitations import router as invitations_router
+app.include_router(invitations_router)
+from session_routes import router as session_router
+app.include_router(session_router)
+from upload_security import router as uploads_router
+app.include_router(uploads_router)
 app.include_router(onboarding_router)
 app.include_router(employee_onboarding_router)
 app.include_router(payroll_router)
@@ -121,7 +131,7 @@ app.include_router(absence_alerts_router)
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 _env_origins = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
-allowed_origins = set(_env_origins + [
+allowed_origins = set(_env_origins + ([] if APP_ENV == "production" else [
     "http://localhost:3000",
     "http://localhost:5173",
     "http://localhost:5180",
@@ -129,13 +139,13 @@ allowed_origins = set(_env_origins + [
     "http://127.0.0.1:5173",
     "http://127.0.0.1:5180",
     "https://logday-api.duckdns.org",
-])
-_ALLOWED_REGEX_COMPILED = re.compile(r"^https?://.*")
+]))
+if "*" in allowed_origins:
+    raise RuntimeError("ALLOWED_ORIGINS must contain explicit origins, not a wildcard")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_origin_regex=r"^https?://.*",
+    allow_origins=sorted(allowed_origins),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -147,27 +157,6 @@ async def add_cors_and_cache_headers(request: Request, call_next):
     req_id = request.headers.get("x-request-id") or uuid.uuid4().hex[:8]
     request.state.request_id = req_id
     start_perf = time.perf_counter()
-
-    origin = request.headers.get("origin")
-    is_allowed = False
-    if origin:
-        if origin in allowed_origins or _ALLOWED_REGEX_COMPILED.match(origin):
-            is_allowed = True
-        elif APP_ENV != "production":
-            is_allowed = True
-
-    if request.method == "OPTIONS":
-        response = Response(status_code=200)
-        if origin and is_allowed:
-            response.headers["Access-Control-Allow-Origin"] = origin
-            response.headers["Access-Control-Allow-Credentials"] = "true"
-        elif not origin:
-            response.headers["Access-Control-Allow-Origin"] = "*"
-        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS, PATCH"
-        response.headers["Access-Control-Allow-Headers"] = request.headers.get("access-control-request-headers", "*")
-        response.headers["Access-Control-Max-Age"] = "86400"
-        response.headers["X-Request-ID"] = req_id
-        return response
 
     response = await call_next(request)
 
@@ -183,12 +172,6 @@ async def add_cors_and_cache_headers(request: Request, call_next):
             "timestamp": datetime.now(timezone.utc).isoformat()
         })
 
-    if origin and is_allowed:
-        response.headers["Access-Control-Allow-Origin"] = origin
-        response.headers["Access-Control-Allow-Credentials"] = "true"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS, PATCH"
-    response.headers["Access-Control-Allow-Headers"] = "*"
-    response.headers["Access-Control-Expose-Headers"] = "X-Request-ID, X-Process-Time-Ms"
     response.headers["X-Request-ID"] = req_id
     response.headers["X-Process-Time-Ms"] = str(duration_ms)
 
@@ -234,6 +217,7 @@ async def http_exception_handler(request: Request, exc: HTTPException):
     origin = request.headers.get("origin")
     response = JSONResponse(
         status_code=exc.status_code,
+        headers=exc.headers,
         content={
             "status": "error",
             "code": f"HTTP_{exc.status_code}",
@@ -242,11 +226,9 @@ async def http_exception_handler(request: Request, exc: HTTPException):
             "request_id": req_id
         },
     )
-    if origin and origin != "*":
+    if origin in allowed_origins:
         response.headers["Access-Control-Allow-Origin"] = origin
         response.headers["Access-Control-Allow-Credentials"] = "true"
-    else:
-        response.headers["Access-Control-Allow-Origin"] = "*"
     response.headers["Access-Control-Allow-Headers"] = "*"
     response.headers["Access-Control-Allow-Methods"] = "*"
     response.headers["X-Request-ID"] = req_id
@@ -281,11 +263,9 @@ async def general_exception_handler(request: Request, exc: Exception):
             "request_id": req_id
         },
     )
-    if origin and origin != "*":
+    if origin in allowed_origins:
         response.headers["Access-Control-Allow-Origin"] = origin
         response.headers["Access-Control-Allow-Credentials"] = "true"
-    else:
-        response.headers["Access-Control-Allow-Origin"] = "*"
     response.headers["Access-Control-Allow-Headers"] = "*"
     response.headers["Access-Control-Allow-Methods"] = "*"
     response.headers["X-Request-ID"] = req_id
@@ -391,7 +371,7 @@ app.include_router(wfh_employee_router)
 app.include_router(wfh_admin_router)
 
 @app.get("/admin/system/diagnostics", tags=["System"])
-async def get_system_diagnostics(current_admin: Admin = Depends(get_current_admin)):
+async def get_system_diagnostics(current_admin: Admin = Depends(require_feature("settings"))):
     """Real-time admin diagnostics: server uptime, route count, scheduler jobs, recent slow APIs (>500ms), and recent server errors."""
     jobs_info = []
     try:
@@ -418,7 +398,7 @@ async def get_system_diagnostics(current_admin: Admin = Depends(get_current_admi
 
 
 @app.get("/debug/routes")
-async def debug_routes(current_admin: Admin = Depends(get_current_admin)):
+async def debug_routes(current_admin: Admin = Depends(require_feature("settings"))):
     if APP_ENV == "production" and not _is_superadmin(current_admin):
         raise HTTPException(status_code=403, detail="Debug endpoint not available in production")
     return [route.path for route in app.routes]

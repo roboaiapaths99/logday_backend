@@ -189,11 +189,15 @@ async def purge_old_screenshots():
                 expired_screens = await wfh_screenshots_collection.find(query).to_list(length=500)
                 if not expired_screens:
                     break
+                batch_deleted = 0
                 for screen in expired_screens:
                     image_url = screen.get("image_url", "")
-                    await delete_file_from_storage(image_url)
-                    await wfh_screenshots_collection.delete_one({"_id": screen["_id"]})
-                    purged_count += 1
+                    if await delete_file_from_storage(image_url):
+                        await wfh_screenshots_collection.delete_one({"_id": screen["_id"]})
+                        purged_count += 1
+                        batch_deleted += 1
+                if not batch_deleted:
+                    break
                 
         logger.info(f"Finished scheduled job: purge_old_screenshots. Purged {purged_count} screenshots.")
     except Exception as e:

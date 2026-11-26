@@ -1,3 +1,5 @@
+from upload_security import SecureMediaRoute
+from permissions import require_feature, require_any_feature, require_admin_session
 import base64
 import calendar
 import io
@@ -33,6 +35,7 @@ from permissions import require_feature
 from attendance_service import classify_attendance_day
 
 router = APIRouter(
+    route_class=SecureMediaRoute,
     prefix="/admin/payroll",
     tags=["HRMS Payroll"],
     dependencies=[Depends(require_feature("payroll"))]
@@ -703,7 +706,7 @@ async def list_payrolls(
     department: Optional[str] = None,
     status: Optional[str] = None,
     auto_sync: bool = True,
-    current_admin: Admin = Depends(get_current_admin)
+    current_admin: Admin = Depends(require_feature("payroll"))
 ):
     """List payroll records for a month and/or department. Automatically calculates missing employee drafts."""
     if payroll_month and auto_sync:
@@ -734,7 +737,7 @@ async def list_payrolls(
     return payrolls
 
 @router.get("/stats")
-async def get_payroll_stats(payroll_month: str, current_admin: Admin = Depends(get_current_admin)):
+async def get_payroll_stats(payroll_month: str, current_admin: Admin = Depends(require_feature("payroll"))):
     """Summary of total gross, net, deductions, and processed counts for a month."""
     org_filter = get_org_filter(current_admin)
     
@@ -770,7 +773,7 @@ async def get_payroll_stats(payroll_month: str, current_admin: Admin = Depends(g
     }
 
 @router.get("/days-off")
-async def get_days_off(payroll_month: str, organization_id: Optional[str] = None, current_admin: Admin = Depends(get_current_admin)):
+async def get_days_off(payroll_month: str, organization_id: Optional[str] = None, current_admin: Admin = Depends(require_feature("payroll"))):
     """Fetch configured days off (non-working days) for the month."""
     org_id = current_admin.organization_id
     if (current_admin.role == "superadmin" or org_id == "system_org") and organization_id:
@@ -814,7 +817,7 @@ async def get_days_off(payroll_month: str, organization_id: Optional[str] = None
     return {"days_off": sorted(list(days_off_set))}
 
 @router.post("/days-off")
-async def save_days_off(req: DaysOffSaveRequest, current_admin: Admin = Depends(get_current_admin)):
+async def save_days_off(req: DaysOffSaveRequest, current_admin: Admin = Depends(require_feature("payroll"))):
     """Save custom days off configuration for the month without overwriting named holiday documents."""
     org_id = current_admin.organization_id
     if (current_admin.role == "superadmin" or org_id == "system_org") and req.organization_id:
@@ -911,7 +914,7 @@ def _public_email_settings(cfg: dict) -> dict:
 
 
 @router.get("/smtp-settings")
-async def get_payroll_smtp_settings(current_admin: Admin = Depends(get_current_admin)):
+async def get_payroll_smtp_settings(current_admin: Admin = Depends(require_feature("payroll"))):
     """Fetch current email (Brevo) configuration status for sending salary slips."""
     org_id = current_admin.organization_id or "system_org"
     cfg = await _get_org_smtp_config(org_id)
@@ -919,7 +922,7 @@ async def get_payroll_smtp_settings(current_admin: Admin = Depends(get_current_a
 
 
 @router.post("/smtp-settings")
-async def save_payroll_smtp_settings(req: dict, current_admin: Admin = Depends(get_current_admin)):
+async def save_payroll_smtp_settings(req: dict, current_admin: Admin = Depends(require_feature("payroll"))):
     """Save Brevo email configuration for sending salary slips to employee login emails."""
     org_id = current_admin.organization_id or "system_org"
     if org_id == "system_org":
@@ -963,7 +966,7 @@ async def save_payroll_smtp_settings(req: dict, current_admin: Admin = Depends(g
 
 
 @router.post("/smtp-settings/test")
-async def test_payroll_email_settings(req: dict = Body(default={}), current_admin: Admin = Depends(get_current_admin)):
+async def test_payroll_email_settings(req: dict = Body(default={}), current_admin: Admin = Depends(require_feature("payroll"))):
     """Send a test email via the configured provider (defaults to the logged-in admin's email)."""
     org_id = current_admin.organization_id or "system_org"
     cfg = await _get_org_smtp_config(org_id)
@@ -988,7 +991,7 @@ async def test_payroll_email_settings(req: dict = Body(default={}), current_admi
 
 
 @router.get("/{id}")
-async def get_payroll(id: str, current_admin: Admin = Depends(get_current_admin)):
+async def get_payroll(id: str, current_admin: Admin = Depends(require_feature("payroll"))):
     """Fetch details of a single employee's payroll record."""
     org_filter = get_org_filter(current_admin)
     try:
@@ -1005,7 +1008,7 @@ async def get_payroll(id: str, current_admin: Admin = Depends(get_current_admin)
     return p
 
 @router.post("/calculate")
-async def calculate_employee_payroll(payload: PayrollCreate, current_admin: Admin = Depends(get_current_admin)):
+async def calculate_employee_payroll(payload: PayrollCreate, current_admin: Admin = Depends(require_feature("payroll"))):
     """Calculate and save/update a single DRAFT payroll record."""
     org_id = current_admin.organization_id
     email_clean = payload.employee_email.strip().lower()
@@ -1155,7 +1158,7 @@ async def calculate_employee_payroll(payload: PayrollCreate, current_admin: Admi
     return payroll_doc
 
 @router.post("/run-monthly")
-async def run_monthly_payroll(payload: PayrollRunRequest, current_admin: Admin = Depends(get_current_admin)):
+async def run_monthly_payroll(payload: PayrollRunRequest, current_admin: Admin = Depends(require_feature("payroll"))):
     """Run bulk payroll calculations for all active employees according to salary and attendance."""
     org_id = current_admin.organization_id
     
@@ -1303,7 +1306,7 @@ async def run_monthly_payroll(payload: PayrollRunRequest, current_admin: Admin =
     }
 
 @router.put("/{id}")
-async def edit_payroll_draft(id: str, updates: dict, current_admin: Admin = Depends(get_current_admin)):
+async def edit_payroll_draft(id: str, updates: dict, current_admin: Admin = Depends(require_feature("payroll"))):
     """Edit payroll salary, attendance days, bonuses/deductions, or override the final net payable amount directly."""
     org_filter = get_org_filter(current_admin)
     try:
@@ -1452,7 +1455,7 @@ async def edit_payroll_draft(id: str, updates: dict, current_admin: Admin = Depe
     return p_updated
 
 @router.post("/{id}/approve")
-async def approve_payroll(id: str, current_admin: Admin = Depends(get_current_admin)):
+async def approve_payroll(id: str, current_admin: Admin = Depends(require_feature("payroll"))):
     """Approve a draft payroll record."""
     org_filter = get_org_filter(current_admin)
     try:
@@ -1478,7 +1481,7 @@ async def approve_payroll(id: str, current_admin: Admin = Depends(get_current_ad
     return {"message": "Payroll approved successfully", "status": PayrollStatus.APPROVED}
 
 @router.post("/bulk-approve")
-async def bulk_approve_payrolls(payload: Any = Body(...), current_admin: Admin = Depends(get_current_admin)):
+async def bulk_approve_payrolls(payload: Any = Body(...), current_admin: Admin = Depends(require_feature("payroll"))):
     """Approve multiple draft payroll records at once. Accepts either ['id1', ...] or {'ids': ['id1', ...]}."""
     if isinstance(payload, dict):
         ids = payload.get("ids") or []
@@ -1505,7 +1508,7 @@ async def bulk_approve_payrolls(payload: Any = Body(...), current_admin: Admin =
     return {"message": f"Successfully approved {result.modified_count} payroll records."}
 
 @router.post("/{id}/lock")
-async def lock_payroll(id: str, current_admin: Admin = Depends(get_current_admin)):
+async def lock_payroll(id: str, current_admin: Admin = Depends(require_feature("payroll"))):
     """Lock an approved payroll record to finalize it."""
     org_filter = get_org_filter(current_admin)
     try:
@@ -1531,7 +1534,7 @@ async def lock_payroll(id: str, current_admin: Admin = Depends(get_current_admin
     return {"message": "Payroll locked successfully", "status": PayrollStatus.LOCKED}
 
 @router.post("/{id}/mark-paid")
-async def mark_payroll_paid(id: str, req: dict, current_admin: Admin = Depends(get_current_admin)):
+async def mark_payroll_paid(id: str, req: dict, current_admin: Admin = Depends(require_feature("payroll"))):
     """Mark a locked payroll record as paid."""
     org_filter = get_org_filter(current_admin)
     try:
@@ -1561,7 +1564,7 @@ async def mark_payroll_paid(id: str, req: dict, current_admin: Admin = Depends(g
     return {"message": "Payroll marked as paid", "status": PayrollStatus.PAID}
 
 @router.get("/{id}/payslip")
-async def get_payslip_data(id: str, current_admin: Admin = Depends(get_current_admin)):
+async def get_payslip_data(id: str, current_admin: Admin = Depends(require_feature("payroll"))):
     """Generate payslip details for rendering."""
     org_filter = get_org_filter(current_admin)
     try:
@@ -2019,7 +2022,7 @@ async def _dispatch_single_payslip(p: dict, current_admin: Admin) -> dict:
 
 
 @router.get("/{id}/download-pdf")
-async def admin_download_payslip_pdf(id: str, current_admin: Admin = Depends(get_current_admin)):
+async def admin_download_payslip_pdf(id: str, current_admin: Admin = Depends(require_feature("payroll"))):
     """Download the PDF salary slip from the Admin Panel."""
     org_filter = get_org_filter(current_admin)
     try:
@@ -2042,7 +2045,7 @@ async def admin_download_payslip_pdf(id: str, current_admin: Admin = Depends(get
 
 
 @router.post("/{id}/send")
-async def send_payroll_to_employee(id: str, current_admin: Admin = Depends(get_current_admin)):
+async def send_payroll_to_employee(id: str, current_admin: Admin = Depends(require_feature("payroll"))):
     """Send the calculated/adjusted salary slip to the employee's LogDay login email and release in-app."""
     org_filter = get_org_filter(current_admin)
     try:
@@ -2059,7 +2062,7 @@ async def send_payroll_to_employee(id: str, current_admin: Admin = Depends(get_c
 
 
 @router.post("/bulk-send")
-async def bulk_send_payrolls_to_employees(payload: Any = Body(...), current_admin: Admin = Depends(get_current_admin)):
+async def bulk_send_payrolls_to_employees(payload: Any = Body(...), current_admin: Admin = Depends(require_feature("payroll"))):
     """Send multiple salary slips at once to employees' LogDay login emails."""
     if isinstance(payload, dict):
         ids = payload.get("ids") or []

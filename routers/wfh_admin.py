@@ -1,3 +1,5 @@
+from upload_security import SecureMediaRoute
+from permissions import require_feature, require_any_feature, require_admin_session
 from fastapi import APIRouter, FastAPI, HTTPException, File, Depends, BackgroundTasks, Request, Query
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse, Response
@@ -111,12 +113,12 @@ from services.common_helpers import (
 )
 from services.scheduler_jobs import check_missed_visits, purge_old_screenshots
 
-router = APIRouter()
+router = APIRouter(route_class=SecureMediaRoute)
 
 @router.get("/admin/wfh/devices")
 async def admin_list_wfh_devices(
     status: Optional[str] = None,
-    current_admin: Admin = Depends(get_current_admin)
+    current_admin: Admin = Depends(require_feature("wfh_monitoring"))
 ):
     """
     Admin lists all WFH registered devices in their organization.
@@ -144,7 +146,7 @@ async def admin_list_wfh_devices(
 @router.post("/admin/wfh/devices/{device_record_id}/approve")
 async def admin_approve_wfh_device(
     device_record_id: str,
-    current_admin: Admin = Depends(get_current_admin)
+    current_admin: Admin = Depends(require_feature("wfh_monitoring"))
 ):
     """
     Admin approves a WFH device.
@@ -189,7 +191,7 @@ async def admin_approve_wfh_device(
 async def admin_revoke_wfh_device(
     device_record_id: str,
     req: dict,
-    current_admin: Admin = Depends(get_current_admin)
+    current_admin: Admin = Depends(require_feature("wfh_monitoring"))
 ):
     """
     Admin revokes a WFH device.
@@ -229,7 +231,7 @@ async def admin_revoke_wfh_device(
 
 
 @router.get("/admin/wfh/stats")
-async def admin_wfh_stats(current_admin: Admin = Depends(get_current_admin)):
+async def admin_wfh_stats(current_admin: Admin = Depends(require_any_feature("wfh_management", "wfh_monitoring"))):
     org_id = current_admin.organization_id
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
@@ -312,7 +314,7 @@ async def admin_wfh_stats(current_admin: Admin = Depends(get_current_admin)):
 
 
 @router.get("/admin/wfh/live-view")
-async def admin_wfh_live_view(request: Request, current_admin: Admin = Depends(get_current_admin)):
+async def admin_wfh_live_view(request: Request, current_admin: Admin = Depends(require_feature("wfh_monitoring"))):
     org_id = current_admin.organization_id
 
     try:
@@ -416,7 +418,7 @@ async def admin_wfh_live_view(request: Request, current_admin: Admin = Depends(g
 
 
 @router.post("/admin/wfh/employee/{email}/trigger-screenshot")
-async def admin_trigger_screenshot(email: str, current_admin: Admin = Depends(get_current_admin)):
+async def admin_trigger_screenshot(email: str, current_admin: Admin = Depends(require_feature("wfh_monitoring"))):
     clean_email = email.strip().lower()
     
     # Check if employee exists
@@ -436,7 +438,7 @@ async def admin_trigger_screenshot(email: str, current_admin: Admin = Depends(ge
 
 
 @router.post("/admin/wfh/employee/{email}/force-end")
-async def admin_force_end_session(email: str, req: dict, current_admin: Admin = Depends(get_current_admin)):
+async def admin_force_end_session(email: str, req: dict, current_admin: Admin = Depends(require_feature("wfh_monitoring"))):
     clean_email = email.strip().lower()
     reason = req.get("reason", "Force-ended by administrator").strip()
     
@@ -551,7 +553,7 @@ async def admin_force_end_session(email: str, req: dict, current_admin: Admin = 
 
 
 @router.post("/admin/wfh/employee/{email}/force-logout")
-async def admin_force_logout(email: str, current_admin: Admin = Depends(get_current_admin)):
+async def admin_force_logout(email: str, current_admin: Admin = Depends(require_feature("wfh_monitoring"))):
     clean_email = email.strip().lower()
     
     user = await employees_collection.find_one({"email": clean_email})
@@ -630,7 +632,7 @@ async def admin_force_logout(email: str, current_admin: Admin = Depends(get_curr
 
 
 @router.get("/admin/wfh/policy")
-async def get_wfh_policy(current_admin: Admin = Depends(get_current_admin)):
+async def get_wfh_policy(current_admin: Admin = Depends(require_feature("wfh_monitoring"))):
     org_id = current_admin.organization_id
     if not org_id:
         raise HTTPException(status_code=400, detail="Admin organization missing")
@@ -657,7 +659,7 @@ async def get_wfh_policy(current_admin: Admin = Depends(get_current_admin)):
 
 
 @router.put("/admin/wfh/policy")
-async def update_wfh_policy(req: dict, current_admin: Admin = Depends(get_current_admin)):
+async def update_wfh_policy(req: dict, current_admin: Admin = Depends(require_feature("wfh_monitoring"))):
     org_id = current_admin.organization_id
     if not org_id:
         raise HTTPException(status_code=400, detail="Admin organization missing")
@@ -692,7 +694,7 @@ async def admin_wfh_employee_screenshots(
     email: str,
     date: Optional[str] = None,
     limit: int = 100,
-    current_admin: Admin = Depends(get_current_admin)
+    current_admin: Admin = Depends(require_feature("wfh_monitoring"))
 ):
     clean_email = email.strip().lower()
 
@@ -720,7 +722,7 @@ async def admin_wfh_employee_screenshots_download(
     request: Request,
     email: str,
     date: Optional[str] = None,
-    current_admin: Admin = Depends(get_current_admin)
+    current_admin: Admin = Depends(require_feature("wfh_monitoring"))
 ):
     import zipfile
     import io
@@ -746,27 +748,7 @@ async def admin_wfh_employee_screenshots_download(
     if not screenshots:
         raise HTTPException(status_code=404, detail="No screenshots found for the selected date")
 
-    def compress_screenshot(image_url: str) -> bytes:
-        img_bytes = None
-        local_path = None
-        if "/uploads/" in image_url:
-            idx = image_url.find("/uploads/")
-            local_path = image_url[idx:].lstrip("/")
-
-        if local_path and os.path.exists(local_path):
-            with open(local_path, "rb") as f:
-                img_bytes = f.read()
-        elif image_url.startswith("http://") or image_url.startswith("https://"):
-            resp = requests.get(image_url, timeout=10)
-            resp.raise_for_status()
-            img_bytes = resp.content
-        else:
-            local_path = image_url.lstrip("/")
-            if not os.path.exists(local_path):
-                raise FileNotFoundError(f"File not found: {local_path}")
-            with open(local_path, "rb") as f:
-                img_bytes = f.read()
-
+    def compress_screenshot(img_bytes: bytes) -> bytes:
         img = Image.open(io.BytesIO(img_bytes))
         if img.mode != "RGB":
             img = img.convert("RGB")
@@ -801,7 +783,12 @@ async def admin_wfh_employee_screenshots_download(
 
         async with semaphore:
             try:
-                compressed_data = await run_in_threadpool(compress_screenshot, image_url)
+                from database import uploads_collection
+                from upload_security import authorize_upload, read_upload_bytes
+                record = await uploads_collection.find_one({"url": image_url})
+                await authorize_upload(record, current_admin.model_dump(), "admin")
+                image_bytes = await run_in_threadpool(read_upload_bytes, record)
+                compressed_data = await run_in_threadpool(compress_screenshot, image_bytes)
                 return {"filename": filename, "data": compressed_data, "success": True}
             except Exception as e:
                 err_msg = f"Failed to compress {image_url}: {str(e)}"
@@ -850,7 +837,7 @@ async def admin_wfh_employee_activity(
     email: str,
     date: Optional[str] = None,
     limit: int = 200,
-    current_admin: Admin = Depends(get_current_admin)
+    current_admin: Admin = Depends(require_feature("wfh_monitoring"))
 ):
     clean_email = email.strip().lower()
 
@@ -878,7 +865,7 @@ async def admin_wfh_employee_apps(
     email: str,
     date: Optional[str] = None,
     limit: int = 100,
-    current_admin: Admin = Depends(get_current_admin)
+    current_admin: Admin = Depends(require_feature("wfh_monitoring"))
 ):
     clean_email = email.strip().lower()
 
@@ -904,7 +891,7 @@ async def admin_wfh_employee_productivity(
     email: str,
     date: Optional[str] = None,
     limit: int = 100,
-    current_admin: Admin = Depends(get_current_admin)
+    current_admin: Admin = Depends(require_feature("wfh_monitoring"))
 ):
     clean_email = email.strip().lower()
 
@@ -929,7 +916,7 @@ async def admin_wfh_employee_productivity(
 async def admin_wfh_employee_timeline(
     email: str,
     date: Optional[str] = None,
-    current_admin: Admin = Depends(get_current_admin)
+    current_admin: Admin = Depends(require_feature("wfh_monitoring"))
 ):
     clean_email = email.strip().lower()
 
@@ -1017,7 +1004,7 @@ async def admin_wfh_alerts(
     status: Optional[str] = None,
     severity: Optional[str] = None,
     limit: int = 100,
-    current_admin: Admin = Depends(get_current_admin)
+    current_admin: Admin = Depends(require_feature("wfh_monitoring"))
 ):
     query = {}
 
@@ -1043,7 +1030,7 @@ async def admin_wfh_alerts(
 async def admin_review_wfh_alert(
     alert_id: str,
     req: dict,
-    current_admin: Admin = Depends(get_current_admin)
+    current_admin: Admin = Depends(require_feature("wfh_monitoring"))
 ):
     if not ObjectId.is_valid(alert_id):
         raise HTTPException(status_code=400, detail="Invalid alert id")
@@ -1077,7 +1064,7 @@ async def admin_review_wfh_alert(
 
 
 @router.get("/admin/wfh/employee/{email}/tasks")
-async def admin_get_employee_tasks(email: str, current_admin: Admin = Depends(get_current_admin)):
+async def admin_get_employee_tasks(email: str, current_admin: Admin = Depends(require_feature("wfh_monitoring"))):
     clean_email = email.strip().lower()
     query = {"employee_email": clean_email}
     
@@ -1092,7 +1079,7 @@ async def admin_get_employee_tasks(email: str, current_admin: Admin = Depends(ge
 
 
 @router.post("/admin/wfh/employee/{email}/tasks")
-async def admin_assign_employee_task(email: str, req: dict, current_admin: Admin = Depends(get_current_admin)):
+async def admin_assign_employee_task(email: str, req: dict, current_admin: Admin = Depends(require_feature("wfh_monitoring"))):
     clean_email = email.strip().lower()
     title = req.get("title")
     if not title:
@@ -1131,7 +1118,7 @@ async def get_wfh_reports_productivity(
     end_date: Optional[str] = None,
     employee_email: Optional[str] = None,
     format: str = "json",
-    current_admin: Admin = Depends(get_current_admin)
+    current_admin: Admin = Depends(require_feature("wfh_monitoring"))
 ):
     query = {}
     if current_admin.organization_id and current_admin.organization_id != "system_org":
@@ -1200,7 +1187,7 @@ async def get_wfh_reports_app_usage(
     end_date: Optional[str] = None,
     employee_email: Optional[str] = None,
     format: str = "json",
-    current_admin: Admin = Depends(get_current_admin)
+    current_admin: Admin = Depends(require_feature("wfh_monitoring"))
 ):
     query = {}
     if current_admin.organization_id and current_admin.organization_id != "system_org":
@@ -1264,7 +1251,7 @@ async def get_wfh_reports_attendance(
     end_date: Optional[str] = None,
     employee_email: Optional[str] = None,
     format: str = "json",
-    current_admin: Admin = Depends(get_current_admin)
+    current_admin: Admin = Depends(require_feature("wfh_monitoring"))
 ):
     query = {}
     if current_admin.organization_id and current_admin.organization_id != "system_org":
@@ -1347,7 +1334,7 @@ async def get_wfh_reports_screenshots(
     end_date: Optional[str] = None,
     employee_email: Optional[str] = None,
     format: str = "json",
-    current_admin: Admin = Depends(get_current_admin)
+    current_admin: Admin = Depends(require_feature("wfh_monitoring"))
 ):
     query = {}
     if current_admin.organization_id and current_admin.organization_id != "system_org":

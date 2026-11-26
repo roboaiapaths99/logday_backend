@@ -1,3 +1,6 @@
+from upload_security import register_upload, validate_image_bytes
+from upload_security import SecureMediaRoute
+from permissions import require_feature, require_any_feature, require_admin_session
 import os
 import uuid
 import math
@@ -26,7 +29,7 @@ from auth import get_current_employee, get_current_admin
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(tags=["LogDay FlyField"])
+router = APIRouter(route_class=SecureMediaRoute, tags=["LogDay FlyField"])
 
 # In-memory geocode cache to avoid redundant lookups (bounded to prevent memory leaks)
 FLYFIELD_GEOCODE_CACHE: Dict[tuple, str] = {}
@@ -452,9 +455,11 @@ async def upload_flyfield_media(
     filename = f"{uuid.uuid4().hex[:16]}{ext}"
     file_path = os.path.join(folder_dir, filename)
 
-    content = await target_file.read()
+    content = await target_file.read(MAX_MEDIA_BYTES + 1)
     if len(content) > MAX_MEDIA_BYTES:
         raise HTTPException(status_code=413, detail="Uploaded media file exceeds 15 MB limit.")
+    if media_type == "photo":
+        await run_in_threadpool(validate_image_bytes, content)
     with open(file_path, "wb") as f:
         f.write(content)
 
@@ -462,6 +467,7 @@ async def upload_flyfield_media(
     cur_long = long if long is not None else (longitude or 0.0)
 
     public_url = f"/uploads/flyfield/{org_id}/{today_str}/{filename}"
+    await register_upload(public_url, user, "field_media", size=len(content))
     resolved_addr = await resolve_real_address(cur_lat, cur_long, address) if cur_lat and cur_long else visit.get("check_in_address")
 
     media_item = {
@@ -626,7 +632,7 @@ async def get_flyfield_history(month: Optional[str] = None, user: dict = Depends
 # ==============================================================================
 
 @router.get("/admin/flyfield/live")
-async def get_admin_flyfield_live(admin = Depends(get_current_admin)):
+async def get_admin_flyfield_live(admin = Depends(require_feature("flyfield"))):
     """
     Live real-time status of all FlyField employees in admin's organization:
     - Day status (Active / Completed / Not Started)
@@ -824,7 +830,7 @@ async def get_admin_flyfield_live(admin = Depends(get_current_admin)):
 
 
 @router.get("/admin/flyfield/employee/{email}/timeline")
-async def get_admin_employee_timeline(email: str, date: Optional[str] = None, admin = Depends(get_current_admin)):
+async def get_admin_employee_timeline(email: str, date: Optional[str] = None, admin = Depends(require_feature("flyfield"))):
     """Admin timeline view for a specific FlyField employee (Organization-scoped)"""
     clean_email = email.strip().lower()
     if admin.organization_id and admin.organization_id != "system_org" and getattr(admin, "role", "") != "superadmin":
@@ -839,7 +845,7 @@ async def get_admin_flyfield_visits(
     date: Optional[str] = None,
     employee_email: Optional[str] = None,
     status_filter: Optional[str] = None,
-    admin = Depends(get_current_admin)
+    admin = Depends(require_feature("flyfield"))
 ):
     """Tabular list of all FlyField visits with real addresses, photos, and playable voice notes"""
     org_id = admin.organization_id
@@ -866,7 +872,7 @@ async def get_admin_flyfield_visits(
 
 
 @router.post("/admin/flyfield/visit/{visit_id}/close")
-async def admin_close_stuck_visit(visit_id: str, admin = Depends(get_current_admin)):
+async def admin_close_stuck_visit(visit_id: str, admin = Depends(require_feature("flyfield"))):
     """Allows Admin to close a visit if an employee forgot to checkout"""
     try:
         obj_id = ObjectId(visit_id)

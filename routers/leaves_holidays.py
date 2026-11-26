@@ -1,3 +1,6 @@
+from upload_security import save_local_image
+from upload_security import SecureMediaRoute
+from permissions import require_feature, require_any_feature, require_admin_session
 from fastapi import APIRouter, FastAPI, HTTPException, File, Depends, BackgroundTasks, Request, Query
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse, Response
@@ -111,38 +114,16 @@ from services.common_helpers import (
 )
 from services.scheduler_jobs import check_missed_visits, purge_old_screenshots
 
-router = APIRouter()
+router = APIRouter(route_class=SecureMediaRoute)
 
 @router.post("/api/leave/request")
 async def create_leave_request(req: dict, employee=Depends(get_current_employee)):
     """Submit a new Leave or On-Duty (OD) request with optional duration (full_day, half_day, short_leave) and proof."""
     try:
         proof_file_url = None
-        if req.get("proof_url") and req["proof_url"].startswith("data:image"):
-            # Handle base64 image upload
-            try:
-                import base64
-                import uuid
-                
-                # Ensure proofs directory exists
-                proofs_dir = os.path.join(UPLOAD_DIR, "proofs")
-                if not os.path.exists(proofs_dir):
-                    os.makedirs(proofs_dir)
-                
-                header, encoded = req["proof_url"].split(",", 1)
-                ext = header.split("/")[1].split(";")[0]
-                filename = f"proof_{uuid.uuid4()}.{ext}"
-                file_path = os.path.join(proofs_dir, filename)
-                
-                with open(file_path, "wb") as f:
-                    f.write(base64.b64decode(encoded))
-                
-                proof_file_url = f"/uploads/proofs/{filename}"
-                logger.info(f"Proof uploaded and saved to {proof_file_url}")
-            except Exception as upload_err:
-                logger.error(f"Failed to process proof upload: {upload_err}")
-                # We'll continue without the proof if it fails
-        
+        if req.get("proof_url"):
+            proof_file_url = await save_local_image(req["proof_url"], employee, "leave_proof", "proofs")
+
         start_date = normalize_date_str(req.get("start_date", ""))
         end_date = normalize_date_str(req.get("end_date", start_date))
         duration_type = str(req.get("duration_type", "full_day")).lower().strip()
@@ -187,6 +168,8 @@ async def create_leave_request(req: dict, employee=Depends(get_current_employee)
             "exceeds_quota": exceeds_quota,
             "duration": duration
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Failed to create leave request: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to submit request")
@@ -319,7 +302,7 @@ async def leave_decision(payload: dict, manager=Depends(get_current_employee)):
 
 
 @router.get("/admin/leave/requests")
-async def admin_get_leave_requests(status: Optional[str] = None, admin: dict = Depends(get_current_admin)):
+async def admin_get_leave_requests(status: Optional[str] = None, admin: dict = Depends(require_feature("leaves"))):
     """List all leave requests for the organization (Role Scoped)."""
     filter_query = get_employee_filter(admin)
     
@@ -421,7 +404,7 @@ async def post_leave_message(request_id: str, payload: dict, auth_data=Depends(g
 
 
 @router.post("/admin/leave/requests/{request_id}/{action}")
-async def handle_leave_request(request_id: str, action: str, req_body: Optional[dict] = None, admin: dict = Depends(get_current_admin)):
+async def handle_leave_request(request_id: str, action: str, req_body: Optional[dict] = None, admin: dict = Depends(require_feature("leaves"))):
     """Handle (Approve/Reject/Cancel) a leave request with optional is_paid flag."""
     try:
         obj_id = ObjectId(request_id)
@@ -541,7 +524,7 @@ async def handle_leave_request(request_id: str, action: str, req_body: Optional[
 
 
 @router.put("/admin/leave/requests/{request_id}/payment-status")
-async def toggle_leave_payment_status(request_id: str, req_body: dict, admin: dict = Depends(get_current_admin)):
+async def toggle_leave_payment_status(request_id: str, req_body: dict, admin: dict = Depends(require_feature("leaves"))):
     """Toggle whether an approved leave is Paid or Loss of Pay (LOP) for payroll."""
     try:
         obj_id = ObjectId(request_id)
@@ -568,7 +551,7 @@ async def toggle_leave_payment_status(request_id: str, req_body: dict, admin: di
 
 
 @router.post("/admin/attendance/convert-absent-to-leave")
-async def convert_absent_to_leave(req: ConvertAbsentToLeaveRequest, admin: Admin = Depends(get_current_admin)):
+async def convert_absent_to_leave(req: ConvertAbsentToLeaveRequest, admin: Admin = Depends(require_feature("attendance"))):
     """Admin regularization: Convert an Absent day into an Approved Leave (e.g. informed via Email/WhatsApp)."""
     clean_email = req.employee_email.strip().lower()
     clean_date = normalize_date_str(req.date)
@@ -636,7 +619,7 @@ async def convert_absent_to_leave(req: ConvertAbsentToLeaveRequest, admin: Admin
 
 
 @router.post("/admin/holidays")
-async def admin_create_holiday(req: HolidayCreateRequest, admin: dict = Depends(get_current_admin)):
+async def admin_create_holiday(req: HolidayCreateRequest, admin: dict = Depends(require_feature("leaves"))):
     """Create or update a named holiday for the organization."""
     org_id = admin.organization_id or "system_org"
     date_str = req.date.strip()
@@ -672,7 +655,7 @@ async def admin_create_holiday(req: HolidayCreateRequest, admin: dict = Depends(
 
 
 @router.post("/admin/holidays/bulk")
-async def admin_bulk_create_holidays(req: HolidayBulkCreateRequest, admin: dict = Depends(get_current_admin)):
+async def admin_bulk_create_holidays(req: HolidayBulkCreateRequest, admin: dict = Depends(require_feature("leaves"))):
     """Bulk create holidays for the organization."""
     org_id = admin.organization_id or "system_org"
     created_count = 0
@@ -714,7 +697,7 @@ async def admin_bulk_create_holidays(req: HolidayBulkCreateRequest, admin: dict 
 
 
 @router.get("/admin/holidays")
-async def admin_get_holidays(year: Optional[int] = None, month: Optional[str] = None, admin: dict = Depends(get_current_admin)):
+async def admin_get_holidays(year: Optional[int] = None, month: Optional[str] = None, admin: dict = Depends(require_feature("leaves"))):
     """List all configured holidays for the admin's organization."""
     org_id = admin.organization_id or "system_org"
     query = {
@@ -740,7 +723,7 @@ async def admin_get_holidays(year: Optional[int] = None, month: Optional[str] = 
 
 
 @router.delete("/admin/holidays/{holiday_id_or_date}")
-async def admin_delete_holiday(holiday_id_or_date: str, admin: dict = Depends(get_current_admin)):
+async def admin_delete_holiday(holiday_id_or_date: str, admin: dict = Depends(require_feature("leaves"))):
     """Delete a holiday by its ID or YYYY-MM-DD date."""
     org_id = admin.organization_id or "system_org"
     query = {}
@@ -804,7 +787,7 @@ async def employee_get_holidays(year: Optional[int] = None, employee: dict = Dep
 
 
 @router.get("/admin/leave-policy")
-async def admin_get_leave_policy(year: Optional[int] = None, admin: dict = Depends(get_current_admin)):
+async def admin_get_leave_policy(year: Optional[int] = None, admin: dict = Depends(require_feature("leaves"))):
     """Fetch org-wide leave policy and quotas with enterprise attendance rules."""
     org_id = admin.organization_id or "system_org"
     if not year:
@@ -876,7 +859,7 @@ async def admin_get_leave_policy(year: Optional[int] = None, admin: dict = Depen
 
 
 @router.put("/admin/leave-policy")
-async def admin_update_leave_policy(req: LeavePolicyUpdateRequest, admin: dict = Depends(get_current_admin)):
+async def admin_update_leave_policy(req: LeavePolicyUpdateRequest, admin: dict = Depends(require_feature("leaves"))):
     """Set organization-wide default leave quotas, allocation cycle, carry forward, and paid/unpaid rules."""
     org_id = admin.organization_id or "system_org"
     year = req.year or datetime.now(timezone.utc).year
@@ -958,7 +941,7 @@ async def admin_update_leave_policy(req: LeavePolicyUpdateRequest, admin: dict =
 async def admin_update_employee_leave_quota(
     email: str,
     req: EmployeeLeaveQuotaUpdateRequest,
-    admin: dict = Depends(get_current_admin)
+    admin: dict = Depends(require_feature("leaves"))
 ):
     """Set custom leave quota override for a specific employee."""
     org_id = admin.organization_id or "system_org"
@@ -996,7 +979,7 @@ async def admin_get_employee_leave_balance(
     email: str,
     year: Optional[int] = None,
     month: Optional[str] = None,
-    admin: dict = Depends(get_current_admin)
+    admin: dict = Depends(require_feature("leaves"))
 ):
     """Fetch live calculated leave balance for an employee."""
     org_id = admin.organization_id or "system_org"

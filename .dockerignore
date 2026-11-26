@@ -5,6 +5,10 @@ __pycache__
 .Python
 env/
 venv/
+.venv-security/
+.pytest_cache/
+tests/
+dependency-audit.json
 .env
 .env.local
 .git

@@ -1,3 +1,4 @@
+from auth import resolve_access_token
 from fastapi import APIRouter, FastAPI, HTTPException, File, Depends, BackgroundTasks, Request, Query
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse, Response
@@ -149,51 +150,29 @@ async def reverse_geocode(lat: float, lon: float):
 @router.get("/uploads/{file_path:path}")
 async def serve_upload_file(
     file_path: str,
-    request: Request,
-    token: Optional[str] = Query(None)
+    request: Request
 ):
-    """
-    Secure file serving endpoint for uploads.
-    Public folders (e.g. logos) are served openly.
-    Sensitive employee docs & screenshots require valid JWT authentication in production.
-    """
-    # Prevent directory traversal
-    clean_path = os.path.normpath(file_path).lstrip("/\\")
-    if clean_path.startswith("..") or ".." in clean_path.split(os.path.sep):
-        raise HTTPException(status_code=403, detail="Invalid path")
-
-    base_dir = os.path.abspath(UPLOAD_DIR)
-    target_file = os.path.abspath(os.path.join(base_dir, clean_path))
-    if not target_file.startswith(base_dir):
-        raise HTTPException(status_code=403, detail="Access denied")
-
-    if not os.path.exists(target_file) or not os.path.isfile(target_file):
-        raise HTTPException(status_code=404, detail="File not found")
-
-    first_segment = clean_path.split(os.path.sep)[0].lower()
-    if first_segment in PUBLIC_UPLOAD_FOLDERS or APP_ENV != "production":
+    from upload_security import safe_local_path, authorize_upload
+    from database import uploads_collection
+    url = "/uploads/" + file_path
+    target_file = safe_local_path(url)
+    if file_path.startswith("logos/"):
+        if not target_file.is_file():
+            raise HTTPException(404, "File not found")
         return FileResponse(target_file)
+    auth_header = request.headers.get("authorization", "")
+    if not auth_header.startswith("Bearer "):
+        raise HTTPException(401, "Authentication required to view this file")
+    account, kind = await resolve_access_token(auth_header.split(" ", 1)[1])
+    record = await uploads_collection.find_one({"url": url})
+    await authorize_upload(record, account, kind)
+    if not target_file.is_file():
+        raise HTTPException(404, "File not found")
+    return FileResponse(target_file, media_type=record["media_type"], headers={
+        "Cache-Control": "private, no-store", "Content-Security-Policy": "sandbox",
+        "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer",
+    })
 
-    # In production, require authentication for sensitive documents & screenshots
-    auth_token = token
-    if not auth_token:
-        auth_header = request.headers.get("authorization", "")
-        if auth_header.startswith("Bearer "):
-            auth_token = auth_header.split(" ", 1)[1]
-    if not auth_token:
-        auth_token = request.cookies.get("access_token")
-
-    if not auth_token:
-        raise HTTPException(status_code=401, detail="Authentication required to view this file")
-
-    try:
-        payload = jwt.decode(auth_token, SECRET_KEY, algorithms=[ALGORITHM])
-        if not payload.get("sub"):
-            raise HTTPException(status_code=401, detail="Invalid session token")
-    except Exception:
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
-
-    return FileResponse(target_file)
 
 
 @router.get("/")

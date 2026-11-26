@@ -6,6 +6,9 @@ __pycache__/
 .Python
 env/
 venv/
+.venv-security/
+.pytest_cache/
+dependency-audit.json
 ENV/
 build/
 develop-eggs/

@@ -1,3 +1,4 @@
+from permissions import require_feature, require_any_feature, require_admin_session
 """
 4:00 PM Daily Absentee Admin Alert & 1.5-Day Warning Email System.
 
@@ -1006,7 +1007,7 @@ async def execute_absence_alert_email_action(
 
 
 @router.post("/admin/absence-alerts/run-now")
-async def admin_trigger_absence_alerts_now(current_admin: Admin = Depends(get_current_admin)):
+async def admin_trigger_absence_alerts_now(current_admin: Admin = Depends(require_feature("attendance"))):
     """Manually trigger the 4:00 PM absentee check for the admin's organization right now."""
     org_id = current_admin.organization_id or "system_org"
     result = await process_org_absence_alerts(org_id, force_run=True)
@@ -1020,7 +1021,7 @@ async def admin_trigger_absence_alerts_now(current_admin: Admin = Depends(get_cu
 @router.get("/admin/absence-alerts")
 async def admin_list_absence_alerts(
     date: Optional[str] = None,
-    current_admin: Admin = Depends(get_current_admin),
+    current_admin: Admin = Depends(require_feature("attendance")),
 ):
     """List recent 4:00 PM absentee alerts and their status ('pending', 'mail_sent', 'rejected') for the organization."""
     org_id = current_admin.organization_id or "system_org"

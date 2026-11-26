@@ -1,3 +1,5 @@
+from upload_security import SecureMediaRoute
+from permissions import require_feature, require_any_feature, require_admin_session
 import copy
 from datetime import datetime, timezone
 from typing import List, Optional
@@ -12,12 +14,13 @@ from hrms_payroll import _resolve_employee_salary_structure
 from permissions import require_feature
 
 router = APIRouter(
+    route_class=SecureMediaRoute,
     prefix="/admin/exit-management",
     tags=["HRMS Exit Management"],
     dependencies=[Depends(require_feature("exit_management"))]
 )
 
-employee_exit_router = APIRouter(tags=["HRMS Employee Exit"])
+employee_exit_router = APIRouter(route_class=SecureMediaRoute, tags=["HRMS Employee Exit"])
 
 def get_org_filter(admin: Admin):
     if admin.role == "superadmin" or admin.organization_id == "system_org":
@@ -74,7 +77,7 @@ DEFAULT_CLEARANCES = {
 }
 
 @router.get("")
-async def list_exits(status: Optional[str] = None, current_admin: Admin = Depends(get_current_admin)):
+async def list_exits(status: Optional[str] = None, current_admin: Admin = Depends(require_feature("exit_management"))):
     """List all exit processes for the organization."""
     org_filter = get_org_filter(current_admin)
     query = {**org_filter}
@@ -88,7 +91,7 @@ async def list_exits(status: Optional[str] = None, current_admin: Admin = Depend
     return exits
 
 @router.get("/stats")
-async def get_exit_stats(current_admin: Admin = Depends(get_current_admin)):
+async def get_exit_stats(current_admin: Admin = Depends(require_feature("exit_management"))):
     """Get counts of exits in different states."""
     org_filter = get_org_filter(current_admin)
     
@@ -107,7 +110,7 @@ async def get_exit_stats(current_admin: Admin = Depends(get_current_admin)):
     }
 
 @router.get("/{id}")
-async def get_exit(id: str, current_admin: Admin = Depends(get_current_admin)):
+async def get_exit(id: str, current_admin: Admin = Depends(require_feature("exit_management"))):
     """Get single exit details by ID."""
     org_filter = get_org_filter(current_admin)
     try:
@@ -123,7 +126,7 @@ async def get_exit(id: str, current_admin: Admin = Depends(get_current_admin)):
     return exit_doc
 
 @router.post("", status_code=status.HTTP_201_CREATED)
-async def initiate_exit(payload: ExitCreate, current_admin: Admin = Depends(get_current_admin)):
+async def initiate_exit(payload: ExitCreate, current_admin: Admin = Depends(require_feature("exit_management"))):
     """Initiate exit process for an employee."""
     org_id = current_admin.organization_id
     email_clean = payload.employee_email.strip().lower()
@@ -195,7 +198,7 @@ async def initiate_exit(payload: ExitCreate, current_admin: Admin = Depends(get_
     return exit_doc
 
 @router.put("/{id}")
-async def update_exit(id: str, updates: dict, current_admin: Admin = Depends(get_current_admin)):
+async def update_exit(id: str, updates: dict, current_admin: Admin = Depends(require_feature("exit_management"))):
     """Update general exit details."""
     org_filter = get_org_filter(current_admin)
     try:
@@ -222,7 +225,7 @@ async def update_exit(id: str, updates: dict, current_admin: Admin = Depends(get
     return updated
 
 @router.put("/{id}/clearance")
-async def update_department_clearance(id: str, payload: ClearanceUpdate, current_admin: Admin = Depends(get_current_admin)):
+async def update_department_clearance(id: str, payload: ClearanceUpdate, current_admin: Admin = Depends(require_feature("exit_management"))):
     """Update clearance status & checklist items for a department (HR, IT, Finance, Assets)."""
     org_filter = get_org_filter(current_admin)
     try:
@@ -278,7 +281,7 @@ async def update_department_clearance(id: str, payload: ClearanceUpdate, current
     return updated
 
 @router.put("/{id}/clearance-items")
-async def update_clearance_checklist_items(id: str, req: dict, current_admin: Admin = Depends(get_current_admin)):
+async def update_clearance_checklist_items(id: str, req: dict, current_admin: Admin = Depends(require_feature("exit_management"))):
     """Update checklist items for a department's clearance."""
     org_filter = get_org_filter(current_admin)
     try:
@@ -334,7 +337,7 @@ async def update_clearance_checklist_items(id: str, req: dict, current_admin: Ad
     return updated
 
 @router.post("/{id}/settlement")
-async def calculate_settlement(id: str, req: dict, current_admin: Admin = Depends(get_current_admin)):
+async def calculate_settlement(id: str, req: dict, current_admin: Admin = Depends(require_feature("exit_management"))):
     """Calculate and save final settlement numbers."""
     org_filter = get_org_filter(current_admin)
     try:
@@ -422,7 +425,7 @@ async def calculate_settlement(id: str, req: dict, current_admin: Admin = Depend
     return updated
 
 @router.post("/{id}/interview")
-async def record_exit_interview(id: str, req: dict, current_admin: Admin = Depends(get_current_admin)):
+async def record_exit_interview(id: str, req: dict, current_admin: Admin = Depends(require_feature("exit_management"))):
     """Record employee exit interview feedback details."""
     org_filter = get_org_filter(current_admin)
     try:
@@ -458,7 +461,7 @@ async def record_exit_interview(id: str, req: dict, current_admin: Admin = Depen
     return updated
 
 @router.post("/{id}/complete")
-async def complete_exit(id: str, current_admin: Admin = Depends(get_current_admin)):
+async def complete_exit(id: str, current_admin: Admin = Depends(require_feature("exit_management"))):
     """Complete exit management pipeline, verify clearances, and auto-deactivate employee account."""
     org_filter = get_org_filter(current_admin)
     try:

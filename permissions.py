@@ -87,6 +87,7 @@ def require_feature(feature: str):
 
         return current_admin
 
+    _check_feature.admin_policy = True
     return _check_feature
 
 
@@ -107,6 +108,7 @@ def require_any_feature(*features: str):
             )
         return current_admin
 
+    _check_any.admin_policy = True
     return _check_any
 
 
@@ -118,3 +120,10 @@ def get_all_features():
 def get_all_feature_ids():
     """Return all feature IDs (used when creating new owner/admin accounts)."""
     return ALL_FEATURE_IDS
+
+
+async def require_admin_session(current_admin: Admin = Depends(get_current_admin)):
+    """Identity-only policy for the signed-in administrator's own profile."""
+    return current_admin
+
+require_admin_session.admin_policy = True

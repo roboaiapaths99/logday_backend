@@ -21,6 +21,10 @@ async def get_database():
     return db
 
 # Collections
+uploads_collection = db["uploads_registry"]
+oauth_states_collection = db["oauth_states"]
+auth_sessions_collection = db["auth_sessions"]
+employee_invitations_collection = db["employee_invitations"]
 employees_collection = db["employees"]
 attendance_logs_collection = db["attendance_logs"]
 settings_collection = db["settings"]
@@ -64,6 +68,11 @@ absence_alerts_collection = db["absence_alerts"]
 
 # Ensure indexes for employee check-in status and session tracking
 async def ensure_employee_indexes():
+    await oauth_states_collection.create_index("expires_at", expireAfterSeconds=0)
+    await auth_sessions_collection.create_index("expires_at", expireAfterSeconds=0)
+    await employee_invitations_collection.create_index("expires_at", expireAfterSeconds=0)
+    await uploads_collection.create_index("url", unique=True)
+    await uploads_collection.create_index([("organization_id", 1), ("owner_id", 1)])
     # Core employee indexes
     await employees_collection.create_index("checked_in")
     await employees_collection.create_index("session_id")

@@ -252,6 +252,7 @@ class ChangePasswordRequest(BaseModel):
 
 
 class RegisterRequest(BaseModel):
+    invitation_token: Optional[str] = Field(default=None, max_length=256)
     full_name: str
     email: str
     employee_id: str

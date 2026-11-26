@@ -1,3 +1,4 @@
+from upload_security import SecureMediaRoute
 from fastapi import APIRouter, Depends, HTTPException, status
 from typing import List, Optional
 from datetime import datetime, timezone, timedelta
@@ -8,7 +9,7 @@ from auth import get_current_employee, get_current_admin
 from models import Admin, WFHStatus, EmployeeType
 from permissions import require_feature
 
-router = APIRouter(tags=["WFH Management"])
+router = APIRouter(route_class=SecureMediaRoute, tags=["WFH Management"])
 
 # ─── Employee Endpoints ─────────────────────────────────────────
 

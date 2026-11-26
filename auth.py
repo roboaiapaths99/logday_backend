@@ -16,20 +16,21 @@ import hashlib
 
 logger = logging.getLogger(__name__)
 
-# JWT configuration
+# Reject unsafe production configuration rather than silently deriving a key.
+import secrets
+from bson import ObjectId
+
 _raw_secret = os.getenv("JWT_SECRET") or os.getenv("SECRET_KEY") or ""
-if not _raw_secret or _raw_secret in ("supersecretkey", "CHANGE_ME_USE_A_LONG_RANDOM_STRING"):
-    if os.getenv("APP_ENV", "development") == "production":
-        logger.critical("SECURITY WARNING: JWT_SECRET is not set or uses a weak default in production!")
-    # Derive a machine/db-scoped fallback key rather than a static literal if env var was omitted
-    _seed = f"logday-jwt-{os.getenv('MONGODB_URL', 'local')}-{os.getenv('ADMIN_EMAIL', 'admin')}"
-    SECRET_KEY = _raw_secret if _raw_secret else hashlib.sha256(_seed.encode("utf-8")).hexdigest()
-else:
-    SECRET_KEY = _raw_secret
-ALGORITHM = os.getenv("ALGORITHM", "HS256")
-# Handle trailing comments in Docker --env-file
-expire_minutes_str = str(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "43200")).split('#')[0].strip()
-ACCESS_TOKEN_EXPIRE_MINUTES = int(expire_minutes_str)
+_weak_secret = len(_raw_secret) < 32 or _raw_secret in {"supersecretkey", "CHANGE_ME_USE_A_LONG_RANDOM_STRING"}
+if _weak_secret and os.getenv("APP_ENV", "development").lower() == "production":
+    raise RuntimeError("JWT_SECRET must be an independently generated secret of at least 32 characters")
+SECRET_KEY = secrets.token_hex(32) if _weak_secret else _raw_secret
+ALGORITHM = "HS256"
+TOKEN_ISSUER = os.getenv("JWT_ISSUER", "logday-api")
+TOKEN_AUDIENCE = "logday-api-v2"
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60").split("#")[0].strip())
+if not 1 <= ACCESS_TOKEN_EXPIRE_MINUTES <= 1440:
+    raise RuntimeError("ACCESS_TOKEN_EXPIRE_MINUTES must be between 1 and 1440")
 
 import time
 from collections import defaultdict
@@ -65,9 +66,6 @@ _MAX_FAILED_ATTEMPTS = 15
 def _get_client_ip(request: Request) -> str:
     if not request:
         return "unknown"
-    xff = request.headers.get("x-forwarded-for")
-    if xff:
-        return xff.split(",")[0].strip()
     if request.client and request.client.host:
         return request.client.host
     return "unknown"
@@ -102,185 +100,114 @@ def clear_failed_logins(request: Request, email: str):
     key = (ip, (email or "").strip().lower())
     _FAILED_LOGINS.pop(key, None)
 
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
-    to_encode = data.copy()
-    if expires_delta:
-        expire = datetime.now(timezone.utc) + expires_delta
-    else:
-        expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-    return encoded_jwt
-
 from fastapi import Depends, HTTPException, status, Request
 from fastapi.security import OAuth2PasswordBearer
-from database import admins_collection, employees_collection
+from database import admins_collection, employees_collection, auth_sessions_collection
 from models import Admin
 
 admin_oauth2_scheme = OAuth2PasswordBearer(tokenUrl="admin/login")
 employee_oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
-async def get_current_admin(request: Request, token: str = Depends(admin_oauth2_scheme)):
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Could not validate credentials",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
+
+def _unauthorized():
+    return HTTPException(401, "Invalid or expired session. Please sign in again.", headers={"WWW-Authenticate": "Bearer"})
+
+
+def ensure_active_account(account):
+    if account.get("is_active") is False or str(account.get("status", "")).lower() in {"inactive", "disabled", "deleted"}:
+        raise HTTPException(403, "Your account has been deactivated.")
+    if not account.get("organization_id"):
+        raise HTTPException(403, "Account has no organization. Contact your administrator.")
+
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    """Low-level signing; callers must supply a persisted session and immutable identity."""
+    if data.get("account_type") not in {"employee", "admin"} or not ObjectId.is_valid(data.get("sub", "")) or not data.get("sid"):
+        raise ValueError("Account ID, account type, and session ID are required")
+    now = datetime.now(timezone.utc)
+    claims = dict(data)
+    claims.update(iss=TOKEN_ISSUER, aud=TOKEN_AUDIENCE, iat=now,
+                  exp=now + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)))
+    return jwt.encode(claims, SECRET_KEY, algorithm=ALGORITHM)
+
+
+async def issue_access_token(account: dict, account_type: str):
+    ensure_active_account(account)
+    if account_type not in {"employee", "admin"}:
+        raise ValueError("Invalid account type")
+    sid = secrets.token_urlsafe(32)
+    expires_at = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    await auth_sessions_collection.insert_one({
+        "_id": sid, "account_id": str(account["_id"]), "account_type": account_type,
+        "organization_id": account["organization_id"], "expires_at": expires_at,
+        "revoked": False,
+    })
+    return create_access_token({"sub": str(account["_id"]), "account_type": account_type,
+                                "sid": sid, "ver": account.get("auth_version", 0)})
+
+
+def decode_access_token(token: str):
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        sub = payload.get("sub")
-        if not sub or not isinstance(sub, str):
-            raise credentials_exception
-        email: str = sub.lower().strip()
-    except JWTError:
-        raise credentials_exception
-        
-    admin = await admins_collection.find_one({"email": email})
-    if admin is None:
-        # Check hardcoded superadmin fallback from .env
-        fallback_email = os.getenv("ADMIN_EMAIL", "admin@officeflow.ai")
-        if email == fallback_email:
-             return Admin(
-                  email=email, 
-                  role="superadmin", 
-                  full_name="System Super Admin",
-                  organization_id="system_org",
-                  allowed_features=["dashboard", "employees", "attendance", "leaves", "expenses", "reports", "war_room", "territory", "nudge", "leaderboard", "settings", "sub_admins", "onboarding", "exit_management", "payroll", "document_verification", "wfh_management", "wfh_monitoring"]
-             )
-        raise credentials_exception
-    
-    # Ensure role exists, default to 'hr' if missing for some reason
-    if "role" not in admin:
-        admin["role"] = "hr"
-    
-    # Ensure allowed_features exists
-    if "allowed_features" not in admin:
-        admin["allowed_features"] = ["dashboard"]
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM], audience=TOKEN_AUDIENCE,
+                             issuer=TOKEN_ISSUER, options={"require_exp": True, "require_iat": True,
+                                                         "require_sub": True, "require_aud": True, "require_iss": True})
+        if payload.get("account_type") not in {"employee", "admin"} or not ObjectId.is_valid(payload.get("sub", "")):
+            raise _unauthorized()
+        if not isinstance(payload.get("sid"), str) or not payload["sid"] or not isinstance(payload.get("ver"), int):
+            raise _unauthorized()
+        return payload
+    except (JWTError, ValueError, TypeError):
+        raise _unauthorized()
 
-    # Perform automated permission checks based on URL path
-    role_val = admin["role"]
-    if role_val not in ["superadmin", "owner", "admin"]:
-        allowed = admin.get("allowed_features") or []
-        path = request.url.path
-        
-        # 1. Attendance & Dashboard
-        if path.startswith("/admin/stats") or path.startswith("/admin/me") or path.startswith("/admin/system/diagnostics"):
-            if "dashboard" not in allowed and "settings" not in allowed:
-                raise HTTPException(403, "Access denied for 'dashboard'")
-                
-        elif path.startswith("/admin/logs") or path.startswith("/admin/attendance") or path.startswith("/admin/live-feed") or path.startswith("/admin/export-logs"):
-            if "attendance" not in allowed:
-                raise HTTPException(403, "Access denied for 'attendance'")
-                
-        # 2. Employees & Org Structure
-        elif path.startswith("/admin/employees") or path.startswith("/admin/create-employee") or path.startswith("/admin/org"):
-            if "employees" not in allowed:
-                raise HTTPException(403, "Access denied for 'employees'")
-                
-        # 3. Leaves
-        elif path.startswith("/admin/leave"):
-            if "leaves" not in allowed:
-                raise HTTPException(403, "Access denied for 'leaves'")
-                
-        # 4. Expenses
-        elif path.startswith("/admin/expenses"):
-            if "expenses" not in allowed:
-                raise HTTPException(403, "Access denied for 'expenses'")
-                
-        # 5. Field Force (war_room, territory, nudge, leaderboard)
-        elif path.startswith("/admin/field/trail") or path.startswith("/admin/field/live-status") or path.startswith("/admin/field/heatmap-data"):
-            if "war_room" not in allowed:
-                raise HTTPException(403, "Access denied for 'war_room'")
-                
-        elif path.startswith("/admin/field/reimbursements") or path.startswith("/admin/field/visit-plans") or path.startswith("/admin/field/visit"):
-            if "war_room" not in allowed:
-                raise HTTPException(403, "Access denied for 'war_room'")
-                
-        elif "/territory" in path:
-            if "territory" not in allowed:
-                raise HTTPException(403, "Access denied for 'territory'")
-                
-        elif path.startswith("/admin/nudge"):
-            if "nudge" not in allowed:
-                raise HTTPException(403, "Access denied for 'nudge'")
-                
-        elif path.startswith("/admin/leaderboard"):
-            if "leaderboard" not in allowed:
-                raise HTTPException(403, "Access denied for 'leaderboard'")
 
-        elif path.startswith("/admin/flyfield"):
-            if "flyfield" not in allowed and "war_room" not in allowed:
-                raise HTTPException(403, "Access denied for 'flyfield'")
-                
-        # 6. HRMS (onboarding, exit_management, payroll, document_verification)
-        elif path.startswith("/admin/onboarding") or path.startswith("/hrms/onboarding"):
-            if "/documents" in path or "/verify" in path:
-                if "document_verification" not in allowed:
-                    raise HTTPException(403, "Access denied for 'document_verification'")
-            else:
-                if "onboarding" not in allowed:
-                    raise HTTPException(403, "Access denied for 'onboarding'")
-                    
-        elif path.startswith("/admin/exit-management") or path.startswith("/hrms/exit"):
-            if "exit_management" not in allowed:
-                raise HTTPException(403, "Access denied for 'exit_management'")
-                
-        elif path.startswith("/admin/payroll"):
-            if "payroll" not in allowed:
-                raise HTTPException(403, "Access denied for 'payroll'")
-                
-        # 7. WFH (wfh_management, wfh_monitoring)
-        elif path.startswith("/admin/wfh/request-stats") or path.startswith("/admin/wfh-requests"):
-            if "wfh_management" not in allowed:
-                raise HTTPException(403, "Access denied for 'wfh_management'")
+async def resolve_access_token(token: str, expected_type: Optional[str] = None):
+    payload = decode_access_token(token)
+    return await resolve_session_claims(payload, expected_type)
 
-        elif path.startswith("/admin/wfh/stats"):
-            if "wfh_management" not in allowed and "wfh_monitoring" not in allowed:
-                raise HTTPException(403, "Access denied. Requires 'wfh_management' or 'wfh_monitoring' permission.")
-                
-        elif path.startswith("/admin/wfh/requests") or path.startswith("/admin/wfh/calendar") or path.startswith("/admin/wfh/policies") or path.startswith("/admin/wfh/policy"):
-            if "wfh_management" not in allowed:
-                raise HTTPException(403, "Access denied for 'wfh_management'")
-                
-        elif path.startswith("/admin/wfh"):
-            if "wfh_monitoring" not in allowed:
-                raise HTTPException(403, "Access denied for 'wfh_monitoring'")
-                
-        # 8. Settings & Admin
-        elif path.startswith("/admin/settings") or path.startswith("/admin/upload-logo") or path.startswith("/admin/absence-alerts"):
-            if "settings" not in allowed and "attendance" not in allowed:
-                raise HTTPException(403, "Access denied for 'settings'")
-                
-        elif path.startswith("/admin/sub-admins"):
-            if "sub_admins" not in allowed:
-                raise HTTPException(403, "Access denied for 'sub_admins'")
-                
-    return Admin(**admin)
+
+async def resolve_session_claims(payload, expected_type=None):
+    """Resolve already verified access-token or file-grant claims against live state."""
+    if payload.get("account_type") not in {"admin", "employee"} or not ObjectId.is_valid(payload.get("sub", "")):
+        raise _unauthorized()
+    if not isinstance(payload.get("sid"), str) or not isinstance(payload.get("ver"), int):
+        raise _unauthorized()
+    kind = payload["account_type"]
+    if expected_type and kind != expected_type:
+        raise _unauthorized()
+    session = await auth_sessions_collection.find_one({
+        "_id": payload["sid"], "account_id": payload["sub"], "account_type": kind,
+        "revoked": False, "expires_at": {"$gt": datetime.now(timezone.utc)},
+    })
+    if not session:
+        raise _unauthorized()
+    collection = admins_collection if kind == "admin" else employees_collection
+    account = await collection.find_one({"_id": ObjectId(payload["sub"])})
+    if not account or payload["ver"] != account.get("auth_version", 0):
+        raise _unauthorized()
+    ensure_active_account(account)
+    if session.get("organization_id") != account.get("organization_id"):
+        raise _unauthorized()
+    return account, kind
+
+
+def _has_explicit_admin_policy(dependant):
+    if getattr(getattr(dependant, "call", None), "admin_policy", False):
+        return True
+    return any(_has_explicit_admin_policy(child) for child in getattr(dependant, "dependencies", []))
+
+
+async def get_current_admin(request: Request, token: str = Depends(admin_oauth2_scheme)):
+    account, _ = await resolve_access_token(token, "admin")
+    # New routes fail closed until they declare a permission dependency.
+    route = request.scope.get("route")
+    if not _has_explicit_admin_policy(getattr(route, "dependant", None)):
+        raise HTTPException(403, "This route has no admin access policy")
+    if account.get("organization_id") == "system_org" and account.get("role") != "superadmin":
+        raise HTTPException(403, "System organization requires a superadmin account")
+    account.setdefault("allowed_features", [])
+    return Admin(**account)
 
 
 async def get_current_employee(token: str = Depends(employee_oauth2_scheme)):
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Could not validate credentials",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        sub = payload.get("sub")
-        if not sub or not isinstance(sub, str):
-            raise credentials_exception
-        email: str = sub.lower().strip()
-    except JWTError:
-        raise credentials_exception
-        
-    employee = await employees_collection.find_one({"email": email})
-    if employee is None:
-        raise credentials_exception
-        
-    if employee.get("status") == "Inactive" or employee.get("is_active") is False:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Your account has been deactivated."
-        )
-        
-    return employee
+    account, _ = await resolve_access_token(token, "employee")
+    return account

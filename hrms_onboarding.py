@@ -1,3 +1,5 @@
+from upload_security import SecureMediaRoute
+from permissions import require_feature, require_any_feature, require_admin_session
 import uuid
 import logging
 from datetime import datetime, timezone
@@ -16,8 +18,8 @@ from hrms_models import (
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/admin/onboarding", tags=["HRMS Onboarding"])
-employee_onboarding_router = APIRouter(tags=["HRMS Employee Onboarding"])
+router = APIRouter(route_class=SecureMediaRoute, prefix="/admin/onboarding", tags=["HRMS Onboarding"])
+employee_onboarding_router = APIRouter(route_class=SecureMediaRoute, tags=["HRMS Employee Onboarding"])
 
 DEFAULT_ONBOARDING_TASKS = {
     "HR": [
@@ -644,7 +646,7 @@ async def get_all_documents(
     status: Optional[str] = None,
     source: Optional[str] = None,
     summary: Optional[bool] = None,
-    current_admin: Admin = Depends(get_current_admin)
+    current_admin: Admin = Depends(require_feature("document_verification"))
 ):
     """
     Get all onboarding documents for all employees in the admin's organization.
@@ -759,7 +761,7 @@ async def get_all_documents(
 @router.get("/{employee_id}/documents")
 async def get_employee_documents(
     employee_id: str,
-    current_admin: Admin = Depends(get_current_admin)
+    current_admin: Admin = Depends(require_feature("document_verification"))
 ):
     """Fetch documents for a specific employee."""
     from permissions import require_feature
@@ -807,7 +809,7 @@ async def verify_reject_document(
     employee_id: str,
     doc_id: str,
     req: dict,
-    current_admin: Admin = Depends(get_current_admin)
+    current_admin: Admin = Depends(require_feature("document_verification"))
 ):
     """Verify or reject a document."""
     from permissions import require_feature
@@ -872,7 +874,7 @@ async def verify_reject_document(
 @router.get("/{employee_id}/documents/summary")
 async def get_employee_document_summary(
     employee_id: str,
-    current_admin: Admin = Depends(get_current_admin)
+    current_admin: Admin = Depends(require_feature("document_verification"))
 ):
     """Fetch verification summary stats for this employee."""
     from permissions import require_feature
@@ -906,7 +908,7 @@ async def get_employee_document_summary(
 @router.post("/{employee_id}/digilocker/connect")
 async def connect_digilocker(
     employee_id: str,
-    current_admin: Admin = Depends(get_current_admin)
+    current_admin: Admin = Depends(require_feature("document_verification"))
 ):
     """Initiate DigiLocker OAuth by returning the authorization URL."""
     await require_feature("document_verification")(current_admin)
@@ -922,7 +924,7 @@ async def connect_digilocker(
          
     from digilocker import generate_auth_url
     org_id = onb.get("organization_id", "system_org")
-    res = generate_auth_url(employee_id, org_id)
+    res = await generate_auth_url(employee_id, org_id)
     return {"status": "success", "auth_url": res.get("auth_url")}
 
 
@@ -934,17 +936,19 @@ async def digilocker_callback(code: str, state: str):
     import logging
     logger = logging.getLogger(__name__)
 
-    employee_id = state.split(":")[0] if ":" in state else state
+    from oauth_state import consume_oauth_state
+    oauth_state = await consume_oauth_state(state)
+    employee_id = oauth_state["employee_id"]
     try:
         obj_id = ObjectId(employee_id)
     except Exception:
          raise HTTPException(status_code=400, detail="Invalid state parameter")
 
-    onb = await onboardings_collection.find_one({"_id": obj_id})
+    onb = await onboardings_collection.find_one({"_id": obj_id, "organization_id": oauth_state["organization_id"]})
     if not onb:
         raise HTTPException(status_code=404, detail="Onboarding record not found")
 
-    token_data = await exchange_code_for_token(code)
+    token_data = await exchange_code_for_token(code, oauth_state["code_verifier"])
     access_token = token_data.get("access_token")
     if not access_token:
          raise HTTPException(status_code=400, detail="Failed to retrieve access token from DigiLocker")
@@ -1016,7 +1020,7 @@ async def digilocker_callback(code: str, state: str):
 async def pull_digilocker_doc(
     employee_id: str,
     req_body: dict,
-    current_admin: Admin = Depends(get_current_admin)
+    current_admin: Admin = Depends(require_feature("document_verification"))
 ):
     """Trigger manual pull of a document from DigiLocker."""
     await require_feature("document_verification")(current_admin)
@@ -1077,7 +1081,7 @@ async def pull_digilocker_doc(
 async def upload_document_ocr(
     employee_id: str,
     req_body: dict,
-    current_admin: Admin = Depends(get_current_admin)
+    current_admin: Admin = Depends(require_feature("document_verification"))
 ):
     """Process a document image upload with OCR extraction."""
     await require_feature("document_verification")(current_admin)
@@ -1102,47 +1106,21 @@ async def upload_document_ocr(
     if not onb:
          raise HTTPException(status_code=404, detail="Onboarding record not found")
 
-    image_data = None
+    from upload_security import decode_image_payload, read_upload_bytes, authorize_upload
+    from database import uploads_collection
+    from fastapi.concurrency import run_in_threadpool
     if image_b64:
-        try:
-            image_data = image_from_base64(image_b64)
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Invalid base64 image: {e}")
+        image_data, _ = await run_in_threadpool(decode_image_payload, image_b64)
     else:
-        import urllib.parse
-        import socket
-        import ipaddress
-        import requests
-        if file_url.startswith("/uploads/"):
-            local_file = os.path.abspath(file_url.lstrip("/"))
-            uploads_root = os.path.abspath("uploads")
-            if not local_file.startswith(uploads_root) or not os.path.exists(local_file):
-                raise HTTPException(status_code=400, detail="Local upload file not found")
-            with open(local_file, "rb") as f:
-                image_data = f.read()
-        else:
-            parsed = urllib.parse.urlparse(file_url)
-            if parsed.scheme not in ("https", "http") or not parsed.hostname:
-                raise HTTPException(status_code=400, detail="Invalid file_url scheme")
-            try:
-                resolved_ip = ipaddress.ip_address(socket.gethostbyname(parsed.hostname))
-                if resolved_ip.is_private or resolved_ip.is_loopback or resolved_ip.is_link_local:
-                    raise HTTPException(status_code=400, detail="Access to internal network URLs is forbidden")
-            except HTTPException:
-                raise
-            except Exception:
-                raise HTTPException(status_code=400, detail="Could not resolve file_url host")
-            try:
-                from fastapi.concurrency import run_in_threadpool
-                r = await run_in_threadpool(requests.get, file_url, timeout=10)
-                if r.status_code == 200:
-                    image_data = r.content
-                else:
-                    raise HTTPException(status_code=400, detail=f"Failed to fetch image from URL: HTTP {r.status_code}")
-            except HTTPException:
-                raise
-            except Exception as e:
-                 raise HTTPException(status_code=400, detail=f"Error downloading image: {e}")
+        # Re-read the source document from this tenant-scoped onboarding record.
+        # A caller-supplied URL (including a signed display URL) is never fetched.
+        source = next((d for d in onb.get("documents_submitted", []) if d.get("type") == doc_type), None)
+        record = await uploads_collection.find_one({"url": (source or {}).get("file_url")})
+        await authorize_upload(record, current_admin.model_dump(), "admin")
+        if record["organization_id"] != onb["organization_id"] or record["purpose"] != "onboarding":
+            raise HTTPException(403, "Document ownership mismatch")
+        file_url = record["url"]
+        image_data = await run_in_threadpool(read_upload_bytes, record)
 
     try:
         from fastapi.concurrency import run_in_threadpool
@@ -1194,7 +1172,7 @@ os.makedirs(ONBOARDING_UPLOADS_DIR, exist_ok=True)
 async def get_my_onboarding(employee=Depends(get_current_employee)):
     """Retrieve the current logged-in employee's onboarding progress and tasks."""
     clean_email = employee["email"].strip().lower()
-    onb = await onboardings_collection.find_one({"employee_email": clean_email})
+    onb = await onboardings_collection.find_one({"employee_email": clean_email, "organization_id": employee["organization_id"]})
     if not onb:
         # Check if we should auto-initialize a default onboarding record for this employee
         emp_id = str(employee.get("_id", ""))
@@ -1243,40 +1221,26 @@ async def upload_my_onboarding_document(
 ):
     """Upload or capture a required credential (Aadhaar, PAN, Bank, Photo) from the mobile app."""
     clean_email = employee["email"].strip().lower()
-    onb = await onboardings_collection.find_one({"employee_email": clean_email})
+    onb = await onboardings_collection.find_one({"employee_email": clean_email, "organization_id": employee["organization_id"]})
     if not onb:
         raise HTTPException(status_code=404, detail="Onboarding profile not found")
 
-    ALLOWED_DOC_EXTENSIONS = {"jpg", "jpeg", "png", "pdf", "webp"}
-    MAX_UPLOAD_BYTES = 15 * 1024 * 1024  # 15 MB
-
-    file_url = None
-    filepath = None
+    from upload_security import (save_local_bytes, decode_image_payload, validate_image_bytes, safe_local_path)
+    from fastapi.concurrency import run_in_threadpool
     if file:
-        ext = file.filename.rsplit(".", 1)[-1].lower() if (file.filename and "." in file.filename) else "jpg"
-        if ext not in ALLOWED_DOC_EXTENSIONS:
-            raise HTTPException(status_code=400, detail=f"Unsupported file type '.{ext}'. Allowed: {', '.join(sorted(ALLOWED_DOC_EXTENSIONS))}")
-        content = await file.read()
-        if len(content) > MAX_UPLOAD_BYTES:
-            raise HTTPException(status_code=413, detail="Uploaded file exceeds 15 MB limit")
-        filename = f"{clean_email}_{doc_type}_{uuid.uuid4().hex[:8]}.{ext}"
-        filepath = os.path.join(ONBOARDING_UPLOADS_DIR, filename)
-        with open(filepath, "wb") as f:
-            f.write(content)
-        file_url = f"/uploads/onboarding_docs/{filename}"
+        content = await file.read(15 * 1024 * 1024 + 1)
+        if content.startswith(b"%PDF-"):
+            media_type, extension = "application/pdf", ".pdf"
+        else:
+            media_type = await run_in_threadpool(validate_image_bytes, content)
+            extension = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}[media_type]
     elif image_b64:
-        import base64
-        ext = "jpg"
-        if image_b64.startswith("data:image"):
-            header, image_b64 = image_b64.split(",", 1)
-        raw_bytes = base64.b64decode(image_b64)
-        if len(raw_bytes) > MAX_UPLOAD_BYTES:
-            raise HTTPException(status_code=413, detail="Uploaded image exceeds 15 MB limit")
-        filename = f"{clean_email}_{doc_type}_{uuid.uuid4().hex[:8]}.{ext}"
-        filepath = os.path.join(ONBOARDING_UPLOADS_DIR, filename)
-        with open(filepath, "wb") as f:
-            f.write(raw_bytes)
-        file_url = f"/uploads/onboarding_docs/{filename}"
+        content, media_type = await run_in_threadpool(decode_image_payload, image_b64)
+        extension = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}[media_type]
+    else:
+        raise HTTPException(400, "A document is required")
+    file_url = await save_local_bytes(content, employee, "onboarding", "onboarding_docs", extension, media_type)
+    filepath = str(safe_local_path(file_url))
 
     is_verified = False
     verification_msg = None
@@ -1322,7 +1286,7 @@ async def upload_my_onboarding_document(
 async def complete_my_onboarding_task(task_id: str, employee=Depends(get_current_employee)):
     """Mark an onboarding checklist task as complete."""
     clean_email = employee["email"].strip().lower()
-    onb = await onboardings_collection.find_one({"employee_email": clean_email})
+    onb = await onboardings_collection.find_one({"employee_email": clean_email, "organization_id": employee["organization_id"]})
     if not onb:
         raise HTTPException(status_code=404, detail="Onboarding profile not found")
 
@@ -1356,7 +1320,7 @@ async def employee_digilocker_pull_sandbox(req_body: dict, employee=Depends(get_
     doc_type = req_body.get("doc_type", "aadhaar")
     clean_email = employee["email"].strip().lower()
     
-    onb = await onboardings_collection.find_one({"employee_email": clean_email})
+    onb = await onboardings_collection.find_one({"employee_email": clean_email, "organization_id": employee["organization_id"]})
     if not onb:
         raise HTTPException(status_code=404, detail="Onboarding profile not found")
 
@@ -1408,7 +1372,7 @@ async def get_digilocker_auth_url(employee=Depends(get_current_employee)):
     from digilocker import generate_auth_url
     clean_email = employee["email"].strip().lower()
     org_id = employee.get("organization_id", "org_default")
-    auth_data = generate_auth_url(clean_email, org_id)
+    auth_data = await generate_auth_url(clean_email, org_id)
     return auth_data
 
 
@@ -1419,25 +1383,29 @@ async def digilocker_oauth_callback(code: str, state: str, error: Optional[str] 
     from fastapi.responses import HTMLResponse
     from digilocker import exchange_code_for_token, pull_document, DIGILOCKER_DOC_TYPES
 
+    from oauth_state import consume_oauth_state
+    from html import escape
+    oauth_state = await consume_oauth_state(state)
+
     if error:
         return HTMLResponse(
             f"<html><body style='font-family:sans-serif;text-align:center;padding:40px;'>"
             f"<h2 style='color:#e11d48;'>DigiLocker Verification Cancelled</h2>"
-            f"<p>{error}</p>"
+            f"<p>{escape(error)}</p>"
             f"<p>You can return to the LogDay app.</p></body></html>"
         )
 
     try:
-        parts = state.split(":")
-        emp_email = parts[0].strip().lower()
-        token_res = await exchange_code_for_token(code)
+        emp_email = oauth_state["employee_id"].strip().lower()
+        token_res = await exchange_code_for_token(code, oauth_state["code_verifier"])
         access_token = token_res.get("access_token")
 
         onb = None
         if ObjectId.is_valid(emp_email):
-            onb = await onboardings_collection.find_one({"_id": ObjectId(emp_email)})
+            onb = await onboardings_collection.find_one({"_id": ObjectId(emp_email), "organization_id": oauth_state["organization_id"]})
         if not onb:
             onb = await onboardings_collection.find_one({
+                "organization_id": oauth_state["organization_id"],
                 "$or": [
                     {"employee_email": emp_email},
                     {"employee_id": emp_email}

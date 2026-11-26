@@ -1,3 +1,4 @@
+from upload_security import SecureMediaRoute
 from fastapi import APIRouter, FastAPI, HTTPException, File, Depends, BackgroundTasks, Request, Query
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse, Response
@@ -111,7 +112,7 @@ from services.common_helpers import (
 )
 from services.scheduler_jobs import check_missed_visits, purge_old_screenshots
 
-router = APIRouter()
+router = APIRouter(route_class=SecureMediaRoute)
 
 @router.post("/api/wfh/device-info")
 async def register_wfh_device(req: dict, employee=Depends(get_current_employee)):
@@ -751,9 +752,18 @@ async def wfh_submit_screenshot(req: dict, background_tasks: BackgroundTasks, re
 
     await verify_wfh_device(employee_id, org_id, device_id)
 
+    from upload_security import decode_image_payload, owned_upload
     image_url = req.get("image_url")
-    if not image_url:
-        raise HTTPException(status_code=400, detail="image_url is required")
+    if req.get("upload_id"):
+        record = await owned_upload(req["upload_id"], employee, purpose="screenshot")
+        image_url = record["url"]
+    elif isinstance(image_url, str) and not image_url.startswith(("http:", "https:", "/")):
+        image_bytes, media_type = await run_in_threadpool(decode_image_payload, image_url)
+        extension = {"image/png": ".png", "image/webp": ".webp", "image/jpeg": ".jpg"}[media_type]
+        image_url = await upload_file_to_storage(image_bytes, uuid.uuid4().hex + extension, "wfh_view",
+                                                 owner=employee, purpose="screenshot")
+    else:
+        raise HTTPException(400, "Submit an image or an owned upload_id; arbitrary URLs are not accepted")
 
     server_now = datetime.now(timezone.utc)
     timestamp_str = req.get("timestamp")
@@ -767,33 +777,6 @@ async def wfh_submit_screenshot(req: dict, background_tasks: BackgroundTasks, re
     else:
         now = server_now
 
-    def is_base64_payload(value: str) -> bool:
-        return (value.startswith("data:image/") or ";base64," in value or (not value.startswith("http") and not value.startswith("/uploads") and len(value) > 1000))
-
-    if is_base64_payload(image_url):
-        import base64
-        import uuid
-        import time
-        header = ""
-        base64_data = image_url
-        if "," in image_url:
-            header, base64_data = image_url.split(",", 1)
-
-        try:
-            image_bytes = base64.b64decode(base64_data)
-            ext = ".jpg"
-            if "png" in header:
-                ext = ".png"
-            elif "gif" in header:
-                ext = ".gif"
-            filename = f"view_{int(time.time())}_{uuid.uuid4().hex[:8]}{ext}"
-            image_url = await upload_file_to_storage(image_bytes, filename, "wfh_view")
-        except Exception as err:
-            logger.error(f"Failed to decode base64 screenshot: {err}")
-            raise HTTPException(status_code=400, detail=f"Invalid base64 image data: {err}")
-    elif image_url.startswith("/uploads/"):
-        pass
-
     doc = {
         "employee_id": employee_id,
         "employee_email": employee.get("email"),
@@ -804,7 +787,7 @@ async def wfh_submit_screenshot(req: dict, background_tasks: BackgroundTasks, re
         "date": now.strftime("%Y-%m-%d"),
         "timestamp": now,
         "image_url": image_url,
-        "thumbnail_url": req.get("thumbnail_url"),
+        "thumbnail_url": None,
         "active_app": req.get("active_app"),
         "active_window": req.get("active_window"),
         "flagged": req.get("flagged", False),
@@ -1201,8 +1184,9 @@ async def wfh_face_check(req: dict, employee=Depends(get_current_employee)):
             base64_data = image_base64
             if "," in image_base64:
                 base64_data = image_base64.split(",", 1)[1]
-            image_bytes = base64.b64decode(base64_data)
-            image_url = await upload_file_to_storage(image_bytes, filename, "wfh_face_checks")
+            from upload_security import decode_image_payload
+            image_bytes, _ = await run_in_threadpool(decode_image_payload, image_base64)
+            image_url = await upload_file_to_storage(image_bytes, filename, "wfh_face_checks", owner=employee, purpose="face_check")
         except Exception as e:
             logger.error(f"Failed to save face check image: {e}")
             

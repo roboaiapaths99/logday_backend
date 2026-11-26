@@ -1,3 +1,6 @@
+from upload_security import SecureMediaRoute
+from permissions import require_feature, require_any_feature, require_admin_session
+from auth import issue_access_token, ensure_active_account
 from fastapi import APIRouter, FastAPI, HTTPException, File, Depends, BackgroundTasks, Request, Query
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse, Response
@@ -113,10 +116,10 @@ from services.common_helpers import (
 )
 from services.scheduler_jobs import check_missed_visits, purge_old_screenshots
 
-router = APIRouter()
+router = APIRouter(route_class=SecureMediaRoute)
 
 @router.post("/admin/import-employees")
-async def admin_import_employees(file: bytes = File(...), current_admin: Admin = Depends(get_current_admin)):
+async def admin_import_employees(file: bytes = File(...), current_admin: Admin = Depends(require_feature("employees"))):
     """Bulk import employees from CSV or Excel with upsert and auto-assignment."""
     try:
         org_id = current_admin.organization_id
@@ -240,7 +243,7 @@ async def admin_import_employees(file: bytes = File(...), current_admin: Admin =
 
 
 @router.get("/admin/employees/import-template")
-async def get_import_template(current_admin: Admin = Depends(get_current_admin)):
+async def get_import_template(current_admin: Admin = Depends(require_feature("employees"))):
     """Download a CSV template for employee import."""
     csv_content = "full_name,email,employee_id,password,designation,department,employee_type,manager_email,beat_zone_name\n"
     csv_content += "John Doe,john@example.com,EMP001,,Sales Executive,Sales,field,manager@example.com,North Zone\n"
@@ -254,7 +257,7 @@ async def get_import_template(current_admin: Admin = Depends(get_current_admin))
 
 
 @router.get("/admin/export-logs-pdf")
-async def admin_export_logs_pdf(current_admin: Admin = Depends(get_current_admin)):
+async def admin_export_logs_pdf(current_admin: Admin = Depends(require_feature("attendance"))):
     """Generate a PDF report of all attendance logs for the admin's organization."""
     try:
         org_id = current_admin.organization_id
@@ -322,7 +325,7 @@ async def admin_export_logs_pdf(current_admin: Admin = Depends(get_current_admin
 
 
 @router.get("/admin/export-logs-excel")
-async def admin_export_logs_excel(current_admin: Admin = Depends(get_current_admin)):
+async def admin_export_logs_excel(current_admin: Admin = Depends(require_feature("attendance"))):
     """Export attendance logs to Excel for the admin's organization."""
     try:
         org_id = current_admin.organization_id
@@ -378,13 +381,9 @@ async def admin_login(req: AdminLoginRequest, request: Request):
     # 2. Verify password
     if admin and await verify_password_async(req.password, admin.get("hashed_password")):
         clear_failed_logins(request, clean_email)
-        token_data = {"sub": clean_email, "role": admin.get("role", "admin")}
-        # Add Organization Context if present
-        if admin.get("organization_id"):
-            token_data["org_id"] = admin.get("organization_id")
-            
-        token = create_access_token(data=token_data)
-        
+        ensure_active_account(admin)
+        token = await issue_access_token(admin, "admin")
+
         # Fetch Org details for branding if applicable
         org_details = {}
         if admin.get("organization_id"):
@@ -413,17 +412,6 @@ async def admin_login(req: AdminLoginRequest, request: Request):
             "organization": org_details
         }
     
-    # 3. Fallback to configured env superadmin (requires explicit ADMIN_PASSWORD in production)
-    import hmac
-    admin_email = os.getenv("ADMIN_EMAIL", "admin@officeflow.ai").strip().lower()
-    default_pass = "" if APP_ENV == "production" else "admin123"
-    admin_pass = os.getenv("ADMIN_PASSWORD", default_pass)
-    
-    if admin_pass and clean_email == admin_email and hmac.compare_digest(req.password, admin_pass):
-        clear_failed_logins(request, clean_email)
-        token = create_access_token(data={"sub": admin_email, "role": "superadmin"})
-        return {"access_token": token, "token_type": "bearer", "user": {"name": "Super Admin", "email": admin_email, "role": "superadmin"}}
-
     record_failed_login(request, clean_email)
     raise HTTPException(status_code=401, detail="Invalid admin credentials")
 
@@ -489,7 +477,7 @@ async def register_organization(req: OrganizationRegisterRequest):
 
 
 @router.get("/admin/sub-admins")
-async def list_sub_admins(current_admin: Admin = Depends(get_current_admin)):
+async def list_sub_admins(current_admin: Admin = Depends(require_feature("sub_admins"))):
     """List all admins for the organization (Owner/Superadmin only)."""
     if current_admin.role not in ["owner", "superadmin", "admin"]:
         raise HTTPException(status_code=403, detail="Only organization owners/admins can manage the admin team.")
@@ -503,12 +491,15 @@ async def list_sub_admins(current_admin: Admin = Depends(get_current_admin)):
 
 
 @router.post("/admin/sub-admins")
-async def create_sub_admin(req: SubAdminCreate, current_admin: Admin = Depends(get_current_admin)):
+async def create_sub_admin(req: SubAdminCreate, current_admin: Admin = Depends(require_feature("sub_admins"))):
     """Create a new sub-admin for the organization (Owner/Superadmin only)."""
     if current_admin.role not in ["owner", "superadmin", "admin"]:
         logger.warning(f"Access Denied: Admin {current_admin.email} with role {current_admin.role} tried to manage sub-admins.")
         raise HTTPException(status_code=403, detail="Only organization owners/admins can add new admins.")
     
+    if not _is_superadmin(current_admin) and req.role in ["superadmin", "owner"]:
+        raise HTTPException(403, "Only a superadmin can assign this role")
+
     clean_email = req.email.strip().lower()
     # Check if admin already exists
     existing = await admins_collection.find_one({"email": clean_email})
@@ -530,7 +521,7 @@ async def create_sub_admin(req: SubAdminCreate, current_admin: Admin = Depends(g
 
 
 @router.delete("/admin/sub-admins/{email}")
-async def delete_sub_admin(email: str, current_admin: Admin = Depends(get_current_admin)):
+async def delete_sub_admin(email: str, current_admin: Admin = Depends(require_feature("sub_admins"))):
     """Remove a sub-admin (Owner/Superadmin only)."""
     if current_admin.role not in ["owner", "superadmin", "admin"]:
         raise HTTPException(status_code=403, detail="Only organization owners/admins can remove admins.")
@@ -555,7 +546,7 @@ async def delete_sub_admin(email: str, current_admin: Admin = Depends(get_curren
 
 
 @router.get("/admin/me")
-async def get_admin_me(current_admin: Admin = Depends(get_current_admin)):
+async def get_admin_me(current_admin: Admin = Depends(require_admin_session)):
     """Return current admin's profile including role and allowed features."""
     admin_data = {
         "email": current_admin.email,
@@ -572,12 +563,12 @@ async def get_admin_me(current_admin: Admin = Depends(get_current_admin)):
             "wfh_management", "wfh_monitoring", "sub_admins", "settings"
         ]
     else:
-        admin_data["allowed_features"] = current_admin.allowed_features or ["dashboard", "employees", "attendance"]
+        admin_data["allowed_features"] = current_admin.allowed_features or []
     return admin_data
 
 
 @router.put("/admin/sub-admins/{email}/permissions")
-async def update_sub_admin_permissions(email: str, req: dict, current_admin: Admin = Depends(get_current_admin)):
+async def update_sub_admin_permissions(email: str, req: dict, current_admin: Admin = Depends(require_feature("sub_admins"))):
     """Update feature-level permissions for a sub-admin (Owner/Superadmin only)."""
     if current_admin.role not in ["owner", "superadmin", "admin"]:
         raise HTTPException(status_code=403, detail="Only organization owners/admins can update permissions.")
@@ -585,6 +576,18 @@ async def update_sub_admin_permissions(email: str, req: dict, current_admin: Adm
     allowed_features = req.get("allowed_features", [])
     role = req.get("role")  # optionally update role too
     
+    from permissions import ALL_FEATURE_IDS
+    if not isinstance(allowed_features, list) or any(f not in ALL_FEATURE_IDS for f in allowed_features):
+        raise HTTPException(422, "Invalid feature list")
+    if role and role not in {r.value for r in AdminRole}:
+        raise HTTPException(422, "Invalid admin role")
+    if not _is_superadmin(current_admin):
+        if role in ["superadmin", "owner"]:
+            raise HTTPException(403, "Only a superadmin can assign this role")
+        target = await admins_collection.find_one({"email": email, "organization_id": current_admin.organization_id})
+        if not target or target.get("role") in ["owner", "superadmin"]:
+            raise HTTPException(403, "Cannot modify this account")
+
     update_fields = {"allowed_features": allowed_features}
     if role:
         update_fields["role"] = role
@@ -603,7 +606,7 @@ async def update_sub_admin_permissions(email: str, req: dict, current_admin: Adm
 
 
 @router.get("/admin/employees")
-async def admin_list_employees(current_admin: Admin = Depends(get_current_admin)):
+async def admin_list_employees(current_admin: Admin = Depends(require_feature("employees"))):
     """List all employees for management (Role Scoped)."""
     filter_query = get_employee_filter(current_admin)
     cursor = employees_collection.find(filter_query, {"hashed_password": 0, "face_embedding": 0})
@@ -614,7 +617,7 @@ async def admin_list_employees(current_admin: Admin = Depends(get_current_admin)
 
 
 @router.put("/admin/employees/{email}")
-async def admin_update_employee(email: str, req: EmployeeUpdate, current_admin: Admin = Depends(get_current_admin)):
+async def admin_update_employee(email: str, req: EmployeeUpdate, current_admin: Admin = Depends(require_feature("employees"))):
     """Update employee details."""
     update_data = {k: v for k, v in req.dict().items() if v is not None}
     if not update_data:
@@ -637,7 +640,7 @@ async def admin_update_employee(email: str, req: EmployeeUpdate, current_admin: 
 
 
 @router.get("/admin/hrms/stats")
-async def get_hrms_stats(current_admin: Admin = Depends(get_current_admin)):
+async def get_hrms_stats(current_admin: Admin = Depends(require_feature("dashboard"))):
     org_id = current_admin.organization_id
     org_filter = {"organization_id": org_id} if (org_id and not _is_superadmin(current_admin)) else {}
     
@@ -666,7 +669,7 @@ async def get_hrms_stats(current_admin: Admin = Depends(get_current_admin)):
 
 @router.post("/admin/employees/bulk-update-type")
 
-async def admin_bulk_update_employee_type(req: dict, current_admin: Admin = Depends(get_current_admin)):
+async def admin_bulk_update_employee_type(req: dict, current_admin: Admin = Depends(require_feature("employees"))):
     """Bulk update employee work type (desk/field/office)"""
     emails = [e.lower().strip() for e in req.get("employee_emails", [])]
     new_type = req.get("employee_type")
@@ -686,7 +689,7 @@ async def admin_bulk_update_employee_type(req: dict, current_admin: Admin = Depe
 
 
 @router.delete("/admin/employees/{email}")
-async def admin_delete_employee(email: str, current_admin: Admin = Depends(get_current_admin)):
+async def admin_delete_employee(email: str, current_admin: Admin = Depends(require_feature("employees"))):
     """Remove an employee and their logs."""
     query = {"email": email}
     if current_admin.organization_id and not _is_superadmin(current_admin):
@@ -708,7 +711,7 @@ async def admin_delete_employee(email: str, current_admin: Admin = Depends(get_c
 async def admin_all_logs(
     limit: int = 100, 
     month: Optional[str] = None, 
-    current_admin: Admin = Depends(get_current_admin)
+    current_admin: Admin = Depends(require_feature("attendance"))
 ):
     """Fetch all attendance logs for the organization (Role Scoped)."""
     filter_query = get_employee_filter(current_admin)
@@ -764,7 +767,7 @@ async def admin_all_logs(
 
 
 @router.post("/admin/employees")
-async def admin_create_employee(req: RegisterRequest, current_admin: Admin = Depends(get_current_admin)):
+async def admin_create_employee(req: RegisterRequest, current_admin: Admin = Depends(require_feature("employees"))):
     """Manually register a new employee (Admin)."""
     clean_email = req.email.strip().lower()
     # Check if employee already exists (globally unique email)
@@ -803,15 +806,15 @@ async def admin_create_employee(req: RegisterRequest, current_admin: Admin = Dep
 
 
 @router.post("/admin/employees/{email}/reset-password")
-async def admin_reset_password(email: str, req: dict, current_admin: Admin = Depends(get_current_admin)):
+async def admin_reset_password(email: str, req: dict, current_admin: Admin = Depends(require_feature("employees"))):
     """Reset an employee's password."""
     from urllib.parse import unquote
     clean_email = unquote(email).strip().lower()
     logger.info(f"Password reset requested for '{clean_email}' by admin '{current_admin.email}' (role={current_admin.role}, org={current_admin.organization_id})")
     
-    # Build query - superadmin/owner can reset any employee, others restricted to their org
+    # Only a system superadmin can reset an employee in another organization
     query = {"email": clean_email}
-    is_privileged = current_admin.role in ["superadmin", "owner"] or clean_email == os.getenv("ADMIN_EMAIL", "admin@officeflow.ai")
+    is_privileged = current_admin.role == "superadmin"
     
     if current_admin.organization_id and not is_privileged:
         # Non-privileged admins can only reset their own org's employees
@@ -833,7 +836,7 @@ async def admin_reset_password(email: str, req: dict, current_admin: Admin = Dep
         {"$set": {
             "hashed_password": hashed_password,
             "force_password_change": True  # Force them to change on next login
-        }}
+        }, "$inc": {"auth_version": 1}}
     )
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Employee not found")
@@ -843,14 +846,14 @@ async def admin_reset_password(email: str, req: dict, current_admin: Admin = Dep
 
 
 @router.post("/admin/employees/{email}/clear-binding")
-async def admin_clear_binding(email: str, current_admin: Admin = Depends(get_current_admin)):
+async def admin_clear_binding(email: str, current_admin: Admin = Depends(require_feature("employees"))):
     """Clear hardware binding for an employee."""
     from urllib.parse import unquote
     clean_email = unquote(email).strip().lower()
     
-    # Build query - superadmin/owner can clear any binding, others restricted to their org
+    # Only a system superadmin can clear another organization's binding
     query = {"email": clean_email}
-    is_privileged = current_admin.role in ["superadmin", "owner"]
+    is_privileged = current_admin.role == "superadmin"
     
     if current_admin.organization_id and not is_privileged:
         if current_admin.organization_id != "system_org":
@@ -867,7 +870,7 @@ async def admin_clear_binding(email: str, current_admin: Admin = Depends(get_cur
 
 
 @router.post("/admin/employees/bulk-assign-manager")
-async def bulk_assign_manager(req: dict, current_admin: Admin = Depends(get_current_admin)):
+async def bulk_assign_manager(req: dict, current_admin: Admin = Depends(require_feature("employees"))):
     """Assign multiple employees to a manager by email."""
     if current_admin.role not in ["owner", "hr", "superadmin"]:
         raise HTTPException(status_code=403, detail="Insufficient permissions to assign managers.")
@@ -889,7 +892,7 @@ async def bulk_assign_manager(req: dict, current_admin: Admin = Depends(get_curr
 
 
 @router.get("/admin/settings")
-async def get_settings(current_admin: Admin = Depends(get_current_admin)):
+async def get_settings(current_admin: Admin = Depends(require_feature("settings"))):
     """Retrieve organization-specific configuration."""
     org_id = current_admin.organization_id
     
@@ -922,7 +925,7 @@ async def get_settings(current_admin: Admin = Depends(get_current_admin)):
 
 
 @router.put("/admin/settings")
-async def update_settings(req: SystemSettings, current_admin: Admin = Depends(get_current_admin)):
+async def update_settings(req: SystemSettings, current_admin: Admin = Depends(require_feature("settings"))):
     """Update organization-specific configuration and branding."""
     org_id = current_admin.organization_id
     if not org_id:
@@ -968,7 +971,7 @@ async def update_settings(req: SystemSettings, current_admin: Admin = Depends(ge
 
 
 @router.post("/admin/upload-logo")
-async def admin_upload_logo(file: bytes = File(...), current_admin: Admin = Depends(get_current_admin)):
+async def admin_upload_logo(file: bytes = File(...), current_admin: Admin = Depends(require_feature("settings"))):
     """Upload organization logo image."""
     try:
         org_id = current_admin.organization_id
@@ -996,7 +999,7 @@ async def admin_upload_logo(file: bytes = File(...), current_admin: Admin = Depe
 
 
 @router.get("/admin/stats")
-async def get_admin_stats(admin: dict = Depends(get_current_admin)):
+async def get_admin_stats(admin: dict = Depends(require_feature("dashboard"))):
     """Summary statistics for the dashboard (Role Scoped)."""
     filter_query = get_employee_filter(admin)
     
@@ -1091,7 +1094,7 @@ async def get_admin_stats(admin: dict = Depends(get_current_admin)):
 
 
 @router.get("/admin/stats/attendance-chart")
-async def get_attendance_chart(admin: dict = Depends(get_current_admin)):
+async def get_attendance_chart(admin: dict = Depends(require_feature("dashboard"))):
     """Attendance volume over the last 7 days (Role Scoped)."""
     filter_query = get_employee_filter(admin)
     org_employees = await employees_collection.find(filter_query, {"_id": 1}).to_list(None)
@@ -1127,7 +1130,7 @@ async def get_attendance_chart(admin: dict = Depends(get_current_admin)):
 
 
 @router.get("/admin/live-feed")
-async def get_admin_live_feed(skip: int = 0, limit: int = 50, admin: dict = Depends(get_current_admin)):
+async def get_admin_live_feed(skip: int = 0, limit: int = 50, admin: dict = Depends(require_feature("attendance"))):
     """Unified real-time check-in/out feed for the dashboard (Role Scoped + Paginated)."""
     filter_query = get_employee_filter(admin)
     
@@ -1163,7 +1166,7 @@ async def get_admin_live_feed(skip: int = 0, limit: int = 50, admin: dict = Depe
 
 
 @router.post("/admin/employees/bulk-update")
-async def admin_bulk_update_employees(req: dict, admin=Depends(get_current_admin)):
+async def admin_bulk_update_employees(req: dict, admin=Depends(require_feature("employees"))):
     """Bulk update fields (like manager assignment or territory) for multiple employees."""
     employee_emails = [e.lower().strip() for e in req.get("employee_emails", [])]
     updates = req.get("updates", {})

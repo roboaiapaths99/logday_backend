@@ -1,3 +1,6 @@
+from upload_security import save_local_image, save_local_bytes, decode_binary_payload
+from upload_security import SecureMediaRoute
+from permissions import require_feature, require_any_feature, require_admin_session
 from fastapi import APIRouter, FastAPI, HTTPException, File, Depends, BackgroundTasks, Request, Query
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse, Response
@@ -111,7 +114,7 @@ from services.common_helpers import (
 )
 from services.scheduler_jobs import check_missed_visits, purge_old_screenshots
 
-router = APIRouter()
+router = APIRouter(route_class=SecureMediaRoute)
 
 @router.post("/api/field/plan")
 async def submit_visit_plan(plan: VisitPlan, employee=Depends(get_current_employee)):
@@ -341,12 +344,7 @@ async def visit_check_in(req: dict, employee=Depends(get_current_employee)):
         selfie_url = None
         face_verified = False
         if req.get("selfie_base64"):
-            import uuid as _uuid
-            os.makedirs("uploads/selfies", exist_ok=True)
-            fname = f"selfies/checkin_{employee['email'].replace('@','_')}_{_uuid.uuid4().hex[:8]}.jpg"
-            with open(f"uploads/{fname}", "wb") as f:
-                f.write(base64.b64decode(req["selfie_base64"]))
-            selfie_url = f"/uploads/{fname}"
+            selfie_url = await save_local_image(req["selfie_base64"], employee, "field_media", "selfies")
 
             # Optional face verification against stored descriptors
             try:
@@ -369,12 +367,7 @@ async def visit_check_in(req: dict, employee=Depends(get_current_employee)):
 
         site_photo_url = None
         if req.get("site_photo_base64"):
-            import uuid as _uuid
-            os.makedirs("uploads/site_photos", exist_ok=True)
-            fname = f"site_photos/checkin_{employee['email'].replace('@','_')}_{_uuid.uuid4().hex[:8]}.jpg"
-            with open(f"uploads/{fname}", "wb") as f:
-                f.write(base64.b64decode(req["site_photo_base64"]))
-            site_photo_url = f"/uploads/{fname}"
+            site_photo_url = await save_local_image(req["site_photo_base64"], employee, "field_media", "site_photos")
 
         log = {
             "employee_id": employee["email"],
@@ -451,22 +444,13 @@ async def visit_check_out(req: dict, background_tasks: BackgroundTasks, employee
         # --- Save voice note if provided ---
         voice_note_url = None
         if req.get("voice_note_base64"):
-            import uuid as _uuid
-            os.makedirs("uploads/voice_notes", exist_ok=True)
-            fname = f"voice_notes/visit_{req['visit_id']}_{_uuid.uuid4().hex[:8]}.m4a"
-            with open(f"uploads/{fname}", "wb") as f:
-                f.write(base64.b64decode(req["voice_note_base64"]))
-            voice_note_url = f"/uploads/{fname}"
+            audio_bytes = decode_binary_payload(req["voice_note_base64"])
+            voice_note_url = await save_local_bytes(audio_bytes, employee, "field_media", "voice_notes", ".m4a", "audio/mp4")
 
         # --- Save site photo if provided ---
         site_photo_url = None
         if req.get("site_photo_base64"):
-            import uuid as _uuid
-            os.makedirs("uploads/site_photos", exist_ok=True)
-            fname = f"site_photos/visit_{req['visit_id']}_{_uuid.uuid4().hex[:8]}.jpg"
-            with open(f"uploads/{fname}", "wb") as f:
-                f.write(base64.b64decode(req["site_photo_base64"]))
-            site_photo_url = f"/uploads/{fname}"
+            site_photo_url = await save_local_image(req["site_photo_base64"], employee, "field_media", "site_photos")
 
         update_data = {
             "check_out_time": datetime.now(timezone.utc),
@@ -658,12 +642,8 @@ async def sync_offline_batch(req: SyncBatchRequest, background_tasks: Background
                 
                 # Check for base64 media to save
                 if visit.get("site_photo_base64"):
-                    import uuid as _uuid
-                    os.makedirs("uploads/site_photos", exist_ok=True)
-                    fname = f"site_photos/sync_{offline_id}_{_uuid.uuid4().hex[:8]}.jpg"
-                    with open(f"uploads/{fname}", "wb") as f:
-                        f.write(base64.b64decode(visit["site_photo_base64"]))
-                    visit["site_photo_url"] = f"/uploads/{fname}"
+                    visit["site_photo_url"] = await save_local_image(visit["site_photo_base64"], employee, "field_media", "site_photos")
+                    visit.pop("site_photo_base64", None)
 
                 if visit.get("check_in_lat") is not None and visit.get("check_in_lng") is not None:
                     try:
@@ -779,7 +759,7 @@ async def submit_km_reimbursement(req: dict, employee=Depends(get_current_employ
 
 
 @router.get("/admin/field/reimbursements")
-async def admin_list_km_claims(status: Optional[str] = "pending", admin=Depends(get_current_admin)):
+async def admin_list_km_claims(status: Optional[str] = "pending", admin=Depends(require_feature("war_room"))):
     """List KM reimbursement claims for approval."""
     query = {}
     if admin.organization_id:
@@ -803,7 +783,7 @@ async def admin_list_km_claims(status: Optional[str] = "pending", admin=Depends(
 
 
 @router.post("/admin/field/reimbursements/{claim_id}/{action}")
-async def process_km_reimbursement(claim_id: str, action: str, admin=Depends(get_current_admin)):
+async def process_km_reimbursement(claim_id: str, action: str, admin=Depends(require_feature("war_room"))):
     "Approve or Reject a KM reimbursement claim."
     new_status = "approved" if action == "approve" else "rejected"
     
@@ -829,7 +809,7 @@ async def process_km_reimbursement(claim_id: str, action: str, admin=Depends(get
 
 
 @router.get("/admin/field/trail/{employee_email}")
-async def get_agent_trail(employee_email: str, admin=Depends(get_current_admin)):
+async def get_agent_trail(employee_email: str, admin=Depends(require_feature("war_room"))):
     """Fetch today's location trail for a specific agent (Admin only)."""
     try:
         now = datetime.now(timezone.utc)
@@ -987,7 +967,7 @@ async def get_field_day_summary(employee_id: str, date: Optional[str] = None, cu
 
 
 @router.put("/admin/employees/{email}/territory")
-async def update_territory(email: str, req: dict, admin=Depends(get_current_admin)):
+async def update_territory(email: str, req: dict, admin=Depends(require_feature("territory"))):
     """Update employee territory settings (radius or polygon)."""
     clean_email = email.lower().strip()
     
@@ -1026,7 +1006,7 @@ async def update_territory(email: str, req: dict, admin=Depends(get_current_admi
 
 
 @router.get("/admin/field/visit-plans")
-async def get_plans_for_approval(status: str = "submitted", admin=Depends(get_current_admin)):
+async def get_plans_for_approval(status: str = "submitted", admin=Depends(require_feature("war_room"))):
     """List visit plans with filtering, execution progress, and proof media."""
     from collections import defaultdict
     query = {}
@@ -1158,7 +1138,7 @@ async def get_plans_for_approval(status: str = "submitted", admin=Depends(get_cu
 
 
 @router.post("/admin/field/visit-plans/{plan_id}/{action}")
-async def process_visit_plan(plan_id: str, action: str, admin=Depends(get_current_admin)):
+async def process_visit_plan(plan_id: str, action: str, admin=Depends(require_feature("war_room"))):
     """Approve or Reject a visit plan."""
     new_status = PlanStatus.APPROVED if action == "approve" else PlanStatus.REJECTED
     result = await visit_plans_collection.update_one(
@@ -1169,7 +1149,7 @@ async def process_visit_plan(plan_id: str, action: str, admin=Depends(get_curren
 
 
 @router.put("/admin/field/visit-plans/{plan_id}")
-async def update_visit_plan(plan_id: str, req: dict, admin=Depends(get_current_admin)):
+async def update_visit_plan(plan_id: str, req: dict, admin=Depends(require_feature("war_room"))):
     """Update a visit plan (reorder stops, edit details, add comments) before or after approval."""
     try:
         # Extract stops and comments from request
@@ -1199,7 +1179,7 @@ async def update_visit_plan(plan_id: str, req: dict, admin=Depends(get_current_a
 
 
 @router.post("/admin/field/generate-otp/{employee_id}")
-async def generate_attendance_otp(employee_id: str, admin=Depends(get_current_admin)):
+async def generate_attendance_otp(employee_id: str, admin=Depends(require_feature("war_room"))):
     """Generate a 4-digit OTP for an employee to use as a GPS fallback."""
     import random
     otp = str(random.randint(1000, 9999))
@@ -1225,7 +1205,7 @@ async def generate_attendance_otp(employee_id: str, admin=Depends(get_current_ad
 
 
 @router.get("/admin/field/live-status")
-async def get_field_live_status(admin=Depends(get_current_admin)):
+async def get_field_live_status(admin=Depends(require_feature("war_room"))):
     """Live operational data for the War Room map (optimized O(1) batched queries)."""
     try:
         # Apply RBAC: managers see only their team
@@ -1399,18 +1379,8 @@ async def get_field_live_status(admin=Depends(get_current_admin)):
 async def submit_expense(req: dict, employee=Depends(get_current_employee)):
     # Handle Base64 Receipt Image if present
     receipt_url = req.get("receipt_url", "")
-    if receipt_url and receipt_url.startswith("data:image"):
-        try:
-            header, encoded = receipt_url.split(",", 1)
-            ext = header.split(";")[0].split("/")[1]
-            filename = f"receipt_{uuid.uuid4().hex}.{ext}"
-            filepath = os.path.join(UPLOAD_DIR, filename)
-            with open(filepath, "wb") as f:
-                f.write(base64.b64decode(encoded))
-            receipt_url = f"/uploads/{filename}"
-        except Exception as e:
-            logger.error(f"Failed to save receipt image: {e}")
-            receipt_url = ""
+    if receipt_url:
+        receipt_url = await save_local_image(receipt_url, employee, "expense_receipt", "receipts")
 
     claim = {
         "employee_id": employee["email"],
@@ -1452,7 +1422,7 @@ async def get_my_expenses(employee=Depends(get_current_employee)):
 
 
 @router.get("/admin/expenses")
-async def admin_list_expenses(status: Optional[str] = None, admin=Depends(get_current_admin)):
+async def admin_list_expenses(status: Optional[str] = None, admin=Depends(require_feature("expenses"))):
     """Admin fetches all expense claims, optionally filtered by status."""
     query = {}
     if admin.organization_id:
@@ -1477,7 +1447,7 @@ async def admin_list_expenses(status: Optional[str] = None, admin=Depends(get_cu
 
 
 @router.put("/admin/expenses/{claim_id}")
-async def admin_update_expense(claim_id: str, req: dict, admin=Depends(get_current_admin)):
+async def admin_update_expense(claim_id: str, req: dict, admin=Depends(require_feature("expenses"))):
     """Admin approves, rejects, or queries an expense claim."""
     from bson import ObjectId
     action = req.get("action", "approve")  # approve | reject | query
@@ -1513,7 +1483,7 @@ async def get_alerts(
     status: Optional[str] = "pending",
     employee_id: Optional[str] = None,
     source: Optional[str] = None,
-    admin=Depends(get_current_admin)
+    admin=Depends(require_feature("war_room"))
 ):
     """Retrieve filtered security and operational alerts."""
     query = {"organization_id": admin.organization_id}
@@ -1540,7 +1510,7 @@ async def get_alerts(
 
 
 @router.put("/admin/field/alerts/{alert_id}")
-async def update_alert_status(alert_id: str, req: dict, admin=Depends(get_current_admin)):
+async def update_alert_status(alert_id: str, req: dict, admin=Depends(require_feature("war_room"))):
     """Update alert status (resolved, dismissed)."""
     from bson import ObjectId
     status = req.get("status")
@@ -1557,7 +1527,7 @@ async def update_alert_status(alert_id: str, req: dict, admin=Depends(get_curren
 
 
 @router.get("/admin/field/heatmap-data")
-async def get_heatmap_data(admin=Depends(get_current_admin)):
+async def get_heatmap_data(admin=Depends(require_feature("war_room"))):
     """Aggregation of pings for heatmap visualization."""
     now = datetime.now(timezone.utc)
     start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -1581,7 +1551,7 @@ async def get_heatmap_data(admin=Depends(get_current_admin)):
 
 
 @router.post("/admin/field/trigger-sla-check")
-async def trigger_sla_check_manual(admin=Depends(get_current_admin)):
+async def trigger_sla_check_manual(admin=Depends(require_feature("war_room"))):
     """Manually trigger the SLA check for debugging."""
     await check_missed_visits(force=True)
     return {"status": "success", "message": "Manual SLA check triggered"}

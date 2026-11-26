@@ -1,3 +1,4 @@
+from upload_security import SecureMediaRoute
 import os
 import uuid
 import io
@@ -20,7 +21,7 @@ from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, 
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 
-router = APIRouter(prefix="/api/employee", tags=["HRMS Employee"])
+router = APIRouter(route_class=SecureMediaRoute, prefix="/api/employee", tags=["HRMS Employee"])
 
 UPLOAD_DIR = "uploads"
 ONBOARDING_UPLOAD_DIR = os.path.join(UPLOAD_DIR, "onboarding")
