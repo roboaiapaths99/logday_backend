@@ -72,8 +72,10 @@ from database import (
     salary_structures_collection,
     holidays_collection,
     leave_policies_collection,
-    tasks_collection
+    tasks_collection,
+    scheduler_locks_collection,
 )
+from pymongo import ReturnDocument
 from models import (
     RegisterRequest, LoginRequest, VerifyPresenceRequest, Token, LoginResponse, EmployeeProfile, UpdateFaceRequest,
     AdminLoginRequest, EmployeeUpdate, SystemSettings, Admin, AdminRole, Organization, OrganizationRegisterRequest, SubAdminCreate,
@@ -99,6 +101,41 @@ from services.common_helpers import (
 
 scheduler = AsyncIOScheduler()
 
+
+async def acquire_scheduler_lock(job_id: str, ttl_seconds: int = 240) -> bool:
+    """
+    Distributed MongoDB lock so scheduled background jobs run at most once per interval
+    even when multiple Gunicorn/Uvicorn web workers are running concurrently.
+    """
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(seconds=max(10, ttl_seconds))
+    owner_pid = f"{os.uname().nodename if hasattr(os, 'uname') else 'host'}:{os.getpid()}"
+    try:
+        existing = await scheduler_locks_collection.find_one({"_id": job_id})
+        if existing:
+            exp = existing.get("expires_at")
+            if isinstance(exp, datetime):
+                exp_utc = exp.replace(tzinfo=timezone.utc) if exp.tzinfo is None else exp.astimezone(timezone.utc)
+                if exp_utc > now:
+                    return False
+            claimed = await scheduler_locks_collection.find_one_and_update(
+                {"_id": job_id, "expires_at": existing.get("expires_at")},
+                {"$set": {"expires_at": expires_at, "locked_at": now, "owner": owner_pid}},
+                return_document=ReturnDocument.AFTER,
+            )
+            return claimed is not None
+
+        await scheduler_locks_collection.insert_one({
+            "_id": job_id,
+            "expires_at": expires_at,
+            "locked_at": now,
+            "owner": owner_pid,
+        })
+        return True
+    except Exception:
+        return False
+
+
 async def check_missed_visits(force: bool = False):
     """
     Scheduled job to check for missed visits.
@@ -106,6 +143,8 @@ async def check_missed_visits(force: bool = False):
     but not checked in by 5:30 PM local time (12:00 PM UTC).
     """
     try:
+        if not force and not await acquire_scheduler_lock("check_missed_visits", ttl_seconds=1800):
+            return
         now = datetime.now(timezone.utc)
         local_now = now + timedelta(minutes=330)
         if not force and local_now.hour < 17:
@@ -165,7 +204,9 @@ async def check_missed_visits(force: bool = False):
 
 
 async def purge_old_screenshots():
-    """Daily clean-up of expired screenshots from DB and local storage based on organization retention policy."""
+    """Daily clean-up of expired screenshots and aged location pings from DB and local storage."""
+    if not await acquire_scheduler_lock("purge_old_screenshots", ttl_seconds=3600):
+        return
     logger.info("Starting scheduled job: purge_old_screenshots")
     try:
         orgs = await organizations_collection.find({}).to_list(length=1000)
@@ -197,8 +238,14 @@ async def purge_old_screenshots():
                         batch_deleted += 1
                 if not batch_deleted:
                     break
-                
-        logger.info(f"Finished scheduled job: purge_old_screenshots. Purged {purged_count} screenshots.")
+
+        # Purge location pings older than LOCATION_PING_RETENTION_DAYS (default 90 days) to prevent unbounded DB growth
+        ping_retention_days = int(os.getenv("LOCATION_PING_RETENTION_DAYS", "90") or 90)
+        ping_cutoff = now - timedelta(days=max(7, ping_retention_days))
+        ping_del = await location_pings_collection.delete_many({"recorded_at": {"$lt": ping_cutoff}})
+        purged_pings = getattr(ping_del, "deleted_count", 0)
+
+        logger.info(f"Finished scheduled job: purge_old_screenshots. Purged {purged_count} screenshots and {purged_pings} old location pings.")
     except Exception as e:
         logger.error(f"Error running purge_old_screenshots: {e}")
 

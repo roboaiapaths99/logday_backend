@@ -5,7 +5,10 @@ except ImportError:
     cv2 = None  # type: ignore[assignment]
     HAS_CV2 = False
 
-import numpy as np
+try:
+    import numpy as np
+except ImportError:
+    np = None  # type: ignore[assignment]
 import base64
 
 try:
@@ -46,7 +49,7 @@ def decode_image(base64_string):
 DUMMY_IMAGE_BYPASS = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+ip1sAAAAASUVORK5CYII="
 
 def get_face_embedding(img_base64):
-    """Generates a face embedding from a base64 image string."""
+    """Generates a face embedding from a base64 image string using in-memory NumPy arrays and strict face detection."""
     env = os.getenv("APP_ENV", "development").lower()
     # In production, dummy bypass is strictly disabled
     if env != "production" and (not HAS_DEEPFACE or img_base64 == DUMMY_IMAGE_BYPASS):
@@ -54,53 +57,33 @@ def get_face_embedding(img_base64):
     if env == "production" and not HAS_DEEPFACE:
         logger.error("DeepFace is required in production environment.")
         return None
-        
-    try:
-        # Save to temp file for DeepFace
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as temp:
-            img = decode_image(img_base64)
-            if img is None:
-                return None
-            cv2.imwrite(temp.name, img)
-            temp_path = temp.name
 
-        # Generate embedding with robust detector
-        # Try RetinaFace (accurate) first, then fallback
-        try:
-            results = DeepFace.represent(
-                img_path=temp_path, 
-                model_name="VGG-Face", 
-                detector_backend="retinaface", # Higher accuracy for enterprise
-                enforce_detection=True,
-                align=True
-            )
-        except Exception as e1:
-            logger.warning(f"RetinaFace failed: {e1}. Falling back to MTCNN.")
+    try:
+        img = decode_image(img_base64)
+        if img is None:
+            return None
+
+        # Generate embedding directly from the in-memory BGR NumPy array (zero disk temp-file I/O).
+        # Always enforce_detection=True across all fallbacks so background/no-face images never produce false vectors.
+        results = None
+        for backend in ("retinaface", "mtcnn", "opencv"):
             try:
                 results = DeepFace.represent(
-                    img_path=temp_path, 
-                    model_name="VGG-Face", 
-                    detector_backend="mtcnn", # Fast and reliable fallback
+                    img_path=img,
+                    model_name="VGG-Face",
+                    detector_backend=backend,
                     enforce_detection=True,
-                    align=True
+                    align=True,
                 )
-            except Exception as e2:
-                logger.error(f"MTCNN failed: {e2}. Final fallback to OpenCV.")
-                results = DeepFace.represent(
-                    img_path=temp_path, 
-                    model_name="VGG-Face", 
-                    detector_backend="opencv", 
-                    enforce_detection=False # Last resort, allow even if detection fails
-                )
-        
-        os.unlink(temp_path)
-        
+                if results:
+                    break
+            except Exception as det_err:
+                logger.warning(f"{backend} face detection failed: {det_err}")
+
         if results and len(results) > 0:
             return results[0]["embedding"]
         return None
     except Exception as e:
-        if 'temp_path' in locals() and os.path.exists(temp_path):
-            os.unlink(temp_path)
         logger.error(f"Critical error in face embedding: {e}")
         return None
 

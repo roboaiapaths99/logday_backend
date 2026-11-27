@@ -64,6 +64,7 @@ salary_structures_collection = db["salary_structures"]
 holidays_collection = db["holidays"]
 leave_policies_collection = db["leave_policies"]
 absence_alerts_collection = db["absence_alerts"]
+scheduler_locks_collection = db["scheduler_locks"]
 
 
 # Ensure indexes for employee check-in status and session tracking (each index isolated so one conflict never stops others)
@@ -75,6 +76,9 @@ async def ensure_employee_indexes():
         (oauth_states_collection, "expires_at", {"expireAfterSeconds": 0}),
         (auth_sessions_collection, "expires_at", {"expireAfterSeconds": 0}),
         (employee_invitations_collection, "expires_at", {"expireAfterSeconds": 0}),
+        (scheduler_locks_collection, "expires_at", {"expireAfterSeconds": 0}),
+        (wfh_signals_collection, "created_at", {"expireAfterSeconds": 3600}),
+        (wfh_commands_collection, "timestamp", {"expireAfterSeconds": 86400}),
         (uploads_collection, "url", {"unique": True}),
         (uploads_collection, [("organization_id", 1), ("owner_id", 1)], {}),
         (employees_collection, "checked_in", {}),
@@ -99,6 +103,7 @@ async def ensure_employee_indexes():
         (absence_alerts_collection, [("organization_id", 1), ("employee_email", 1), ("date", 1)], {"unique": True, "sparse": True}),
         (absence_alerts_collection, "token", {"unique": True, "sparse": True}),
         (leave_requests_collection, "penalty_key", {"unique": True, "sparse": True}),
+        (payrolls_collection, [("organization_id", 1), ("employee_email", 1), ("payroll_month", 1)], {"unique": True, "sparse": True}),
         (attendance_logs_collection, [("organization_id", 1), ("offline_id", 1)], {"unique": True, "sparse": True}),
         (visit_logs_collection, [("organization_id", 1), ("offline_id", 1)], {"unique": True, "sparse": True}),
         (location_pings_collection, [("organization_id", 1), ("offline_id", 1)], {"unique": True, "sparse": True}),

@@ -541,31 +541,50 @@ async def auto_verify_document_file(filepath: str, doc_type: str, employee: dict
         return False, "Unsupported file format for auto-verification.", {}
         
     extracted_text = ""
-    # Try calling OCR.space API in threadpool so it never blocks the async event loop
+    # 1. Try local OCR engine (Tesseract / Google Vision from ocr_utils) in threadpool first
     try:
         from fastapi.concurrency import run_in_threadpool
-        url = "https://api.ocr.space/parse/image"
-        def _post_ocr_space():
-            with open(filepath, 'rb') as f:
-                return requests.post(
-                    url,
-                    files={"file": f},
-                    data={"apikey": "helloworld", "language": "eng"},
-                    timeout=10
-                )
-        r = await run_in_threadpool(_post_ocr_space)
-        if r.status_code == 200:
-            res = r.json()
-            parsed_results = res.get("ParsedResults", [])
-            if parsed_results:
-                extracted_text = parsed_results[0].get("ParsedText", "")
-                logger.info(f"OCR successfully extracted text for {doc_type}")
+        from ocr_utils import extract_text_from_image
+
+        if file_ext in [".jpg", ".jpeg", ".png"]:
+            def _read_and_local_ocr():
+                with open(filepath, "rb") as f:
+                    raw_bytes = f.read()
+                text, _ = extract_text_from_image(raw_bytes)
+                return text
+            extracted_text = await run_in_threadpool(_read_and_local_ocr)
+            if extracted_text:
+                logger.info(f"Local OCR successfully extracted text for {doc_type}")
+    except Exception as local_ocr_err:
+        logger.debug(f"Local OCR fallback note: {local_ocr_err}")
+
+    # 2. Fallback to OCR.space API in threadpool using configured OCR_SPACE_API_KEY
+    if not extracted_text:
+        try:
+            from fastapi.concurrency import run_in_threadpool
+            url = "https://api.ocr.space/parse/image"
+            ocr_api_key = (os.getenv("OCR_SPACE_API_KEY") or "").strip() or "helloworld"
+            def _post_ocr_space():
+                with open(filepath, 'rb') as f:
+                    return requests.post(
+                        url,
+                        files={"file": f},
+                        data={"apikey": ocr_api_key, "language": "eng"},
+                        timeout=10
+                    )
+            r = await run_in_threadpool(_post_ocr_space)
+            if r.status_code == 200:
+                res = r.json()
+                parsed_results = res.get("ParsedResults", [])
+                if parsed_results:
+                    extracted_text = parsed_results[0].get("ParsedText", "")
+                    logger.info(f"OCR successfully extracted text for {doc_type}")
+                else:
+                    logger.warning(f"OCR API returned empty results: {res}")
             else:
-                logger.warning(f"OCR API returned empty results: {res}")
-        else:
-            logger.warning(f"OCR API returned status code {r.status_code}")
-    except Exception as e:
-        logger.error(f"OCR API call failed: {e}")
+                logger.warning(f"OCR API returned status code {r.status_code}")
+        except Exception as e:
+            logger.error(f"OCR API call failed: {e}")
         
     # Standardize names for comparison
     emp_name = employee.get("full_name", employee.get("employee_name", "")).strip().lower()

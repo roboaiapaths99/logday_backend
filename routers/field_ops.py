@@ -1246,7 +1246,7 @@ async def get_field_live_status(admin=Depends(require_feature("war_room"))):
         base_filter = get_employee_filter(admin)
         query = {**base_filter, "employee_type": "field"}
             
-        field_emps = await employees_collection.find(query).to_list(length=100)
+        field_emps = await employees_collection.find(query, {"face_embedding": 0, "hashed_password": 0}).to_list(length=100)
         if not field_emps:
             return JSONResponse(content={"agents": [], "stats": {"active": 0, "idle": 0, "breach": 0}})
 

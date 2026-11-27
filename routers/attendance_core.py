@@ -114,6 +114,19 @@ from services.scheduler_jobs import check_missed_visits, purge_old_screenshots
 
 router = APIRouter(route_class=SecureMediaRoute)
 
+_ATTENDANCE_LOCKS: dict[str, asyncio.Lock] = {}
+
+def _get_attendance_lock(user_key: str) -> asyncio.Lock:
+    if len(_ATTENDANCE_LOCKS) > 5000:
+        for k in list(_ATTENDANCE_LOCKS.keys())[:1000]:
+            if not _ATTENDANCE_LOCKS[k].locked():
+                _ATTENDANCE_LOCKS.pop(k, None)
+    lock = _ATTENDANCE_LOCKS.get(user_key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _ATTENDANCE_LOCKS[user_key] = lock
+    return lock
+
 @router.post("/verify-presence")
 async def verify_presence(req: VerifyPresenceRequest, request: Request, employee=Depends(get_current_employee)):
     """Verify user presence using face + GPS + WiFi telemetry."""
@@ -184,47 +197,48 @@ async def verify_presence(req: VerifyPresenceRequest, request: Request, employee
         if target_bssid and req.wifi_bssid and req.wifi_bssid.strip().lower() != target_bssid.strip().lower():
              raise HTTPException(status_code=403, detail="Must be connected to Office WiFi Access Point (BSSID mismatch).")
 
-    # 5. Determine check-in or check-out (Localized)
+    # 5. Determine check-in or check-out (Localized) with per-employee lock to prevent double-tap race
     today_start_utc = get_today_start(tz_offset)
     user_id_str = str(user["_id"])
     emp_email = user.get("email", req.email)
-    last_log = await attendance_logs_collection.find_one(
-        {
-            "$or": [
-                {"user_id": user_id_str},
-                {"user_id": emp_email},
-                {"email": emp_email}
-            ],
-            "timestamp": {"$gte": today_start_utc}
-        },
-        sort=[("timestamp", -1)]
-    )
-    attendance_type = "check-out" if (last_log and last_log.get("type") == "check-in") else "check-in"
+    async with _get_attendance_lock(user_id_str):
+        last_log = await attendance_logs_collection.find_one(
+            {
+                "$or": [
+                    {"user_id": user_id_str},
+                    {"user_id": emp_email},
+                    {"email": emp_email}
+                ],
+                "timestamp": {"$gte": today_start_utc}
+            },
+            sort=[("timestamp", -1)]
+        )
+        attendance_type = "check-out" if (last_log and last_log.get("type") == "check-in") else "check-in"
 
-    # 6. Log Attendance
-    log = {
-        "user_id": user_id_str,
-        "email": emp_email,
-        "timestamp": datetime.now(timezone.utc),
-        "type": attendance_type,
-        "status": "SUCCESS",
-        "location": {"lat": req.get_lat(), "long": req.get_long()},
-        "location_name": req.address or "Verified Zone",
-        "distance_meters": dist_meters,
-        "wifi_info": {"bssid": req.wifi_bssid, "strength": req.wifi_strength},
-        "face_confidence": float(distance),
-        "device_id": req.device_id,
-        "organization_id": str(user.get("organization_id")) if user.get("organization_id") else None,
-    }
-    await attendance_logs_collection.insert_one(log)
-    await employees_collection.update_one(
-        {"_id": user["_id"]},
-        {"$set": {
-            "checked_in": (attendance_type == "check-in"),
-            "last_attendance_type": attendance_type,
-            "last_attendance_time": log["timestamp"]
-        }}
-    )
+        # 6. Log Attendance
+        log = {
+            "user_id": user_id_str,
+            "email": emp_email,
+            "timestamp": datetime.now(timezone.utc),
+            "type": attendance_type,
+            "status": "SUCCESS",
+            "location": {"lat": req.get_lat(), "long": req.get_long()},
+            "location_name": req.address or "Verified Zone",
+            "distance_meters": dist_meters,
+            "wifi_info": {"bssid": req.wifi_bssid, "strength": req.wifi_strength},
+            "face_confidence": float(distance),
+            "device_id": req.device_id,
+            "organization_id": str(user.get("organization_id")) if user.get("organization_id") else None,
+        }
+        await attendance_logs_collection.insert_one(log)
+        await employees_collection.update_one(
+            {"_id": user["_id"]},
+            {"$set": {
+                "checked_in": (attendance_type == "check-in"),
+                "last_attendance_type": attendance_type,
+                "last_attendance_time": log["timestamp"]
+            }}
+        )
 
     return {
         "status": "success",
@@ -800,17 +814,35 @@ async def smart_attendance(req: VerifyPresenceRequest, request: Request, backgro
         }
         if wfh_session_id:
             log["wfh_session_id"] = wfh_session_id
-        
-        await attendance_logs_collection.insert_one(log)
-        await employees_collection.update_one(
-            {"_id": user["_id"]},
-            {"$set": {
-                "checked_in": (attendance_type == "check-in"),
-                "last_attendance_type": attendance_type,
-                "last_attendance_time": log["timestamp"],
-                "last_attendance_status": classification["status"]
-            }}
-        )
+
+        # Acquire per-employee lock and re-verify today's latest log right before insert to prevent double-tap race
+        async with _get_attendance_lock(user_id_str):
+            latest_before_insert = await attendance_logs_collection.find_one(
+                {
+                    "$or": [
+                        {"user_id": user_id_str},
+                        {"user_id": emp_email},
+                        {"email": emp_email}
+                    ],
+                    "timestamp": {"$gte": today_start_utc}
+                },
+                sort=[("timestamp", -1)]
+            )
+            if attendance_type == "check-in" and latest_before_insert and latest_before_insert.get("type") == "check-in":
+                raise HTTPException(status_code=400, detail="You are already checked in. Please check out first.")
+            if attendance_type == "check-out" and (not latest_before_insert or latest_before_insert.get("type") == "check-out"):
+                raise HTTPException(status_code=400, detail="You haven't checked in today. Please check in first.")
+
+            await attendance_logs_collection.insert_one(log)
+            await employees_collection.update_one(
+                {"_id": user["_id"]},
+                {"$set": {
+                    "checked_in": (attendance_type == "check-in"),
+                    "last_attendance_type": attendance_type,
+                    "last_attendance_time": log["timestamp"],
+                    "last_attendance_status": classification["status"]
+                }}
+            )
 
         # Trigger Background Sync to Google Sheets
         background_tasks.add_task(sync_to_google_sheets, log)

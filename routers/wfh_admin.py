@@ -345,7 +345,7 @@ async def admin_wfh_live_view(request: Request, current_admin: Admin = Depends(r
         if org_id and org_id != "system_org":
             query["organization_id"] = org_id
 
-        employees = await employees_collection.find(query).to_list(length=500)
+        employees = await employees_collection.find(query, {"face_embedding": 0, "hashed_password": 0}).to_list(length=500)
 
         if not employees:
             return []

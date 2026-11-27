@@ -438,7 +438,7 @@ async def process_org_absence_alerts(org_id: str, force_run: bool = False) -> di
     if org_id and org_id != "system_org":
         emp_query["organization_id"] = org_id
 
-    employees = await employees_collection.find(emp_query).to_list(length=1000)
+    employees = await employees_collection.find(emp_query, {"face_embedding": 0, "hashed_password": 0}).to_list(length=1000)
     public_base = _resolve_public_api_base_url()
 
     alerts_sent = 0
@@ -549,6 +549,9 @@ async def process_org_absence_alerts(org_id: str, force_run: bool = False) -> di
 async def check_uninformed_absences_4pm():
     """Scheduled background job: runs every 5 minutes and processes 4:00 PM absentee alerts per organization."""
     try:
+        from services.scheduler_jobs import acquire_scheduler_lock
+        if not await acquire_scheduler_lock("check_uninformed_absences_4pm", ttl_seconds=240):
+            return
         settings_docs = await settings_collection.find({
             "absence_notification_emails": {"$exists": True, "$ne": []}
         }).to_list(length=500)

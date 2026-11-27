@@ -164,7 +164,7 @@ async def build_report(admin, month, now=None):
     if not re.fullmatch(r'\d{4}-(0[1-9]|1[0-2])', month) or not 1900 <= int(month[:4]) <= 9998:
         raise HTTPException(400, 'Invalid month. Expected YYYY-MM.')
     now = now or datetime.now(timezone.utc)
-    employees = await employees_collection.find(get_employee_filter(admin)).sort('full_name', 1).to_list(length=None)
+    employees = await employees_collection.find(get_employee_filter(admin), {'face_embedding': 0, 'hashed_password': 0}).sort('full_name', 1).to_list(length=None)
     rows = []
     by_org = defaultdict(list)
     working_days_by_org = {}

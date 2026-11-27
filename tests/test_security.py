@@ -524,3 +524,129 @@ def test_health_and_ready_return_503_when_db_down(client, monkeypatch):
     assert client.get("/ready").status_code == 503
     assert client.get("/health").status_code == 503
 
+
+def test_session_refresh_and_revoked_rejection(client, db):
+    emp = account(db, "employee", email="refresh_emp@example.test")
+    headers = bearer(emp, "employee")
+    res = client.post("/auth/refresh", headers=headers)
+    assert res.status_code == 200, res.text
+    refreshed_token = res.json()["access_token"]
+    new_headers = {"Authorization": f"Bearer {refreshed_token}"}
+    assert client.get("/api/employee/profile", headers=new_headers).status_code == 200
+
+    assert client.post("/auth/logout", headers=new_headers).status_code == 200
+    assert client.post("/auth/refresh", headers=new_headers).status_code == 401
+
+
+def test_manager_scoped_excel_and_pdf_exports(client, db):
+    import io
+    import zipfile
+
+    org_id = str(ObjectId())
+    manager = account(db, "admin", email="mgr_exp@example.test", role="manager", features=["attendance"], org=org_id)
+    direct_report = account(db, "employee", email="direct@example.test", org=org_id)
+    db.employees_collection.update_one({"_id": direct_report["_id"]}, {"$set": {"manager_id": manager["email"], "full_name": "Direct Report"}})
+    other_emp = account(db, "employee", email="unmanaged@example.test", org=org_id)
+    db.employees_collection.update_one({"_id": other_emp["_id"]}, {"$set": {"manager_id": "someone_else@example.test", "full_name": "Unmanaged Person"}})
+
+    now = datetime.now(timezone.utc)
+    db.attendance_logs_collection.insert_many([
+        {"user_id": str(direct_report["_id"]), "email": direct_report["email"], "full_name": "Direct Report", "type": "check-in", "timestamp": now},
+        {"user_id": str(other_emp["_id"]), "email": other_emp["email"], "full_name": "Unmanaged Person", "type": "check-in", "timestamp": now},
+    ])
+
+    headers = bearer(manager, "admin")
+    excel_res = client.get("/admin/export-logs-excel", headers=headers)
+    assert excel_res.status_code == 200, excel_res.text
+    assert excel_res.content.startswith(b"PK")
+    with zipfile.ZipFile(io.BytesIO(excel_res.content)) as zf:
+        xml_bytes = b"".join(zf.read(name) for name in zf.namelist() if name.endswith(".xml"))
+        assert b"direct@example.test" in xml_bytes
+        assert b"unmanaged@example.test" not in xml_bytes
+
+    pdf_res = client.get("/admin/export-logs-pdf", headers=headers)
+    assert pdf_res.status_code == 200
+    assert pdf_res.content.startswith(b"%PDF")
+
+
+def test_failed_logins_rate_limiter_eviction_bound(monkeypatch):
+    import time
+    monkeypatch.setattr(auth, "_MAX_TRACKED_LOGIN_KEYS", 20)
+    auth._FAILED_LOGINS.clear()
+    now_ts = time.time()
+    for i in range(25):
+        auth._FAILED_LOGINS[(f"10.0.0.{i}", f"user{i}@example.test")] = [now_ts - 10]
+    auth._prune_failed_logins(now_ts)
+    assert len(auth._FAILED_LOGINS) <= 20
+
+
+def test_distributed_scheduler_lock_single_winner(db):
+    from services.scheduler_jobs import acquire_scheduler_lock
+
+    first = asyncio.run(acquire_scheduler_lock("unit_test_job", ttl_seconds=60))
+    second = asyncio.run(acquire_scheduler_lock("unit_test_job", ttl_seconds=60))
+    assert first is True
+    assert second is False
+
+    # Once expired, another worker can acquire the lock
+    db.scheduler_locks_collection.update_one(
+        {"_id": "unit_test_job"},
+        {"$set": {"expires_at": datetime.now(timezone.utc) - timedelta(seconds=5)}},
+    )
+    third = asyncio.run(acquire_scheduler_lock("unit_test_job", ttl_seconds=60))
+    assert third is True
+
+
+def test_face_embedding_strictly_enforces_detection(monkeypatch):
+    import importlib.util
+    from pathlib import Path
+
+    spec = importlib.util.spec_from_file_location("real_face_utils", Path(__file__).resolve().parents[1] / "face_utils.py")
+    real_face_utils = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(real_face_utils)
+
+    calls = []
+    class FakeDeepFace:
+        @staticmethod
+        def represent(img_path, model_name, detector_backend, enforce_detection, align=True):
+            calls.append((detector_backend, enforce_detection))
+            raise ValueError("Face could not be detected")
+
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.setattr(real_face_utils, "HAS_DEEPFACE", True)
+    monkeypatch.setattr(real_face_utils, "DeepFace", FakeDeepFace)
+    monkeypatch.setattr(real_face_utils, "decode_image", lambda b64: "fake-numpy-img")
+
+    emb = real_face_utils.get_face_embedding("some-base64")
+    assert emb is None
+    assert len(calls) == 3
+    assert all(enforce is True for _, enforce in calls)
+
+
+def test_concurrent_payroll_auto_generation_is_idempotent(db):
+    from types import SimpleNamespace
+    import hrms_payroll
+
+    org_id = str(ObjectId())
+    owner = account(db, "admin", email="pay_owner@example.test", role="owner", features=["payroll"], org=org_id)
+    emp = account(db, "employee", email="pay_emp@example.test", org=org_id)
+    db.employees_collection.update_one({"_id": emp["_id"]}, {"$set": {"status": "Active"}})
+
+    admin_obj = SimpleNamespace(**owner)
+
+    async def run_twice():
+        await asyncio.gather(
+            hrms_payroll._auto_generate_missing_payrolls("2026-11", admin_obj),
+            hrms_payroll._auto_generate_missing_payrolls("2026-11", admin_obj),
+        )
+
+    asyncio.run(run_twice())
+    count = db.payrolls_collection.count_documents({
+        "organization_id": org_id,
+        "employee_email": emp["email"],
+        "payroll_month": "2026-11",
+    })
+    assert count == 1
+
+
+

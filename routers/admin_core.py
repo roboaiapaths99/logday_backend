@@ -257,67 +257,71 @@ async def get_import_template(current_admin: Admin = Depends(require_feature("em
 
 @router.get("/admin/export-logs-pdf")
 async def admin_export_logs_pdf(current_admin: Admin = Depends(require_feature("attendance"))):
-    """Generate a PDF report of all attendance logs for the admin's organization."""
+    """Generate a PDF report of all attendance logs for the admin's organization/team scope."""
     try:
         org_id = current_admin.organization_id
-        if not org_id:
-             raise HTTPException(status_code=403, detail="Organization context required")
+        if not org_id and not _is_superadmin(current_admin):
+            raise HTTPException(status_code=403, detail="Organization context required")
 
-        # Get all employee IDs for this org
-        org_employees = await employees_collection.find({"organization_id": org_id}, {"_id": 1}).to_list(None)
+        # Enforce both tenant and manager team scope
+        org_employees = await employees_collection.find(get_employee_filter(current_admin), {"_id": 1}).to_list(None)
         org_emp_ids = [str(emp["_id"]) for emp in org_employees]
 
         cursor = attendance_logs_collection.find({"user_id": {"$in": org_emp_ids}}).sort("timestamp", -1)
         logs = await cursor.to_list(length=5000)
-        
-        buffer = io.BytesIO()
-        doc = SimpleDocTemplate(buffer, pagesize=landscape(letter), rightMargin=30, leftMargin=30, topMargin=30, bottomMargin=30)
-        elements = []
-        
-        styles = getSampleStyleSheet()
-        elements.append(Paragraph("LogDay Attendance Audit Report", styles['Title']))
-        elements.append(Paragraph(f"Generated on: {datetime.now(timezone.utc).astimezone(timezone(timedelta(minutes=330))).strftime('%Y-%m-%d %I:%M %p')} (IST)", styles['Normal']))
-        elements.append(Spacer(1, 20))
-        
-        data = [["Timestamp", "Employee Name", "Type", "Location", "Verification"]]
-        for log in logs:
-            ts = log.get("timestamp")
-            if isinstance(ts, datetime):
-                # Localize to IST for PDF Display
-                ist_ts = ts.astimezone(timezone(timedelta(minutes=330)))
-                ts_str = ist_ts.strftime("%Y-%m-%d %I:%M %p")
-            else:
-                ts_str = str(ts)
-                
-            data.append([
-                ts_str,
-                log.get("full_name") or log.get("email") or "Unknown",
-                log.get("type", "check-in").upper(),
-                log.get("address", "Main Office"),
-                log.get("status", "SUCCESS").upper()
-            ])
-            
-        table = Table(data, hAlign='LEFT', colWidths=[150, 150, 100, 200, 100])
-        table.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#7c3aed")),
-            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-            ('FONTSIZE', (0, 0), (-1, 0), 12),
-            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-            ('BACKGROUND', (0, 1), (-1, -1), colors.whitesmoke),
-            ('GRID', (0, 0), (-1, -1), 1, colors.grey)
-        ]))
-        
-        elements.append(table)
-        doc.build(elements)
-        
-        buffer.seek(0)
+
+        def _build_pdf():
+            buffer = io.BytesIO()
+            doc = SimpleDocTemplate(buffer, pagesize=landscape(letter), rightMargin=30, leftMargin=30, topMargin=30, bottomMargin=30)
+            elements = []
+
+            styles = getSampleStyleSheet()
+            elements.append(Paragraph("LogDay Attendance Audit Report", styles['Title']))
+            elements.append(Paragraph(f"Generated on: {datetime.now(timezone.utc).astimezone(timezone(timedelta(minutes=330))).strftime('%Y-%m-%d %I:%M %p')} (IST)", styles['Normal']))
+            elements.append(Spacer(1, 20))
+
+            data = [["Timestamp", "Employee Name", "Type", "Location", "Verification"]]
+            for log in logs:
+                ts = log.get("timestamp")
+                if isinstance(ts, datetime):
+                    ist_ts = ts.astimezone(timezone(timedelta(minutes=330)))
+                    ts_str = ist_ts.strftime("%Y-%m-%d %I:%M %p")
+                else:
+                    ts_str = str(ts)
+
+                data.append([
+                    ts_str,
+                    log.get("full_name") or log.get("email") or "Unknown",
+                    log.get("type", "check-in").upper(),
+                    log.get("address", "Main Office"),
+                    log.get("status", "SUCCESS").upper()
+                ])
+
+            table = Table(data, hAlign='LEFT', colWidths=[150, 150, 100, 200, 100])
+            table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#7c3aed")),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, 0), 12),
+                ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+                ('BACKGROUND', (0, 1), (-1, -1), colors.whitesmoke),
+                ('GRID', (0, 0), (-1, -1), 1, colors.grey)
+            ]))
+
+            elements.append(table)
+            doc.build(elements)
+            buffer.seek(0)
+            return buffer
+
+        buffer = await run_in_threadpool(_build_pdf)
         return StreamingResponse(
-        buffer,
-        media_type="application/pdf",
-        headers={"Content-Disposition": f"attachment; filename=attendance_report_{datetime.now(timezone.utc).astimezone(timezone(timedelta(minutes=330))).strftime('%Y%m%d')}.pdf"}
-    )
+            buffer,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f"attachment; filename=attendance_report_{datetime.now(timezone.utc).astimezone(timezone(timedelta(minutes=330))).strftime('%Y%m%d')}.pdf"}
+        )
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"PDF export error: {e}")
         raise HTTPException(status_code=500, detail=f"PDF generation failed: {str(e)}")
@@ -325,45 +329,78 @@ async def admin_export_logs_pdf(current_admin: Admin = Depends(require_feature("
 
 @router.get("/admin/export-logs-excel")
 async def admin_export_logs_excel(current_admin: Admin = Depends(require_feature("attendance"))):
-    """Export attendance logs to Excel for the admin's organization."""
+    """Export attendance logs to Excel for the admin's organization/team scope."""
     try:
         org_id = current_admin.organization_id
-        if not org_id:
-             raise HTTPException(status_code=403, detail="Organization context required")
+        if not org_id and not _is_superadmin(current_admin):
+            raise HTTPException(status_code=403, detail="Organization context required")
 
-        org_employees = await employees_collection.find({"organization_id": org_id}, {"_id": 1}).to_list(None)
+        # Enforce both tenant and manager team scope
+        org_employees = await employees_collection.find(get_employee_filter(current_admin), {"_id": 1}).to_list(None)
         org_emp_ids = [str(emp["_id"]) for emp in org_employees]
 
         logs = await attendance_logs_collection.find({"user_id": {"$in": org_emp_ids}}).sort("timestamp", -1).to_list(5000)
-        
-        # Flatten logs for Excel
-        data = []
+
+        headers_list = ["Employee", "Email", "Time", "Type", "Late", "Late Mins", "Address", "WiFi", "Distance (m)", "Duration (h)"]
+        rows_data = []
         for log in logs:
-            data.append({
-                "Employee": log.get("full_name") or log.get("email"),
-                "Email": log.get("email"),
-                "Time": (log.get("timestamp").astimezone(timezone(timedelta(minutes=330))).strftime("%Y-%m-%d %H:%M:%S") + " (IST)") if log.get("timestamp") else "N/A",
-                "Type": log.get("type").title(),
+            ts = log.get("timestamp")
+            time_str = (ts.astimezone(timezone(timedelta(minutes=330))).strftime("%Y-%m-%d %H:%M:%S") + " (IST)") if isinstance(ts, datetime) else (str(ts) if ts else "N/A")
+            rows_data.append({
+                "Employee": log.get("full_name") or log.get("email") or "",
+                "Email": log.get("email") or "",
+                "Time": time_str,
+                "Type": str(log.get("type") or "check-in").title(),
                 "Late": "Yes" if log.get("is_late") else "No",
                 "Late Mins": log.get("late_mins", 0),
-                "Address": log.get("address"),
-                "WiFi": log.get("wifi_ssid"),
-                "Distance (m)": round(log.get("distance_meters", 0), 1),
-                "Duration (h)": log.get("duration_hours", 0)
+                "Address": log.get("address") or "",
+                "WiFi": log.get("wifi_ssid") or "",
+                "Distance (m)": round(float(log.get("distance_meters") or 0), 1),
+                "Duration (h)": log.get("duration_hours", 0),
             })
-        
-        df = pd.DataFrame(data)
-        
-        buffer = io.BytesIO()
-        with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-            df.to_excel(writer, index=False, sheet_name='Attendance Logs')
-        
-        buffer.seek(0)
+
+        def _build_excel():
+            buffer = io.BytesIO()
+            if pd is not None:
+                try:
+                    df = pd.DataFrame(rows_data, columns=headers_list)
+                    with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+                        df.to_excel(writer, index=False, sheet_name='Attendance Logs')
+                    buffer.seek(0)
+                    return buffer
+                except ImportError:
+                    buffer = io.BytesIO()
+
+            # Zero-dependency standards-compliant XLSX fallback so export never fails even without openpyxl
+            from xml.sax.saxutils import escape
+            def _cell_xml(val):
+                if isinstance(val, (int, float)) and not isinstance(val, bool):
+                    return f"<c><v>{val}</v></c>"
+                clean = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", str(val if val is not None else ""))
+                return f'<c t="inlineStr"><is><t xml:space="preserve">{escape(clean)}</t></is></c>'
+
+            matrix = [headers_list] + [[r[col] for col in headers_list] for r in rows_data]
+            sheet_xml = '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>'
+            for r_idx, r_vals in enumerate(matrix, 1):
+                sheet_xml += f'<row r="{r_idx}">' + "".join(_cell_xml(v) for v in r_vals) + "</row>"
+            sheet_xml += "</sheetData></worksheet>"
+            with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr("[Content_Types].xml", '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>')
+                zf.writestr("_rels/.rels", '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>')
+                zf.writestr("xl/workbook.xml", '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Attendance Logs" sheetId="1" r:id="rId1"/></sheets></workbook>')
+                zf.writestr("xl/_rels/workbook.xml.rels", '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>')
+                zf.writestr("xl/worksheets/sheet1.xml", sheet_xml)
+            buffer.seek(0)
+            return buffer
+
+        buffer = await run_in_threadpool(_build_excel)
         return StreamingResponse(
             buffer,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             headers={"Content-Disposition": f"attachment; filename=attendance_logs_{datetime.now(timezone.utc).astimezone(timezone(timedelta(minutes=330))).strftime('%Y%m%d')}.xlsx"}
         )
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Excel export error: {e}")
         raise HTTPException(status_code=500, detail=f"Excel export failed: {str(e)}")
@@ -976,7 +1013,7 @@ async def update_settings(req: SystemSettings, current_admin: Admin = Depends(re
 
 
 @router.post("/admin/upload-logo")
-async def admin_upload_logo(file: bytes = File(...), current_admin: Admin = Depends(require_feature("settings"))):
+async def admin_upload_logo(request: Request, file: bytes = File(...), current_admin: Admin = Depends(require_feature("settings"))):
     """Upload organization logo image."""
     try:
         org_id = current_admin.organization_id
@@ -984,20 +1021,27 @@ async def admin_upload_logo(file: bytes = File(...), current_admin: Admin = Depe
             raise HTTPException(status_code=403, detail="Organization context required")
 
         # Generate unique filename inside public logos folder
-        file_extension = "png" # Default, or we could extract from headers
+        file_extension = "png"
         logos_dir = os.path.join(UPLOAD_DIR, "logos")
         os.makedirs(logos_dir, exist_ok=True)
         filename = f"logo_{org_id}_{uuid.uuid4().hex[:8]}.{file_extension}"
         file_path = os.path.join(logos_dir, filename)
-        
-        with open(file_path, "wb") as buffer:
-            buffer.write(file)
-            
-        # Generate full URL (placed in /uploads/logos/ so PUBLIC_UPLOAD_FOLDERS allows unauthenticated access)
-        base_url = os.getenv("API_BASE_URL", "http://localhost:8001")
-        logo_url = f"{base_url}/uploads/logos/{filename}"
-        
+
+        def _write_logo():
+            with open(file_path, "wb") as buffer:
+                buffer.write(file)
+        await run_in_threadpool(_write_logo)
+
+        # Generate proxy-aware public URL (never hardcoding localhost:8001 in production)
+        configured_base = (os.getenv("PUBLIC_API_URL") or os.getenv("API_BASE_URL") or "").strip().rstrip("/")
+        if configured_base:
+            logo_url = f"{configured_base}/uploads/logos/{filename}"
+        else:
+            logo_url = build_static_upload_url(request, f"/uploads/logos/{filename}")
+
         return {"logo_url": logo_url}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Logo upload failed: {e}")
         raise HTTPException(status_code=500, detail=f"Logo upload failed: {str(e)}")

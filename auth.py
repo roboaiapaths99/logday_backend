@@ -29,9 +29,9 @@ SECRET_KEY = secrets.token_hex(32) if _weak_secret else _raw_secret
 ALGORITHM = "HS256"
 TOKEN_ISSUER = os.getenv("JWT_ISSUER", "logday-api")
 TOKEN_AUDIENCE = "logday-api-v2"
-ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60").split("#")[0].strip())
-if not 1 <= ACCESS_TOKEN_EXPIRE_MINUTES <= 1440:
-    raise RuntimeError("ACCESS_TOKEN_EXPIRE_MINUTES must be between 1 and 1440")
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "1440").split("#")[0].strip())
+if not 1 <= ACCESS_TOKEN_EXPIRE_MINUTES <= 43200:
+    raise RuntimeError("ACCESS_TOKEN_EXPIRE_MINUTES must be between 1 and 43200")
 
 import time
 from collections import defaultdict
@@ -63,6 +63,24 @@ async def get_password_hash_async(password):
 _FAILED_LOGINS: dict[tuple[str, str], list[float]] = defaultdict(list)
 _LOGIN_WINDOW_SECONDS = 300  # 5 minutes
 _MAX_FAILED_ATTEMPTS = 15
+_MAX_TRACKED_LOGIN_KEYS = 10000
+
+def _prune_failed_logins(now_ts: float) -> None:
+    if len(_FAILED_LOGINS) < _MAX_TRACKED_LOGIN_KEYS:
+        return
+    expired_keys = [
+        k for k, ts_list in list(_FAILED_LOGINS.items())
+        if not ts_list or (now_ts - ts_list[-1] >= _LOGIN_WINDOW_SECONDS)
+    ]
+    for k in expired_keys:
+        _FAILED_LOGINS.pop(k, None)
+    if len(_FAILED_LOGINS) >= _MAX_TRACKED_LOGIN_KEYS:
+        # Evict oldest keys so size drops strictly below _MAX_TRACKED_LOGIN_KEYS (target 80% capacity)
+        target_len = max(0, int(_MAX_TRACKED_LOGIN_KEYS * 0.8))
+        evict_count = max(1, len(_FAILED_LOGINS) - target_len)
+        sorted_keys = sorted(_FAILED_LOGINS.keys(), key=lambda k: _FAILED_LOGINS[k][-1] if _FAILED_LOGINS[k] else 0.0)
+        for k in sorted_keys[:evict_count]:
+            _FAILED_LOGINS.pop(k, None)
 
 def _get_client_ip(request: Request) -> str:
     if not request:
@@ -76,6 +94,7 @@ def check_login_rate_limit(request: Request, email: str):
     ip = _get_client_ip(request)
     key = (ip, (email or "").strip().lower())
     now_ts = time.time()
+    _prune_failed_logins(now_ts)
     attempts = [t for t in _FAILED_LOGINS.get(key, []) if now_ts - t < _LOGIN_WINDOW_SECONDS]
     if attempts:
         _FAILED_LOGINS[key] = attempts
@@ -92,6 +111,7 @@ def record_failed_login(request: Request, email: str):
     ip = _get_client_ip(request)
     key = (ip, (email or "").strip().lower())
     now_ts = time.time()
+    _prune_failed_logins(now_ts)
     attempts = [t for t in _FAILED_LOGINS.get(key, []) if now_ts - t < _LOGIN_WINDOW_SECONDS]
     attempts.append(now_ts)
     _FAILED_LOGINS[key] = attempts
