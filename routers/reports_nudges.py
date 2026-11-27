@@ -49,7 +49,6 @@ except ImportError:
     boto3 = None
     NoCredentialsError = Exception
 
-from jose import jwt
 from database import (
     employees_collection, attendance_logs_collection, settings_collection, admins_collection, 
     organizations_collection, visit_plans_collection, visit_logs_collection, 
@@ -115,6 +114,21 @@ from services.scheduler_jobs import check_missed_visits, purge_old_screenshots
 
 router = APIRouter(route_class=SecureMediaRoute)
 
+@router.get("/admin/reports/automation-data")
+async def export_automation_data(
+    month: str,
+    format: str = Query("xlsx", pattern="^(xlsx|pdf)$"),
+    admin=Depends(require_feature("attendance")),
+):
+    from services.automation_report import build_report, render_xlsx, render_pdf
+    report = await build_report(admin, month)
+    content = await run_in_threadpool(render_pdf if format == "pdf" else render_xlsx, report)
+    media_type = "application/pdf" if format == "pdf" else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    return Response(content, media_type=media_type, headers={
+        "Content-Disposition": f'attachment; filename="LogDay_Automation_{month}.{format}"',
+        "Cache-Control": "private, no-store",
+    })
+
 @router.get("/admin/reports/attendance")
 async def attendance_report(
     start_date: Optional[str] = None,
@@ -136,7 +150,7 @@ async def attendance_report(
         else:
             query["timestamp"] = {"$lte": datetime.fromisoformat(end_date)}
     
-    logs = await attendance_logs_collection.find(query).sort("timestamp", -1).to_list(length=1000)
+    logs = await attendance_logs_collection.find(query).sort("timestamp", -1).to_list(length=None)
     
     from bson import ObjectId
     emp_ids = list({ObjectId(log["user_id"]) for log in logs if log.get("user_id") and ObjectId.is_valid(str(log["user_id"]))})
@@ -182,7 +196,7 @@ async def expense_report(admin=Depends(require_feature("reports"))):
         ]
     }
     
-    claims = await expense_claims_collection.find(query).to_list(length=1000)
+    claims = await expense_claims_collection.find(query).to_list(length=None)
     
     total_amount = sum(c.get("amount", 0) for c in claims)
     approved_amount = sum(c.get("amount", 0) for c in claims if c.get("status") == "approved")
@@ -316,7 +330,7 @@ async def leave_report(
         query["start_date"] = {"$gte": start_date, "$lte": end_date}
     
     cursor = leave_requests_collection.find(query)
-    leaves = await cursor.to_list(length=1000)
+    leaves = await cursor.to_list(length=None)
     
     # 1. Distribution by Type
     type_counts = {}
@@ -567,7 +581,7 @@ async def admin_send_nudge(req: dict, admin=Depends(require_feature("nudge"))):
         query = {"is_active": {"$ne": False}}
         if org_id:
             query["organization_id"] = org_id
-        all_emps = await employees_collection.find(query).to_list(length=1000)
+        all_emps = await employees_collection.find(query).to_list(length=None)
         valid_recipients = [e["email"] for e in all_emps if e.get("email")]
     else:
         valid_recipients = []
@@ -695,7 +709,7 @@ async def get_employee_nudges(emp=Depends(get_current_employee)):
         ]
     }
     
-    logs = await nudge_logs_collection.find(query).sort("sent_at", -1).to_list(length=100)
+    logs = await nudge_logs_collection.find(query).sort("sent_at", -1).to_list(length=None)
     result = []
     for log in logs:
         log_id = str(log["_id"])
@@ -829,18 +843,22 @@ async def get_employee_monthly_summary(
         raise HTTPException(status_code=400, detail="Invalid month format. Expected YYYY-MM")
 
     # Security: Ensure admin only sees their org's data
-    org_filter = {"organization_id": admin.organization_id} if admin.organization_id else {}
+    org_filter = get_employee_filter(admin)
     
     # 1. Fetch Employee Details
     employee = await employees_collection.find_one({"email": email, **org_filter})
     if not employee:
         raise HTTPException(status_code=404, detail="Employee not found")
 
+    org_doc = await get_effective_org_settings(employee.get("organization_id"))
+    offset = timedelta(minutes=int(org_doc.get("timezone_offset", 330)))
+
     # 2. Fetch All Logs for the month
     logs = await attendance_logs_collection.find({
         "email": email,
-        "timestamp": {"$gte": start_date, "$lt": end_date}
-    }).sort("timestamp", 1).to_list(length=1000)
+        "organization_id": employee["organization_id"],
+        "timestamp": {"$gte": start_date - offset, "$lt": end_date - offset}
+    }).sort("timestamp", 1).to_list(length=None)
 
     # 3. Fetch Approved Leaves for the month (flexible identifier matching)
     clean_email = email.strip().lower()
@@ -851,12 +869,13 @@ async def get_employee_monthly_summary(
         emp_identifiers.append(str(employee["employee_id"]).strip())
 
     raw_leaves = await leave_requests_collection.find({
+        "organization_id": employee["organization_id"],
         "$or": [
             {"employee_id": {"$in": emp_identifiers}},
             {"email": {"$in": emp_identifiers}}
         ],
         "status": {"$regex": "^approved$", "$options": "i"}
-    }).to_list(length=100)
+    }).to_list(length=None)
 
     leaves = []
     for rl in raw_leaves:
@@ -868,12 +887,13 @@ async def get_employee_monthly_summary(
             leaves.append(rl)
 
     raw_pending = await leave_requests_collection.find({
+        "organization_id": employee["organization_id"],
         "$or": [
             {"employee_id": {"$in": emp_identifiers}},
             {"email": {"$in": emp_identifiers}}
         ],
         "status": {"$regex": "^pending$", "$options": "i"}
-    }).to_list(length=100)
+    }).to_list(length=None)
 
     pending_leaves = []
     for rp in raw_pending:
@@ -905,12 +925,13 @@ async def get_employee_monthly_summary(
         office_start_time_str = org_doc.get("office_start_time", "10:00")
         late_threshold_mins = org_doc.get("late_grace_mins") if org_doc.get("late_grace_mins") is not None else org_doc.get("late_threshold_mins", 15)
 
-    # Fetch configured days off / holidays for this organization and month
+    # Fetch configured days off / holidays for this organization and month via shared work_calendar
+    from services.work_calendar import month_days_off
     days_off_set = set()
     holiday_names = {}
     if org_id:
         try:
-            # 1. Fetch days_off doc (has composite days_off array)
+            days_off_set = set(await month_days_off(str(org_id), month))
             h_doc = await holidays_collection.find_one({
                 "$or": [
                     {"organization_id": str(org_id), "payroll_month": month, "days_off": {"$exists": True}},
@@ -918,16 +939,14 @@ async def get_employee_monthly_summary(
                 ]
             })
             if h_doc:
-                days_off_set.update(h_doc.get("days_off", []))
                 holiday_names.update(h_doc.get("holiday_names", {}))
 
-            # 2. Fetch all named holidays for this month (e.g. Janmashtami, festival, company)
             named_holidays = await holidays_collection.find({
                 "$or": [
                     {"organization_id": str(org_id), "payroll_month": month, "date": {"$exists": True}},
                     {"organization_id": "system_org", "payroll_month": month, "date": {"$exists": True}}
                 ]
-            }).to_list(length=100)
+            }).to_list(length=None)
             for nh in named_holidays:
                 d_num = None
                 if "day" in nh and nh["day"] is not None:
@@ -940,24 +959,14 @@ async def get_employee_monthly_summary(
                 if d_num is not None:
                     days_off_set.add(d_num)
                     holiday_names[str(d_num)] = nh.get("name") or "Holiday"
-
-            # 3. Always include all Sundays in this month as weekends
-            try:
-                y_m = month.split("-")
-                month_days_cnt = calendar.monthrange(int(y_m[0]), int(y_m[1]))[1]
-                for di in range(1, month_days_cnt + 1):
-                    if datetime(int(y_m[0]), int(y_m[1]), di).weekday() == 6:
-                        days_off_set.add(di)
-            except Exception:
-                pass
         except Exception as e:
             logger.warning(f"Failed to fetch holidays in monthly summary: {e}")
 
     start_h, start_m = map(int, office_start_time_str.split(":"))
     end_h, end_m = map(int, office_end_time_str.split(":"))
 
-    local_start_of_month = start_date + timedelta(minutes=tz_offset)
-    local_month_end = end_date + timedelta(minutes=tz_offset)
+    local_start_of_month = start_date
+    local_month_end = end_date
     local_now = datetime.now(timezone.utc) + timedelta(minutes=tz_offset)
     
     # Use the earlier of (End of Month) or (Today) for the loop boundary
@@ -1044,7 +1053,7 @@ async def get_employee_monthly_summary(
                 day_info["status"] = holiday_names.get(str(day_num), "Weekend")
             else:
                 day_info["status"] = holiday_names.get(str(day_num), "Holiday")
-        elif current_day_local.weekday() >= 5:
+        elif current_day_local.weekday() == 6:
             is_weekend_or_holiday = True
             day_info["status"] = "Weekend"
 

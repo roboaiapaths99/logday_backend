@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 from typing import Optional
-from jose import JWTError, jwt
+import jwt
+from jwt.exceptions import PyJWTError as JWTError
 import os
 from dotenv import load_dotenv
 
@@ -148,9 +149,14 @@ async def issue_access_token(account: dict, account_type: str):
 
 def decode_access_token(token: str):
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM], audience=TOKEN_AUDIENCE,
-                             issuer=TOKEN_ISSUER, options={"require_exp": True, "require_iat": True,
-                                                         "require_sub": True, "require_aud": True, "require_iss": True})
+        payload = jwt.decode(
+            token,
+            SECRET_KEY,
+            algorithms=[ALGORITHM],
+            audience=TOKEN_AUDIENCE,
+            issuer=TOKEN_ISSUER,
+            options={"require": ["exp", "iat", "sub", "aud", "iss"]},
+        )
         if payload.get("account_type") not in {"employee", "admin"} or not ObjectId.is_valid(payload.get("sub", "")):
             raise _unauthorized()
         if not isinstance(payload.get("sid"), str) or not payload["sid"] or not isinstance(payload.get("ver"), int):

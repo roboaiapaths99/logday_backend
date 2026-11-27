@@ -49,7 +49,6 @@ except ImportError:
     boto3 = None
     NoCredentialsError = Exception
 
-from jose import jwt
 from database import (
     employees_collection, attendance_logs_collection, settings_collection, admins_collection, 
     organizations_collection, visit_plans_collection, visit_logs_collection, 
@@ -353,26 +352,17 @@ async def admin_wfh_live_view(request: Request, current_admin: Admin = Depends(r
 
         employee_ids = [str(emp["_id"]) for emp in employees]
 
-        # Fetch latest screenshot and activity per employee using fast indexed find_one
-        screenshots_by_emp = {}
-        activities_by_emp = {}
-        
-        async def fetch_emp_latest(emp_id):
-            shot_task = wfh_screenshots_collection.find_one(
-                {"employee_id": emp_id},
-                sort=[("timestamp", -1)]
-            )
-            act_task = wfh_activity_collection.find_one(
-                {"employee_id": emp_id},
-                sort=[("timestamp", -1)]
-            )
-            shot, act = await asyncio.gather(shot_task, act_task)
-            if shot:
-                screenshots_by_emp[emp_id] = shot
-            if act:
-                activities_by_emp[emp_id] = act
-
-        await asyncio.gather(*(fetch_emp_latest(emp_id) for emp_id in employee_ids))
+        pipeline = [
+            {"$match": {"employee_id": {"$in": employee_ids}}},
+            {"$sort": {"timestamp": -1}},
+            {"$group": {"_id": "$employee_id", "latest": {"$first": "$$ROOT"}}},
+        ]
+        shots, activity = await asyncio.gather(
+            wfh_screenshots_collection.aggregate(pipeline).to_list(length=None),
+            wfh_activity_collection.aggregate(pipeline).to_list(length=None),
+        )
+        screenshots_by_emp = {item["_id"]: item["latest"] for item in shots}
+        activities_by_emp = {item["_id"]: item["latest"] for item in activity}
 
         # Build lookup dicts keyed by employee_id
         sessions_by_emp = {s["employee_id"]: s for s in (active_sessions_list or [])}
@@ -422,12 +412,14 @@ async def admin_trigger_screenshot(email: str, current_admin: Admin = Depends(re
     clean_email = email.strip().lower()
     
     # Check if employee exists
-    user = await employees_collection.find_one({"email": clean_email})
+    user = await employees_collection.find_one({"email": clean_email, **get_employee_filter(current_admin)})
     if not user:
         raise HTTPException(status_code=404, detail="Employee not found")
         
     doc = {
+        "employee_id": str(user["_id"]),
         "employee_email": clean_email,
+        "organization_id": user.get("organization_id"),
         "command": "trigger_screenshot",
         "status": "pending",
         "timestamp": datetime.now(timezone.utc)
@@ -442,14 +434,17 @@ async def admin_force_end_session(email: str, req: dict, current_admin: Admin = 
     clean_email = email.strip().lower()
     reason = req.get("reason", "Force-ended by administrator").strip()
     
-    user = await employees_collection.find_one({"email": clean_email})
+    user = await employees_collection.find_one({"email": clean_email, **get_employee_filter(current_admin)})
     if not user:
         raise HTTPException(status_code=404, detail="Employee not found")
         
-    active_session = await wfh_sessions_collection.find_one({
+    session_query = {
         "employee_email": clean_email,
         "status": "active"
-    })
+    }
+    if user.get("organization_id"):
+        session_query["organization_id"] = user["organization_id"]
+    active_session = await wfh_sessions_collection.find_one(session_query)
     
     if not active_session:
         raise HTTPException(status_code=400, detail="No active WFH session found for this employee.")
@@ -556,7 +551,7 @@ async def admin_force_end_session(email: str, req: dict, current_admin: Admin = 
 async def admin_force_logout(email: str, current_admin: Admin = Depends(require_feature("wfh_monitoring"))):
     clean_email = email.strip().lower()
     
-    user = await employees_collection.find_one({"email": clean_email})
+    user = await employees_collection.find_one({"email": clean_email, **get_employee_filter(current_admin)})
     if not user:
         raise HTTPException(status_code=404, detail="Employee not found")
         
@@ -564,7 +559,9 @@ async def admin_force_logout(email: str, current_admin: Admin = Depends(require_
     
     # Enqueue force_logout command to agent
     cmd_doc = {
+        "employee_id": str(user["_id"]),
         "employee_email": clean_email,
+        "organization_id": user.get("organization_id"),
         "command": "force_logout",
         "status": "pending",
         "timestamp": now,
@@ -573,10 +570,13 @@ async def admin_force_logout(email: str, current_admin: Admin = Depends(require_
     await wfh_commands_collection.insert_one(cmd_doc)
     
     # Also force-end active WFH session if exists
-    active_session = await wfh_sessions_collection.find_one({
+    session_query = {
         "employee_email": clean_email,
         "status": "active"
-    })
+    }
+    if user.get("organization_id"):
+        session_query["organization_id"] = user["organization_id"]
+    active_session = await wfh_sessions_collection.find_one(session_query)
     
     session_id_str = None
     if active_session:
@@ -697,6 +697,9 @@ async def admin_wfh_employee_screenshots(
     current_admin: Admin = Depends(require_feature("wfh_monitoring"))
 ):
     clean_email = email.strip().lower()
+    user = await employees_collection.find_one({"email": clean_email, **get_employee_filter(current_admin)})
+    if not user:
+        raise HTTPException(status_code=404, detail="Employee not found")
 
     query = {"employee_email": clean_email}
 
@@ -733,6 +736,9 @@ async def admin_wfh_employee_screenshots_download(
     from starlette.responses import StreamingResponse
 
     clean_email = email.strip().lower()
+    user = await employees_collection.find_one({"email": clean_email, **get_employee_filter(current_admin)})
+    if not user:
+        raise HTTPException(status_code=404, detail="Employee not found")
 
     query = {"employee_email": clean_email}
 
@@ -840,6 +846,9 @@ async def admin_wfh_employee_activity(
     current_admin: Admin = Depends(require_feature("wfh_monitoring"))
 ):
     clean_email = email.strip().lower()
+    user = await employees_collection.find_one({"email": clean_email, **get_employee_filter(current_admin)})
+    if not user:
+        raise HTTPException(status_code=404, detail="Employee not found")
 
     query = {"employee_email": clean_email}
 
@@ -868,6 +877,9 @@ async def admin_wfh_employee_apps(
     current_admin: Admin = Depends(require_feature("wfh_monitoring"))
 ):
     clean_email = email.strip().lower()
+    user = await employees_collection.find_one({"email": clean_email, **get_employee_filter(current_admin)})
+    if not user:
+        raise HTTPException(status_code=404, detail="Employee not found")
 
     query = {"employee_email": clean_email}
 
@@ -894,6 +906,9 @@ async def admin_wfh_employee_productivity(
     current_admin: Admin = Depends(require_feature("wfh_monitoring"))
 ):
     clean_email = email.strip().lower()
+    user = await employees_collection.find_one({"email": clean_email, **get_employee_filter(current_admin)})
+    if not user:
+        raise HTTPException(status_code=404, detail="Employee not found")
 
     query = {"employee_email": clean_email}
 
@@ -919,6 +934,9 @@ async def admin_wfh_employee_timeline(
     current_admin: Admin = Depends(require_feature("wfh_monitoring"))
 ):
     clean_email = email.strip().lower()
+    user = await employees_collection.find_one({"email": clean_email, **get_employee_filter(current_admin)})
+    if not user:
+        raise HTTPException(status_code=404, detail="Employee not found")
 
     base_query = {"employee_email": clean_email}
 
@@ -1066,6 +1084,9 @@ async def admin_review_wfh_alert(
 @router.get("/admin/wfh/employee/{email}/tasks")
 async def admin_get_employee_tasks(email: str, current_admin: Admin = Depends(require_feature("wfh_monitoring"))):
     clean_email = email.strip().lower()
+    user = await employees_collection.find_one({"email": clean_email, **get_employee_filter(current_admin)})
+    if not user:
+        raise HTTPException(status_code=404, detail="Employee not found")
     query = {"employee_email": clean_email}
     
     if current_admin.organization_id and current_admin.organization_id != "system_org":
@@ -1085,11 +1106,7 @@ async def admin_assign_employee_task(email: str, req: dict, current_admin: Admin
     if not title:
         raise HTTPException(status_code=400, detail="Task title is required")
         
-    emp_query = {"email": clean_email}
-    if current_admin.organization_id and current_admin.organization_id != "system_org":
-        emp_query["organization_id"] = current_admin.organization_id
-        
-    emp = await employees_collection.find_one(emp_query)
+    emp = await employees_collection.find_one({"email": clean_email, **get_employee_filter(current_admin)})
     if not emp:
         raise HTTPException(status_code=404, detail="Employee not found or access denied")
         

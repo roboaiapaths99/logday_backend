@@ -237,41 +237,8 @@ async def fetch_attendance_data(employee_email: str, org_id: str, payroll_month:
         "payroll_month": payroll_month,
         "days_off": {"$exists": True}
     })
-    if not days_off_doc:
-        days_off_doc = await holidays_collection.find_one({
-            "organization_id": "system_org",
-            "payroll_month": payroll_month,
-            "days_off": {"$exists": True}
-        })
-    
-    if days_off_doc:
-        days_off = set(days_off_doc.get("days_off", []))
-    else:
-        days_off = set()
-
-    # Also load any named holidays directly from holidays_collection
-    try:
-        named_h = await holidays_collection.find({
-            "$or": [
-                {"organization_id": org_id, "payroll_month": payroll_month, "date": {"$exists": True}},
-                {"organization_id": "system_org", "payroll_month": payroll_month, "date": {"$exists": True}}
-            ]
-        }).to_list(length=100)
-        for nh in named_h:
-            if "day" in nh and nh["day"] is not None:
-                days_off.add(int(nh["day"]))
-            elif "date" in nh and nh["date"]:
-                try:
-                    days_off.add(int(str(nh["date"]).split("-")[2]))
-                except Exception:
-                    pass
-    except Exception:
-        pass
-
-    for day in range(1, num_days + 1):
-        dt = datetime(year, month, day)
-        if dt.weekday() == 6:  # Sunday
-            days_off.add(day)
+    from services.work_calendar import month_days_off
+    days_off = await month_days_off(org_id, payroll_month)
 
     # Fetch Leave Policy & System Settings first so we know timezone_offset
     policy = await leave_policies_collection.find_one({
@@ -315,13 +282,14 @@ async def fetch_attendance_data(employee_email: str, org_id: str, payroll_month:
         emp_identifiers.append(str(emp["employee_id"]).strip())
 
     cursor_leaves = leave_requests_collection.find({
+        "organization_id": org_id,
         "$or": [
             {"employee_id": {"$in": emp_identifiers}},
             {"email": {"$in": emp_identifiers}}
         ],
         "status": {"$regex": "^approved$", "$options": "i"}
     })
-    leaves = await cursor_leaves.to_list(length=200)
+    leaves = await cursor_leaves.to_list(length=None)
 
     paid_leave_days = 0.0
     unpaid_leave_days = 0.0

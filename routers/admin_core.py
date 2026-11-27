@@ -50,7 +50,6 @@ except ImportError:
     boto3 = None
     NoCredentialsError = Exception
 
-from jose import jwt
 from database import (
     employees_collection, attendance_logs_collection, settings_collection, admins_collection, 
     organizations_collection, visit_plans_collection, visit_logs_collection, 
@@ -619,7 +618,7 @@ async def admin_list_employees(current_admin: Admin = Depends(require_feature("e
 @router.put("/admin/employees/{email}")
 async def admin_update_employee(email: str, req: EmployeeUpdate, current_admin: Admin = Depends(require_feature("employees"))):
     """Update employee details."""
-    update_data = {k: v for k, v in req.dict().items() if v is not None}
+    update_data = {k: v for k, v in req.model_dump().items() if v is not None}
     if not update_data:
         raise HTTPException(status_code=400, detail="No update data provided")
     
@@ -778,7 +777,8 @@ async def admin_create_employee(req: RegisterRequest, current_admin: Admin = Dep
     # Embedding is optional for manual registration if they will enroll later
     embedding = None
     if req.face_image:
-        embedding = get_face_embedding(req.face_image)
+        from services.inference import run_inference
+        embedding = await run_inference(get_face_embedding, req.face_image)
 
     hashed_password = await get_password_hash_async(req.password)
     employee_dict = {
@@ -832,7 +832,7 @@ async def admin_reset_password(email: str, req: dict, current_admin: Admin = Dep
     
     hashed_password = await get_password_hash_async(new_password)
     result = await employees_collection.update_one(
-        {"email": clean_email},
+        {"_id": user["_id"]},
         {"$set": {
             "hashed_password": hashed_password,
             "force_password_change": True  # Force them to change on next login
@@ -840,6 +840,11 @@ async def admin_reset_password(email: str, req: dict, current_admin: Admin = Dep
     )
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Employee not found")
+    from database import auth_sessions_collection
+    await auth_sessions_collection.update_many(
+        {"account_id": str(user["_id"]), "account_type": "employee"},
+        {"$set": {"revoked": True}}
+    )
     
     logger.info(f"Password reset successful for '{clean_email}'")
     return {"message": "Password reset successfully"}
@@ -907,13 +912,13 @@ async def get_settings(current_admin: Admin = Depends(require_feature("settings"
         default_settings = SystemSettings()
         
         if not settings:
-            return default_settings.dict()
+            return default_settings.model_dump()
         
         # Merge stored data into the model to handle defaults and types safely
         stored_data = {k: v for k, v in settings.items() if k not in ["_id", "organization_id", "id"]}
         
         # Combine default values with stored values, ignoring None or invalid types in stored_data
-        settings_dict = default_settings.dict()
+        settings_dict = default_settings.model_dump()
         for k, v in stored_data.items():
             if k in settings_dict and v is not None:
                 settings_dict[k] = v
@@ -921,7 +926,7 @@ async def get_settings(current_admin: Admin = Depends(require_feature("settings"
         return settings_dict
     except Exception as e:
         logger.error(f"Error fetching settings: {e}")
-        return SystemSettings().dict()
+        return SystemSettings().model_dump()
 
 
 @router.put("/admin/settings")
@@ -932,7 +937,7 @@ async def update_settings(req: SystemSettings, current_admin: Admin = Depends(re
         raise HTTPException(status_code=403, detail="Organization linkage required for settings update.")
 
     try:
-        update_dict = req.dict()
+        update_dict = req.model_dump()
         update_dict["organization_id"] = org_id
         update_dict["updated_at"] = datetime.now(timezone.utc)
 

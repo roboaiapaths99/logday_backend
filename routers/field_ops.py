@@ -50,7 +50,6 @@ except ImportError:
     boto3 = None
     NoCredentialsError = Exception
 
-from jose import jwt
 from database import (
     employees_collection, attendance_logs_collection, settings_collection, admins_collection, 
     organizations_collection, visit_plans_collection, visit_logs_collection, 
@@ -121,7 +120,7 @@ async def submit_visit_plan(plan: VisitPlan, employee=Depends(get_current_employ
     """Submit a daily visit plan for approval."""
     try:
         # Security Enforcement: Identity Hijack Prevention
-        plan_dict = plan.dict()
+        plan_dict = plan.model_dump()
         plan_dict["employee_id"] = employee["email"]
         plan_dict["organization_id"] = employee["organization_id"]
         
@@ -351,7 +350,8 @@ async def visit_check_in(req: dict, employee=Depends(get_current_employee)):
                 user = await employees_collection.find_one({"email": employee["email"]})
                 if user and user.get("face_embedding"):
                     from face_utils import verify_face as _v_face
-                    match, distance = _v_face(req["selfie_base64"], user["face_embedding"])
+                    from services.inference import run_inference
+                    match, distance = await run_inference(_v_face, req["selfie_base64"], user["face_embedding"])
                     face_verified = match
                     if not match:
                         await trigger_alert(
@@ -423,7 +423,8 @@ async def visit_check_out(req: dict, background_tasks: BackgroundTasks, employee
                 target_descriptor = employee.get("face_embedding")
                 if target_descriptor:
                     # Verify provided selfie
-                    is_match, score = verify_face(req["selfie_base64"], target_descriptor)
+                    from services.inference import run_inference
+                    is_match, score = await run_inference(verify_face, req["selfie_base64"], target_descriptor)
                     face_verified = is_match
                     if not is_match:
                         # Alert admin but don't block check-out (could be lighting etc)
@@ -508,7 +509,7 @@ async def receive_location_ping(ping: LocationPing, employee=Depends(get_current
         if not last_log or last_log.get("type") != "check-in":
             return {"status": "ignored", "reason": "privacy_filter_active_duty_only"}
 
-        ping_dict = ping.dict()
+        ping_dict = ping.model_dump()
         ping_dict["employee_id"] = employee["email"]
         ping_dict["organization_id"] = employee["organization_id"]
         ping_dict["recorded_at"] = now
@@ -562,131 +563,164 @@ async def receive_location_ping(ping: LocationPing, employee=Depends(get_current
 
 @router.post("/api/field/sync/batch")
 async def sync_offline_batch(req: SyncBatchRequest, background_tasks: BackgroundTasks, employee=Depends(get_current_employee)):
-    """Synchronize offline data back to the server in a single batch to save bandwidth and handle reconnects."""
+    """Synchronize offline data back to the server with per-item acknowledgements, account ownership verification, and atomic idempotency."""
     try:
+        from upload_security import save_local_image
         now = datetime.now(timezone.utc)
         synced_count = {"attendance": 0, "visits": 0, "pings": 0}
+        acknowledged_ids = {"attendance": [], "visits": [], "pings": []}
+        emp_email = (employee.get("email") or "").strip().lower()
+        emp_org = employee["organization_id"]
 
         # 1. Sync Attendance Logs
-        org_settings = await get_effective_org_settings(employee.get("organization_id"))
+        org_settings = await get_effective_org_settings(emp_org)
         tz_offset = int(org_settings.get("timezone_offset", 330))
 
         for att in req.attendance_logs:
-            offline_id = att.get("offline_id")
+            offline_id = str(att.get("offline_id") or "").strip()
             if not offline_id:
                 continue
-            exists = await attendance_logs_collection.find_one({"offline_id": offline_id})
-            if not exists:
-                att["synced_at"] = now
-                att["user_id"] = str(employee["_id"]) 
-                att["email"] = employee.get("email")
-                att["full_name"] = employee.get("full_name")
-                att["organization_id"] = employee["organization_id"]
-                # Convert string timestamp to datetime if needed
-                if "timestamp" in att and isinstance(att["timestamp"], str):
-                    try:
-                        att["timestamp"] = datetime.fromisoformat(att["timestamp"].replace("Z", "+00:00"))
-                    except:
-                        pass
+            item_owner = str(att.get("offline_owner") or att.get("email") or "").strip().lower()
+            if item_owner and item_owner not in (emp_email, "anonymous"):
+                logger.warning(f"Skipping offline attendance item {offline_id}: owner '{item_owner}' != current user '{emp_email}'")
+                continue
 
-                # Classify offline attendance log
+            att_doc = dict(att)
+            att_doc["offline_id"] = offline_id
+            att_doc["synced_at"] = now
+            att_doc["user_id"] = str(employee["_id"])
+            att_doc["email"] = emp_email
+            att_doc["full_name"] = employee.get("full_name")
+            att_doc["organization_id"] = emp_org
+            if "timestamp" in att_doc and isinstance(att_doc["timestamp"], str):
                 try:
-                    l_ts = att.get("timestamp") or now
-                    if l_ts.tzinfo is None: l_ts = l_ts.replace(tzinfo=timezone.utc)
-                    local_ts = l_ts + timedelta(minutes=tz_offset)
-                    att_type = att.get("type", "check-in")
+                    att_doc["timestamp"] = datetime.fromisoformat(att_doc["timestamp"].replace("Z", "+00:00"))
+                except Exception:
+                    pass
 
-                    classification = classify_attendance_day(
-                        first_checkin_local=local_ts,
-                        last_checkout_local=None if att_type in ["check-in", "IN"] else local_ts,
-                        worked_hours=0.0,
-                        settings=org_settings or {},
-                        employee_type=employee.get("employee_type", "field"),
-                        approved_leave=None
-                    )
-                    att["attendance_status"] = classification["status"]
-                    att["is_short_leave"] = classification["is_short_leave"]
-                    att["is_half_day"] = classification["is_half_day"]
-                    att["short_leave_type"] = classification["short_leave_type"]
-                    att["half_day_type"] = classification["half_day_type"]
-                    att["late_mins"] = classification["late_mins"]
-                    att["early_exit_mins"] = classification["early_exit_mins"]
-                    att["late_off_hours"] = classification["late_off_hours"]
-                    att["early_off_hours"] = classification["early_off_hours"]
-                    att["off_hours"] = classification["off_hours"]
-                    att["classification_reason"] = classification["classification_reason"]
-                except Exception as ex:
-                    logger.warning(f"Offline sync classification error: {ex}")
+            try:
+                l_ts = att_doc.get("timestamp") or now
+                if l_ts.tzinfo is None:
+                    l_ts = l_ts.replace(tzinfo=timezone.utc)
+                local_ts = l_ts + timedelta(minutes=tz_offset)
+                att_type = att_doc.get("type", "check-in")
 
-                await attendance_logs_collection.insert_one(att)
+                classification = classify_attendance_day(
+                    first_checkin_local=local_ts,
+                    last_checkout_local=None if att_type in ["check-in", "IN"] else local_ts,
+                    worked_hours=0.0,
+                    settings=org_settings or {},
+                    employee_type=employee.get("employee_type", "field"),
+                    approved_leave=None
+                )
+                att_doc["attendance_status"] = classification["status"]
+                att_doc["is_short_leave"] = classification["is_short_leave"]
+                att_doc["is_half_day"] = classification["is_half_day"]
+                att_doc["short_leave_type"] = classification["short_leave_type"]
+                att_doc["half_day_type"] = classification["half_day_type"]
+                att_doc["late_mins"] = classification["late_mins"]
+                att_doc["early_exit_mins"] = classification["early_exit_mins"]
+                att_doc["late_off_hours"] = classification["late_off_hours"]
+                att_doc["early_off_hours"] = classification["early_off_hours"]
+                att_doc["off_hours"] = classification["off_hours"]
+                att_doc["classification_reason"] = classification["classification_reason"]
+            except Exception as ex:
+                logger.warning(f"Offline sync classification error: {ex}")
+
+            res = await attendance_logs_collection.update_one(
+                {"organization_id": emp_org, "offline_id": offline_id},
+                {"$setOnInsert": att_doc},
+                upsert=True,
+            )
+            if getattr(res, "upserted_id", None) is not None:
                 synced_count["attendance"] += 1
+            acknowledged_ids["attendance"].append(offline_id)
 
         # 2. Sync Visits
         for visit in req.visits:
-            offline_id = visit.get("offline_id")
+            offline_id = str(visit.get("offline_id") or "").strip()
             if not offline_id:
                 continue
-            exists = await visit_logs_collection.find_one({"offline_id": offline_id})
-            if not exists:
-                visit["synced_at"] = now
-                visit["employee_id"] = employee["email"]
-                visit["organization_id"] = employee["organization_id"]
-                
-                # Convert timestamps
-                for date_field in ["check_in_time", "check_out_time"]:
-                    if date_field in visit and isinstance(visit[date_field], str):
-                        try:
-                            visit[date_field] = datetime.fromisoformat(visit[date_field].replace("Z", "+00:00"))
-                        except:
-                            pass
-                
-                # Check for base64 media to save
-                if visit.get("site_photo_base64"):
-                    visit["site_photo_url"] = await save_local_image(visit["site_photo_base64"], employee, "field_media", "site_photos")
-                    visit.pop("site_photo_base64", None)
+            item_owner = str(visit.get("offline_owner") or visit.get("employee_id") or "").strip().lower()
+            if item_owner and item_owner not in (emp_email, "anonymous"):
+                logger.warning(f"Skipping offline visit item {offline_id}: owner '{item_owner}' != current user '{emp_email}'")
+                continue
 
-                if visit.get("check_in_lat") is not None and visit.get("check_in_lng") is not None:
+            visit_doc = dict(visit)
+            visit_doc["offline_id"] = offline_id
+            visit_doc["synced_at"] = now
+            visit_doc["employee_id"] = emp_email
+            visit_doc["organization_id"] = emp_org
+
+            for date_field in ["check_in_time", "check_out_time"]:
+                if date_field in visit_doc and isinstance(visit_doc[date_field], str):
                     try:
-                        visit["check_in_location"] = {
-                            "type": "Point",
-                            "coordinates": [float(visit["check_in_lng"]), float(visit["check_in_lat"])]
-                        }
-                    except (ValueError, TypeError):
+                        visit_doc[date_field] = datetime.fromisoformat(visit_doc[date_field].replace("Z", "+00:00"))
+                    except Exception:
                         pass
 
-                await visit_logs_collection.insert_one(visit)
-                
-                # Trigger Sheets sync
-                background_tasks.add_task(sync_visit_to_google_sheets, visit)
+            if visit_doc.get("site_photo_base64"):
+                visit_doc["site_photo_url"] = await save_local_image(visit_doc["site_photo_base64"], employee, "field_media", "site_photos")
+                visit_doc.pop("site_photo_base64", None)
+
+            if visit_doc.get("check_in_lat") is not None and visit_doc.get("check_in_lng") is not None:
+                try:
+                    visit_doc["check_in_location"] = {
+                        "type": "Point",
+                        "coordinates": [float(visit_doc["check_in_lng"]), float(visit_doc["check_in_lat"])]
+                    }
+                except (ValueError, TypeError):
+                    pass
+
+            res = await visit_logs_collection.update_one(
+                {"organization_id": emp_org, "offline_id": offline_id},
+                {"$setOnInsert": visit_doc},
+                upsert=True,
+            )
+            if getattr(res, "upserted_id", None) is not None:
+                background_tasks.add_task(sync_visit_to_google_sheets, visit_doc)
                 synced_count["visits"] += 1
+            acknowledged_ids["visits"].append(offline_id)
 
         # 3. Sync Pings
         for ping in req.pings:
-            offline_id = ping.get("offline_id")
+            offline_id = str(ping.get("offline_id") or "").strip()
             if not offline_id:
                 continue
-            exists = await location_pings_collection.find_one({"offline_id": offline_id})
-            if not exists:
-                ping["synced_at"] = now
-                ping["employee_id"] = employee["email"]
-                ping["organization_id"] = employee["organization_id"]
-                if "recorded_at" in ping and isinstance(ping["recorded_at"], str):
-                    try:
-                        ping["recorded_at"] = datetime.fromisoformat(ping["recorded_at"].replace("Z", "+00:00"))
-                    except:
-                        pass
-                if ping.get("lat") is not None and ping.get("lng") is not None:
-                    try:
-                        ping["location"] = {
-                            "type": "Point",
-                            "coordinates": [float(ping["lng"]), float(ping["lat"])]
-                        }
-                    except (ValueError, TypeError):
-                        pass
-                await location_pings_collection.insert_one(ping)
-                synced_count["pings"] += 1
+            item_owner = str(ping.get("offline_owner") or ping.get("employee_id") or "").strip().lower()
+            if item_owner and item_owner not in (emp_email, "anonymous"):
+                logger.warning(f"Skipping offline ping item {offline_id}: owner '{item_owner}' != current user '{emp_email}'")
+                continue
 
-        return {"status": "success", "synced": synced_count}
+            ping_doc = dict(ping)
+            ping_doc["offline_id"] = offline_id
+            ping_doc["synced_at"] = now
+            ping_doc["employee_id"] = emp_email
+            ping_doc["organization_id"] = emp_org
+            if "recorded_at" in ping_doc and isinstance(ping_doc["recorded_at"], str):
+                try:
+                    ping_doc["recorded_at"] = datetime.fromisoformat(ping_doc["recorded_at"].replace("Z", "+00:00"))
+                except Exception:
+                    pass
+            if ping_doc.get("lat") is not None and ping_doc.get("lng") is not None:
+                try:
+                    ping_doc["location"] = {
+                        "type": "Point",
+                        "coordinates": [float(ping_doc["lng"]), float(ping_doc["lat"])]
+                    }
+                except (ValueError, TypeError):
+                    pass
+
+            res = await location_pings_collection.update_one(
+                {"organization_id": emp_org, "offline_id": offline_id},
+                {"$setOnInsert": ping_doc},
+                upsert=True,
+            )
+            if getattr(res, "upserted_id", None) is not None:
+                synced_count["pings"] += 1
+            acknowledged_ids["pings"].append(offline_id)
+
+        return {"status": "success", "synced": synced_count, "acknowledged_ids": acknowledged_ids}
 
     except Exception as e:
         logger.error(f"Batch sync failed: {e}")

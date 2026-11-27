@@ -50,7 +50,6 @@ except ImportError:
     boto3 = None
     NoCredentialsError = Exception
 
-from jose import jwt
 from database import (
     employees_collection, attendance_logs_collection, settings_collection, admins_collection, 
     organizations_collection, visit_plans_collection, visit_logs_collection, 

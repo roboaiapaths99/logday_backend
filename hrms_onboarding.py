@@ -135,7 +135,7 @@ async def create_onboarding(payload: OnboardingCreate, current_admin: Admin = De
     # Build tasks list. If empty, populate using templates
     tasks_to_add = []
     if payload.tasks:
-        tasks_to_add = [t.dict() for t in payload.tasks]
+        tasks_to_add = [t.model_dump() for t in payload.tasks]
     else:
         # Auto-populate using default templates
         for category, titles in DEFAULT_ONBOARDING_TASKS.items():
@@ -240,7 +240,7 @@ async def add_onboarding_task(id: str, task: OnboardingTask, current_admin: Admi
     if not onb:
         raise HTTPException(status_code=404, detail="Onboarding not found")
 
-    new_task = task.dict()
+    new_task = task.model_dump()
     new_task["task_id"] = str(uuid.uuid4())
 
     await onboardings_collection.update_one(

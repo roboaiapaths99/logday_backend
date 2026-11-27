@@ -64,41 +64,9 @@ def _resolve_public_api_base_url() -> str:
 
 async def _is_org_holiday_or_day_off(org_id: str, local_dt: datetime) -> Tuple[bool, str]:
     """Check if `local_dt` is a Sunday, configured day off, or named holiday for `org_id`."""
-    date_str = local_dt.strftime("%Y-%m-%d")
-    payroll_month = date_str[:7]
-    day_num = local_dt.day
-
-    # 1. Sunday check
-    if local_dt.weekday() == 6:
-        return True, "Sunday"
-
-    # 2. Named holiday check
-    named_holiday = await holidays_collection.find_one({
-        "$or": [
-            {"organization_id": org_id, "date": date_str},
-            {"organization_id": "system_org", "date": date_str},
-        ]
-    })
-    if named_holiday:
-        return True, named_holiday.get("name", "Holiday")
-
-    # 3. Monthly days_off calendar check
-    days_off_doc = await holidays_collection.find_one({
-        "organization_id": org_id,
-        "payroll_month": payroll_month,
-        "days_off": {"$exists": True},
-    })
-    if not days_off_doc and org_id != "system_org":
-        days_off_doc = await holidays_collection.find_one({
-            "organization_id": "system_org",
-            "payroll_month": payroll_month,
-            "days_off": {"$exists": True},
-        })
-    if days_off_doc and day_num in (days_off_doc.get("days_off") or []):
-        h_names = days_off_doc.get("holiday_names") or {}
-        return True, h_names.get(str(day_num), "Configured Day Off")
-
-    return False, ""
+    from services.work_calendar import month_days_off
+    off = await month_days_off(org_id, local_dt.strftime("%Y-%m"))
+    return (True, "Scheduled day off") if local_dt.day in off else (False, "")
 
 
 async def _has_employee_logged_in_today(
@@ -552,6 +520,7 @@ async def process_org_absence_alerts(org_id: str, force_run: bool = False) -> di
                 "designation": emp.get("designation", "Employee"),
                 "date": today_str,
                 "token": token,
+                "token_expires_at": now_utc + timedelta(hours=72),
                 "status": "pending",
                 "remaining_leaves_at_alert": rem_leaves,
                 "notified_admin_emails": delivered_to,
@@ -600,6 +569,19 @@ async def check_uninformed_absences_4pm():
         logger.error(f"check_uninformed_absences_4pm failed: {e}")
 
 
+def _is_alert_token_expired(alert_doc: dict, now_utc: Optional[datetime] = None) -> bool:
+    now_utc = now_utc or datetime.now(timezone.utc)
+    exp = alert_doc.get("token_expires_at") or alert_doc.get("expires_at")
+    if isinstance(exp, datetime):
+        exp_utc = exp.replace(tzinfo=timezone.utc) if exp.tzinfo is None else exp.astimezone(timezone.utc)
+        return now_utc >= exp_utc
+    created = alert_doc.get("created_at")
+    if isinstance(created, datetime):
+        created_utc = created.replace(tzinfo=timezone.utc) if created.tzinfo is None else created.astimezone(timezone.utc)
+        return (now_utc - created_utc) > timedelta(hours=72)
+    return False
+
+
 @router.get("/api/absence-alert/action", response_class=HTMLResponse)
 async def preview_absence_alert_email_action(
     token: str = Query(..., description="Unique alert security token"),
@@ -620,12 +602,12 @@ async def preview_absence_alert_email_action(
         )
 
     alert_doc = await absence_alerts_collection.find_one({"token": token})
-    if not alert_doc:
+    if not alert_doc or _is_alert_token_expired(alert_doc):
         return _render_action_html_page(
             title="Alert Link Expired or Not Found",
-            badge_text="Not Found",
+            badge_text="Expired" if alert_doc else "Not Found",
             badge_color="#64748b",
-            message_html="<p>This attendance alert link could not be found or has expired.</p>",
+            message_html="<p>This attendance alert link could not be found or has expired (links are valid for 72 hours).</p>",
         )
 
     emp_email = alert_doc.get("employee_email", "")
@@ -727,12 +709,13 @@ async def execute_absence_alert_email_action(
         )
 
     alert_doc = await absence_alerts_collection.find_one({"token": token})
-    if not alert_doc:
+    now_utc = datetime.now(timezone.utc)
+    if not alert_doc or _is_alert_token_expired(alert_doc, now_utc):
         return _render_action_html_page(
             title="Alert Link Expired or Not Found",
-            badge_text="Not Found",
+            badge_text="Expired" if alert_doc else "Not Found",
             badge_color="#64748b",
-            message_html="<p>This attendance alert link could not be found or has expired.</p>",
+            message_html="<p>This attendance alert link could not be found or has expired (links are valid for 72 hours).</p>",
         )
 
     emp_email = alert_doc.get("employee_email", "")
@@ -742,7 +725,7 @@ async def execute_absence_alert_email_action(
     comp_name = alert_doc.get("company_name") or "LogDay Organization"
     current_status = alert_doc.get("status", "pending")
 
-    # Prevent duplicate processing if already clicked
+    # Prevent duplicate processing if already finalized
     if current_status == "mail_sent":
         return _render_action_html_page(
             title="Warning Email Already Sent",
@@ -763,13 +746,20 @@ async def execute_absence_alert_email_action(
                 f"No email was sent and no penalty was applied.</p>"
             ),
         )
+    if current_status == "processing":
+        return _render_action_html_page(
+            title="Action Already In Progress",
+            badge_text="Processing",
+            badge_color="#d97706",
+            message_html=(
+                f"<p>This alert for <b>{emp_name}</b> ({emp_email}) on <b>{date_str}</b> is currently being processed.</p>"
+            ),
+        )
 
-    now_utc = datetime.now(timezone.utc)
-
-    # --- CASE 1: ADMIN PRESSED "REJECT" -> NOTHING HAPPENS ---
+    # --- CASE 1: ADMIN PRESSED "REJECT" -> ATOMIC CLAIM & NOTHING HAPPENS ---
     if clean_action == "reject":
-        await absence_alerts_collection.update_one(
-            {"_id": alert_doc["_id"]},
+        claimed = await absence_alerts_collection.find_one_and_update(
+            {"_id": alert_doc["_id"], "status": "pending"},
             {
                 "$set": {
                     "status": "rejected",
@@ -778,6 +768,13 @@ async def execute_absence_alert_email_action(
                 }
             },
         )
+        if not claimed:
+            return _render_action_html_page(
+                title="Alert Already Processed",
+                badge_text="Already Processed",
+                badge_color="#475569",
+                message_html=f"<p>This alert for <b>{emp_name}</b> ({emp_email}) on <b>{date_str}</b> was already processed.</p>",
+            )
         return _render_action_html_page(
             title="Alert Rejected — No Action Taken",
             badge_text="Rejected",
@@ -788,70 +785,108 @@ async def execute_absence_alert_email_action(
             ),
         )
 
-    # --- CASE 2: ADMIN PRESSED "SEND MAIL" -> APPLY 1.5 DAY PENALTY & EMAIL EMPLOYEE ---
-    rem_leaves = await _get_remaining_paid_leaves(emp_email, org_id, date_str)
+    # --- CASE 2: ADMIN PRESSED "SEND MAIL" -> ATOMIC CLAIM, UPSERT PENALTY ONCE, THEN SEND EMAIL ---
+    claimed = await absence_alerts_collection.find_one_and_update(
+        {"_id": alert_doc["_id"], "status": {"$in": ["pending", "mail_failed"]}},
+        {
+            "$set": {
+                "status": "processing",
+                "processing_started_at": now_utc,
+                "updated_at": now_utc,
+            }
+        },
+    )
+    if not claimed:
+        return _render_action_html_page(
+            title="Alert Already Processed",
+            badge_text="Already Completed",
+            badge_color="#059669",
+            message_html=(
+                f"<p>The 1.5-day warning email and deduction for <b>{emp_name}</b> ({emp_email}) on <b>{date_str}</b> "
+                f"have already been processed.</p>"
+            ),
+        )
 
-    # Determine paid leave cut vs salary (LOP) cut so total penalty = 1.5 days
-    # Note: In fetch_attendance_data (hrms_payroll.py), an approved leave on `date_str` replaces the 1.0 raw absent day
-    # with the leave record's duration (paid_leave_days or unpaid_leave_days).
-    # Therefore, inserting a total duration of 1.5 days on `date_str` results in an exact 1.5-day deduction!
-    if rem_leaves >= 1.5:
-        paid_leave_cut = 1.5
-        salary_lop_cut = 0.0
-    elif rem_leaves > 0:
-        paid_leave_cut = round(rem_leaves, 2)
-        salary_lop_cut = round(1.5 - paid_leave_cut, 2)
+    # If a previous attempt already applied the penalty and only email delivery failed, reuse the recorded cuts
+    if claimed.get("penalty_applied"):
+        paid_leave_cut = float(claimed.get("paid_leave_cut", 0.0))
+        salary_lop_cut = float(claimed.get("salary_lop_cut", 0.0))
+        rem_leaves = float(claimed.get("remaining_leaves_before", claimed.get("remaining_leaves_at_alert", 0.0)))
     else:
-        paid_leave_cut = 0.0
-        salary_lop_cut = 1.5
+        rem_leaves = await _get_remaining_paid_leaves(emp_email, org_id, date_str)
+        if rem_leaves >= 1.5:
+            paid_leave_cut = 1.5
+            salary_lop_cut = 0.0
+        elif rem_leaves > 0:
+            paid_leave_cut = round(rem_leaves, 2)
+            salary_lop_cut = round(1.5 - paid_leave_cut, 2)
+        else:
+            paid_leave_cut = 0.0
+            salary_lop_cut = 1.5
 
-    # Remove any prior auto-penalty record for this exact date to stay idempotent
-    await leave_requests_collection.delete_many({
-        "employee_id": emp_email,
-        "start_date": date_str,
-        "end_date": date_str,
-        "is_uninformed_absence_penalty": True,
-    })
+        paid_penalty_key = f"absence_penalty:{org_id}:{emp_email}:{date_str}:paid"
+        lop_penalty_key = f"absence_penalty:{org_id}:{emp_email}:{date_str}:lop"
 
-    if paid_leave_cut > 0:
-        await leave_requests_collection.insert_one({
-            "employee_id": emp_email,
-            "email": emp_email,
-            "organization_id": org_id,
-            "leave_type": "casual_leave",
-            "start_date": date_str,
-            "end_date": date_str,
-            "duration_type": "full_day",
-            "duration": paid_leave_cut,
-            "reason": f"Uninformed absence warning penalty ({paid_leave_cut} day paid leave cut)",
-            "is_paid": True,
-            "is_uninformed_absence_penalty": True,
-            "status": "approved",
-            "admin_notes": f"Auto-applied 1.5-day uninformed absence penalty on {date_str} via Admin Email Approval",
-            "processed_at": now_utc,
-            "processed_by": "admin_email_action",
-            "created_at": now_utc,
-        })
+        if paid_leave_cut > 0:
+            await leave_requests_collection.update_one(
+                {"penalty_key": paid_penalty_key},
+                {"$set": {
+                    "penalty_key": paid_penalty_key,
+                    "employee_id": emp_email,
+                    "email": emp_email,
+                    "organization_id": org_id,
+                    "leave_type": "casual_leave",
+                    "start_date": date_str,
+                    "end_date": date_str,
+                    "duration_type": "full_day",
+                    "duration": paid_leave_cut,
+                    "reason": f"Uninformed absence warning penalty ({paid_leave_cut} day paid leave cut)",
+                    "is_paid": True,
+                    "is_uninformed_absence_penalty": True,
+                    "status": "approved",
+                    "admin_notes": f"Auto-applied 1.5-day uninformed absence penalty on {date_str} via Admin Email Approval",
+                    "processed_at": now_utc,
+                    "processed_by": "admin_email_action",
+                    "updated_at": now_utc,
+                }, "$setOnInsert": {"created_at": now_utc}},
+                upsert=True,
+            )
 
-    if salary_lop_cut > 0:
-        await leave_requests_collection.insert_one({
-            "employee_id": emp_email,
-            "email": emp_email,
-            "organization_id": org_id,
-            "leave_type": "unpaid",
-            "start_date": date_str,
-            "end_date": date_str,
-            "duration_type": "full_day",
-            "duration": salary_lop_cut,
-            "reason": f"Uninformed absence warning penalty ({salary_lop_cut} day LOP salary cut)",
-            "is_paid": False,
-            "is_uninformed_absence_penalty": True,
-            "status": "approved",
-            "admin_notes": f"Auto-applied 1.5-day uninformed absence salary deduction on {date_str} via Admin Email Approval",
-            "processed_at": now_utc,
-            "processed_by": "admin_email_action",
-            "created_at": now_utc,
-        })
+        if salary_lop_cut > 0:
+            await leave_requests_collection.update_one(
+                {"penalty_key": lop_penalty_key},
+                {"$set": {
+                    "penalty_key": lop_penalty_key,
+                    "employee_id": emp_email,
+                    "email": emp_email,
+                    "organization_id": org_id,
+                    "leave_type": "unpaid",
+                    "start_date": date_str,
+                    "end_date": date_str,
+                    "duration_type": "full_day",
+                    "duration": salary_lop_cut,
+                    "reason": f"Uninformed absence warning penalty ({salary_lop_cut} day LOP salary cut)",
+                    "is_paid": False,
+                    "is_uninformed_absence_penalty": True,
+                    "status": "approved",
+                    "admin_notes": f"Auto-applied 1.5-day uninformed absence salary deduction on {date_str} via Admin Email Approval",
+                    "processed_at": now_utc,
+                    "processed_by": "admin_email_action",
+                    "updated_at": now_utc,
+                }, "$setOnInsert": {"created_at": now_utc}},
+                upsert=True,
+            )
+
+        await absence_alerts_collection.update_one(
+            {"_id": alert_doc["_id"]},
+            {"$set": {
+                "penalty_applied": True,
+                "remaining_leaves_before": rem_leaves,
+                "paid_leave_cut": paid_leave_cut,
+                "salary_lop_cut": salary_lop_cut,
+                "updated_at": now_utc,
+            }},
+        )
 
     # Also recalculate any existing DRAFT payroll for this employee & month so Payroll page shows the updated 1.5-day deduction immediately
     try:

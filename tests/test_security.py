@@ -2,7 +2,7 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 
 from bson import ObjectId
-from jose import jwt
+import jwt
 import pytest
 
 import auth
@@ -65,7 +65,7 @@ def test_legacy_token_rejected(client, db):
 def test_invalid_claims_rejected(client, db, claim, value):
     admin = account(db, "admin", role="admin")
     token = bearer(admin, "admin")["Authorization"].split()[1]
-    claims = jwt.get_unverified_claims(token)
+    claims = jwt.decode(token, options={"verify_signature": False})
     claims[claim] = value
     token = jwt.encode(claims, auth.SECRET_KEY, algorithm=auth.ALGORITHM)
     assert client.get("/admin/me", headers={"Authorization": f"Bearer {token}"}).status_code == 401
@@ -314,3 +314,213 @@ def test_expired_oauth_state_is_rejected(client, db):
     db.oauth_states_collection.update_many({}, {"$set": {"expires_at": datetime(2000, 1, 1, tzinfo=timezone.utc)}})
     response = client.get("/api/employee/onboarding/digilocker/callback", params={"code": "unused", "state": state})
     assert response.status_code == 400
+
+
+def test_cross_tenant_wfh_admin_commands_rejected(client, db):
+    org_a_admin = account(db, "admin", email="admin_a@example.test", role="owner")
+    org_b_employee = account(db, "employee", email="emp_b@example.test", org=str(ObjectId()))
+    db.employees_collection.update_one({"_id": org_b_employee["_id"]}, {"$set": {"employee_type": "wfh"}})
+    headers = bearer(org_a_admin, "admin")
+    email = org_b_employee["email"]
+
+    assert client.post(f"/admin/wfh/employee/{email}/trigger-screenshot", headers=headers).status_code == 404
+    assert client.post(f"/admin/wfh/employee/{email}/force-end", headers=headers, json={"reason": "test"}).status_code == 404
+    assert client.post(f"/admin/wfh/employee/{email}/force-logout", headers=headers, json={"reason": "test"}).status_code == 404
+    assert client.get(f"/admin/wfh/employee/{email}/screenshots", headers=headers).status_code == 404
+    assert client.get(f"/admin/wfh/employee/{email}/activity", headers=headers).status_code == 404
+    assert client.get(f"/admin/wfh/employee/{email}/apps", headers=headers).status_code == 404
+    assert client.get(f"/admin/wfh/employee/{email}/productivity", headers=headers).status_code == 404
+    assert client.get(f"/admin/wfh/employee/{email}/timeline", headers=headers).status_code == 404
+    assert client.get(f"/admin/wfh/employee/{email}/tasks", headers=headers).status_code == 404
+
+
+def test_wfh_face_check_verifies_on_server(client, db, monkeypatch):
+    import base64
+    import io
+    from PIL import Image
+    import routers.wfh_employee as wfh_emp
+
+    emp = account(db, "employee", email="wfh_face@example.test")
+    db.employees_collection.update_one(
+        {"_id": emp["_id"]},
+        {"$set": {"employee_type": "wfh", "face_embedding": [0.1, 0.2, 0.3]}}
+    )
+    session_id = ObjectId()
+    db.wfh_sessions_collection.insert_one({
+        "_id": session_id,
+        "employee_id": str(emp["_id"]),
+        "email": emp["email"],
+        "organization_id": emp["organization_id"],
+        "status": "active",
+    })
+    monkeypatch.setattr(wfh_emp, "verify_face", lambda img, emb: (False, 0.99))
+
+    buf = io.BytesIO()
+    Image.new("RGB", (3, 3), "green").save(buf, format="PNG")
+    valid_png_b64 = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+
+    response = client.post(
+        "/api/wfh/face-check",
+        headers=bearer(emp, "employee"),
+        json={
+            "session_id": str(session_id),
+            "passed": True,
+            "face_score": 0.01,
+            "image_base64": valid_png_b64,
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["passed"] is False
+    saved = db.wfh_face_checks_collection.find_one({"session_id": str(session_id)})
+    assert saved["passed"] is False
+    assert db.wfh_alerts_collection.find_one({"employee_id": str(emp["_id"]), "type": "WFH_FACE_CHECK_FAILED"}) is not None
+
+
+def test_password_change_and_reset_invalidate_existing_sessions(client, db):
+    owner = account(db, "admin", email="owner_pw@example.test", role="owner")
+    emp = account(db, "employee", email="emp_pw@example.test", org=owner["organization_id"])
+    emp_headers = bearer(emp, "employee")
+
+    assert client.get("/api/employee/profile", headers=emp_headers).status_code == 200
+    change_res = client.post(
+        "/api/me/change-password",
+        headers=emp_headers,
+        json={"old_password": "correct-password", "new_password": "new-password-123"},
+    )
+    assert change_res.status_code == 200, change_res.text
+    assert client.get("/api/employee/profile", headers=emp_headers).status_code == 401
+
+    updated_emp = db.employees_collection.find_one({"_id": emp["_id"]})
+    emp_headers_2 = bearer(updated_emp, "employee")
+    assert client.get("/api/employee/profile", headers=emp_headers_2).status_code == 200
+
+    reset_res = client.post(
+        f"/admin/employees/{emp['email']}/reset-password",
+        headers=bearer(owner, "admin"),
+        json={"password": "admin-reset-password-456"},
+    )
+    assert reset_res.status_code == 200, reset_res.text
+    assert client.get("/api/employee/profile", headers=emp_headers_2).status_code == 401
+
+
+def test_absence_alert_expiry_and_atomic_idempotent_deduction(client, db, monkeypatch):
+    import absence_alerts
+    org_id = str(ObjectId())
+    emp = account(db, "employee", email="absent_emp@example.test", org=org_id)
+
+    expired_token = "expired-alert-token"
+    db.absence_alerts_collection.insert_one({
+        "token": expired_token,
+        "employee_id": str(emp["_id"]),
+        "employee_email": emp["email"],
+        "employee_name": emp["full_name"],
+        "organization_id": org_id,
+        "date": "2026-11-10",
+        "status": "pending",
+        "created_at": datetime.now(timezone.utc) - timedelta(days=5),
+        "token_expires_at": datetime.now(timezone.utc) - timedelta(days=2),
+    })
+    expired_res = client.post("/api/absence-alert/action", data={"token": expired_token, "action": "send_mail"})
+    assert expired_res.status_code == 200
+    assert "Alert Link Expired" in expired_res.text
+    assert db.leave_requests_collection.count_documents({"email": emp["email"], "start_date": "2026-11-10"}) == 0
+
+    valid_token = "valid-alert-token"
+    db.absence_alerts_collection.insert_one({
+        "token": valid_token,
+        "employee_id": str(emp["_id"]),
+        "employee_email": emp["email"],
+        "employee_name": emp["full_name"],
+        "organization_id": org_id,
+        "date": "2026-11-11",
+        "status": "pending",
+        "created_at": datetime.now(timezone.utc),
+        "token_expires_at": datetime.now(timezone.utc) + timedelta(hours=72),
+    })
+
+    calls = {"mail": 0}
+    def fake_send_email_sync(smtp_cfg, to_email, subject, html, *args, **kwargs):
+        calls["mail"] += 1
+        if calls["mail"] == 1:
+            return (False, "SMTP temporary failure")
+        return (True, "Delivered")
+
+    monkeypatch.setattr(absence_alerts, "_send_email_sync", fake_send_email_sync)
+
+    first_res = client.post("/api/absence-alert/action", data={"token": valid_token, "action": "send_mail"})
+    assert first_res.status_code == 200
+    assert "Email Delivery Failed" in first_res.text
+    assert db.leave_requests_collection.count_documents({"email": emp["email"], "start_date": "2026-11-11"}) == 1
+
+    second_res = client.post("/api/absence-alert/action", data={"token": valid_token, "action": "send_mail"})
+    assert second_res.status_code == 200
+    assert "Warning Email Sent to Employee" in second_res.text
+    assert db.leave_requests_collection.count_documents({"email": emp["email"], "start_date": "2026-11-11"}) == 1
+
+    third_res = client.post("/api/absence-alert/action", data={"token": valid_token, "action": "send_mail"})
+    assert third_res.status_code == 200
+    assert "Already Sent" in third_res.text
+    assert db.leave_requests_collection.count_documents({"email": emp["email"], "start_date": "2026-11-11"}) == 1
+
+
+def test_field_offline_sync_idempotency_and_ownership(client, db):
+    emp = account(db, "employee", email="field_sync@example.test")
+    headers = bearer(emp, "employee")
+    batch_payload = {
+        "attendance_logs": [
+            {
+                "offline_id": "att-1",
+                "offline_owner": emp["email"],
+                "type": "check-in",
+                "latitude": 12.97,
+                "longitude": 77.59,
+                "timestamp": "2026-11-10T09:00:00Z",
+            },
+            {
+                "offline_id": "att-foreign",
+                "offline_owner": "other_user@example.test",
+                "type": "check-in",
+                "latitude": 12.97,
+                "longitude": 77.59,
+                "timestamp": "2026-11-10T09:05:00Z",
+            },
+        ],
+        "pings": [
+            {
+                "offline_id": "loc-1",
+                "offline_owner": emp["email"],
+                "lat": 12.97,
+                "lng": 77.59,
+                "recorded_at": "2026-11-10T09:10:00Z",
+            }
+        ],
+    }
+    res1 = client.post("/api/field/sync/batch", headers=headers, json=batch_payload)
+    assert res1.status_code == 200
+    ack1 = res1.json()["acknowledged_ids"]
+    assert ack1["attendance"] == ["att-1"]
+    assert ack1["pings"] == ["loc-1"]
+    assert db.attendance_logs_collection.count_documents({"offline_id": "att-1"}) == 1
+    assert db.attendance_logs_collection.count_documents({"offline_id": "att-foreign"}) == 0
+
+    res2 = client.post("/api/field/sync/batch", headers=headers, json=batch_payload)
+    assert res2.status_code == 200
+    assert db.attendance_logs_collection.count_documents({"offline_id": "att-1"}) == 1
+    assert db.location_pings_collection.count_documents({"offline_id": "loc-1"}) == 1
+
+
+def test_health_and_ready_return_503_when_db_down(client, monkeypatch):
+    import database
+
+    class FailingAdmin:
+        async def command(self, cmd):
+            raise RuntimeError("mongo unreachable")
+
+    class FailingClient:
+        admin = FailingAdmin()
+
+    monkeypatch.setattr(database, "client", FailingClient())
+    assert client.get("/live").status_code == 200
+    assert client.get("/ready").status_code == 503
+    assert client.get("/health").status_code == 503
+

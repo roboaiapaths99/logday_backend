@@ -48,7 +48,6 @@ except ImportError:
     boto3 = None
     NoCredentialsError = Exception
 
-from jose import jwt
 from database import (
     employees_collection, attendance_logs_collection, settings_collection, admins_collection, 
     organizations_collection, visit_plans_collection, visit_logs_collection, 
@@ -180,6 +179,12 @@ async def root():
     return {"message": "LogDay AI Attendance API is active", "status": "online"}
 
 
+@router.get("/live", tags=["System"])
+async def liveness():
+    return {"status": "alive"}
+
+
+@router.get("/ready", tags=["System"])
 @router.get("/health", tags=["System"])
 async def health_check():
     """Health check endpoint to verify API and DB are connected."""
@@ -188,7 +193,7 @@ async def health_check():
         await client.admin.command("ping")
         db_status = "connected"
     except Exception as e:
-        db_status = f"error: {str(e)}"
+        return JSONResponse(status_code=503, content={"status": "unavailable", "database": "disconnected"})
     return {
         "api": "LogDay AI Attendance API",
         "status": "healthy",

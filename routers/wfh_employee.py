@@ -1,3 +1,4 @@
+from services.inference import run_inference
 from upload_security import SecureMediaRoute
 from fastapi import APIRouter, FastAPI, HTTPException, File, Depends, BackgroundTasks, Request, Query
 from fastapi.concurrency import run_in_threadpool
@@ -48,7 +49,6 @@ except ImportError:
     boto3 = None
     NoCredentialsError = Exception
 
-from jose import jwt
 from database import (
     employees_collection, attendance_logs_collection, settings_collection, admins_collection, 
     organizations_collection, visit_plans_collection, visit_logs_collection, 
@@ -248,7 +248,7 @@ async def wfh_checkin(req: dict, employee=Depends(get_current_employee)):
     stored_embedding = employee.get("face_embedding")
     if not stored_embedding or is_dummy_embedding(stored_embedding):
         # Auto-enroll real DeepFace biometric if clear face image is provided
-        new_emb = get_face_embedding(face_image)
+        new_emb = await run_inference(get_face_embedding, face_image)
         if new_emb is not None and not is_dummy_embedding(new_emb):
             await employees_collection.update_one(
                 {"_id": employee["_id"]},
@@ -266,7 +266,7 @@ async def wfh_checkin(req: dict, employee=Depends(get_current_employee)):
                 detail="Face biometric enrollment missing or needs refresh. Please ensure your face is well-lit and clearly visible to complete registration."
             )
 
-    face_ok, face_distance = verify_face(face_image, stored_embedding)
+    face_ok, face_distance = await run_inference(verify_face, face_image, stored_embedding)
 
     if not face_ok:
         raise HTTPException(
@@ -1167,10 +1167,18 @@ async def wfh_face_check(req: dict, employee=Depends(get_current_employee)):
     org_id = employee.get("organization_id")
     
     session_id = req.get("session_id")
-    passed = bool(req.get("passed", True))
-    face_score = float(req.get("face_score", 1.0))
-    failure_reason = req.get("failure_reason", "")
     image_base64 = req.get("image_base64")
+    if not image_base64 or not employee.get("face_embedding"):
+        raise HTTPException(400, "A face image and enrolled face are required")
+    from upload_security import decode_image_payload
+    await run_in_threadpool(decode_image_payload, image_base64)
+    passed, face_score = await run_inference(verify_face, image_base64, employee["face_embedding"])
+    failure_reason = "" if passed else "Face verification failed"
+    if session_id:
+        owned_session = await wfh_sessions_collection.find_one({"_id": ObjectId(session_id),
+            "employee_id": employee_id, "organization_id": org_id}) if ObjectId.is_valid(session_id) else None
+        if not owned_session:
+            raise HTTPException(404, "Session not found")
     
     now = datetime.now(timezone.utc)
     

@@ -13,6 +13,7 @@ import time
 import uuid
 import traceback
 import logging
+from logging.handlers import RotatingFileHandler
 from dotenv import load_dotenv
 from auth import get_current_admin
 from models import Admin
@@ -32,7 +33,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler(os.path.join(LOG_DIR, "backend.log"))
+        RotatingFileHandler(os.path.join(LOG_DIR, "backend.log"), maxBytes=10 * 1024 * 1024, backupCount=5)
     ]
 )
 logger = logging.getLogger(__name__)
@@ -90,13 +91,24 @@ from services.scheduler_jobs import (
     scheduler, check_missed_visits, purge_old_screenshots
 )
 
+from contextlib import asynccontextmanager
+
 APP_ENV = os.getenv("APP_ENV", "development")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await startup_db_client()
+    try:
+        yield
+    finally:
+        await shutdown_event()
 
 app = FastAPI(
     title="Log Day AI Attendance API",
     version="1.0.0",
     docs_url="/docs" if APP_ENV != "production" else None,
     redoc_url="/redoc" if APP_ENV != "production" else None,
+    lifespan=lifespan,
 )
 
 from body_limits import RequestBodyLimitMiddleware
@@ -275,7 +287,6 @@ async def general_exception_handler(request: Request, exc: Exception):
 app.mount("/uploads/logos", StaticFiles(directory=os.path.join(UPLOAD_DIR, "logos")), name="logos")
 
 # 6. Startup & Shutdown Lifecycle Events
-@app.on_event("startup")
 async def startup_db_client():
     """Create indexes and start background scheduler jobs on startup (non-fatal if DB is temporarily unreachable)."""
     try:
@@ -337,7 +348,6 @@ async def startup_db_client():
     logger.info(f"Application startup complete. ENV={APP_ENV}")
     print("Startup complete.")
 
-@app.on_event("shutdown")
 async def shutdown_event():
     """Cleanly shut down scheduler and connections on process exit."""
     try:

@@ -66,53 +66,53 @@ leave_policies_collection = db["leave_policies"]
 absence_alerts_collection = db["absence_alerts"]
 
 
-# Ensure indexes for employee check-in status and session tracking
+# Ensure indexes for employee check-in status and session tracking (each index isolated so one conflict never stops others)
 async def ensure_employee_indexes():
-    await oauth_states_collection.create_index("expires_at", expireAfterSeconds=0)
-    await auth_sessions_collection.create_index("expires_at", expireAfterSeconds=0)
-    await employee_invitations_collection.create_index("expires_at", expireAfterSeconds=0)
-    await uploads_collection.create_index("url", unique=True)
-    await uploads_collection.create_index([("organization_id", 1), ("owner_id", 1)])
-    # Core employee indexes
-    await employees_collection.create_index("checked_in")
-    await employees_collection.create_index("session_id")
-    existing_emp_indexes = await employees_collection.index_information()
-    if "email_1" not in existing_emp_indexes and "employees_email" not in existing_emp_indexes:
-        await employees_collection.create_index("email", unique=True, sparse=True)
-    await employees_collection.create_index([("organization_id", 1), ("employee_type", 1)])
+    import logging
+    logger = logging.getLogger(__name__)
 
-    # WFH Sessions: queries by employee_id+status, and by email+status
-    await wfh_sessions_collection.create_index([("employee_id", 1), ("status", 1)])
-    await wfh_sessions_collection.create_index([("employee_email", 1), ("status", 1)])
-    await wfh_sessions_collection.create_index([("organization_id", 1), ("status", 1)])
+    index_specs = [
+        (oauth_states_collection, "expires_at", {"expireAfterSeconds": 0}),
+        (auth_sessions_collection, "expires_at", {"expireAfterSeconds": 0}),
+        (employee_invitations_collection, "expires_at", {"expireAfterSeconds": 0}),
+        (uploads_collection, "url", {"unique": True}),
+        (uploads_collection, [("organization_id", 1), ("owner_id", 1)], {}),
+        (employees_collection, "checked_in", {}),
+        (employees_collection, "session_id", {}),
+        (employees_collection, [("organization_id", 1), ("employee_type", 1)], {}),
+        (wfh_sessions_collection, [("employee_id", 1), ("status", 1)], {}),
+        (wfh_sessions_collection, [("employee_email", 1), ("status", 1)], {}),
+        (wfh_sessions_collection, [("organization_id", 1), ("status", 1)], {}),
+        (wfh_screenshots_collection, [("employee_id", 1), ("timestamp", -1)], {}),
+        (wfh_screenshots_collection, [("employee_email", 1), ("timestamp", -1)], {}),
+        (wfh_screenshots_collection, "timestamp", {}),
+        (wfh_activity_collection, [("employee_id", 1), ("timestamp", -1)], {}),
+        (wfh_activity_collection, [("employee_email", 1), ("timestamp", -1)], {}),
+        (wfh_productivity_collection, [("date", 1), ("organization_id", 1)], {}),
+        (wfh_productivity_collection, [("employee_id", 1), ("date", 1)], {}),
+        (wfh_alerts_collection, [("status", 1), ("timestamp", -1)], {}),
+        (wfh_alerts_collection, [("organization_id", 1), ("status", 1), ("timestamp", -1)], {}),
+        (wfh_alerts_collection, [("employee_email", 1), ("timestamp", -1)], {}),
+        (wfh_commands_collection, [("employee_email", 1), ("status", 1)], {}),
+        (wfh_app_usage_collection, [("employee_id", 1), ("date", 1)], {}),
+        (wfh_face_checks_collection, [("employee_id", 1), ("timestamp", -1)], {}),
+        (absence_alerts_collection, [("organization_id", 1), ("employee_email", 1), ("date", 1)], {"unique": True, "sparse": True}),
+        (absence_alerts_collection, "token", {"unique": True, "sparse": True}),
+        (leave_requests_collection, "penalty_key", {"unique": True, "sparse": True}),
+        (attendance_logs_collection, [("organization_id", 1), ("offline_id", 1)], {"unique": True, "sparse": True}),
+        (visit_logs_collection, [("organization_id", 1), ("offline_id", 1)], {"unique": True, "sparse": True}),
+        (location_pings_collection, [("organization_id", 1), ("offline_id", 1)], {"unique": True, "sparse": True}),
+    ]
 
-    # WFH Screenshots: queries sorted by timestamp, filtered by employee_id or employee_email
-    await wfh_screenshots_collection.create_index([("employee_id", 1), ("timestamp", -1)])
-    await wfh_screenshots_collection.create_index([("employee_email", 1), ("timestamp", -1)])
-    await wfh_screenshots_collection.create_index("timestamp")  # for purge job
+    try:
+        existing_emp_indexes = await employees_collection.index_information()
+        if "email_1" not in existing_emp_indexes and "employees_email" not in existing_emp_indexes:
+            await employees_collection.create_index("email", unique=True, sparse=True)
+    except Exception as e:
+        logger.warning(f"Employee email index creation skipped: {e}")
 
-    # WFH Activity: queries sorted by timestamp, filtered by employee_id or employee_email
-    await wfh_activity_collection.create_index([("employee_id", 1), ("timestamp", -1)])
-    await wfh_activity_collection.create_index([("employee_email", 1), ("timestamp", -1)])
-
-    # WFH Productivity: queries by date + org — THIS was causing the 20s timeout
-    await wfh_productivity_collection.create_index([("date", 1), ("organization_id", 1)])
-    await wfh_productivity_collection.create_index([("employee_id", 1), ("date", 1)])
-
-    # WFH Alerts: queries by status + timestamp, and by employee_email for timeline
-    await wfh_alerts_collection.create_index([("status", 1), ("timestamp", -1)])
-    await wfh_alerts_collection.create_index([("organization_id", 1), ("status", 1), ("timestamp", -1)])
-    await wfh_alerts_collection.create_index([("employee_email", 1), ("timestamp", -1)])
-
-    # WFH Commands: queries by employee_email + status (polling endpoint)
-    await wfh_commands_collection.create_index([("employee_email", 1), ("status", 1)])
-
-    # App usage: queries by employee_id + date
-    await wfh_app_usage_collection.create_index([("employee_id", 1), ("date", 1)])
-
-    # Face checks: queries by employee_id
-    await wfh_face_checks_collection.create_index([("employee_id", 1), ("timestamp", -1)])
-
-    # 4:00 PM Absence Alerts: unique per org + employee + date, fast lookup by token
-    await absence_alerts_collection.create_index([("organization_id", 1), ("employee_email", 1), ("date", 1)])
-    await absence_alerts_collection.create_index("token", unique=True, sparse=True)
+    for col, keys, kwargs in index_specs:
+        try:
+            await col.create_index(keys, **kwargs)
+        except Exception as e:
+            logger.warning(f"Index creation skipped on {getattr(col, 'name', col)} ({keys}): {e}")

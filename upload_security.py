@@ -14,7 +14,8 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import Response
 from fastapi.routing import APIRoute
-from jose import jwt, JWTError
+import jwt
+from jwt.exceptions import PyJWTError as JWTError
 from PIL import Image, UnidentifiedImageError
 
 from auth import (SECRET_KEY, ALGORITHM, TOKEN_ISSUER, employee_oauth2_scheme,
@@ -241,8 +242,14 @@ async def issue_download_link(upload_id: str, request: Request, token: str = Dep
 @router.get("/api/uploads/{upload_id}/content")
 async def download_upload(upload_id: str, grant: str):
     try:
-        claims = jwt.decode(grant, SECRET_KEY, algorithms=[ALGORITHM], issuer=TOKEN_ISSUER,
-                            audience=DOWNLOAD_AUDIENCE, options={"require_exp": True, "require_iss": True, "require_aud": True})
+        claims = jwt.decode(
+            grant,
+            SECRET_KEY,
+            algorithms=[ALGORITHM],
+            issuer=TOKEN_ISSUER,
+            audience=DOWNLOAD_AUDIENCE,
+            options={"require": ["exp", "iss", "aud"]},
+        )
         if claims.get("upload_id") != upload_id:
             raise HTTPException(403, "Download grant does not match this file")
         account, kind = await resolve_session_claims(claims)

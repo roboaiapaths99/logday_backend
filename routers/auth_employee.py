@@ -51,7 +51,6 @@ except ImportError:
     boto3 = None
     NoCredentialsError = Exception
 
-from jose import jwt
 from database import (
     employees_collection, attendance_logs_collection, settings_collection, admins_collection, 
     organizations_collection, visit_plans_collection, visit_logs_collection, 
@@ -225,17 +224,17 @@ async def get_public_settings_by_slug(slug: str):
     """Public endpoint for apps to fetch organization settings by slug."""
     # Handle "null" or "undefined" string from frontend JS
     if not slug or slug in ["null", "undefined", "generic"]:
-        return SystemSettings().dict()
+        return SystemSettings().model_dump()
         
     org = await organizations_collection.find_one({"slug": slug})
     if not org:
         # Fallback to default instead of 404 to prevent app crashes
-        return SystemSettings().dict()
+        return SystemSettings().model_dump()
     
     settings_doc = await settings_collection.find_one({"organization_id": str(org["_id"])})
     if settings_doc:
         return sanitize_public_settings(settings_doc)
-    return SystemSettings().dict()
+    return SystemSettings().model_dump()
 
 
 @router.post("/login", response_model=LoginResponse)
@@ -477,11 +476,16 @@ async def change_password(req: ChangePasswordRequest, employee=Depends(get_curre
         
     new_hashed_password = await get_password_hash_async(req.new_password)
     await employees_collection.update_one(
-        {"email": employee["email"]},
+        {"_id": user["_id"]},
         {"$set": {
             "hashed_password": new_hashed_password,
             "force_password_change": False
-        }}
+        }, "$inc": {"auth_version": 1}}
+    )
+    from database import auth_sessions_collection
+    await auth_sessions_collection.update_many(
+        {"account_id": str(user["_id"]), "account_type": "employee"},
+        {"$set": {"revoked": True}}
     )
     
     # Check if face enrollment is still needed
@@ -553,7 +557,8 @@ async def update_employee_face(req: dict, current_user: dict = Depends(get_curre
         raise HTTPException(status_code=400, detail="No face image provided.")
     
     try:
-        embedding = get_face_embedding(image_data)
+        from services.inference import run_inference
+        embedding = await run_inference(get_face_embedding, image_data)
         if embedding is None:
             raise HTTPException(status_code=400, detail="No face detected in the provided image.")
         
@@ -594,7 +599,7 @@ async def get_public_settings(request: Request):
     # Fallback to global config
     settings = await settings_collection.find_one({"id": "config"})
     if not settings:
-        return SystemSettings().dict()
+        return SystemSettings().model_dump()
     return sanitize_public_settings(settings)
 
 

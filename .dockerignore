@@ -24,3 +24,11 @@ download_face.py
 *.sqlite
 .vscode/
 .idea/
+
+.env.*
+node_modules/
+uploads/
+logs/
+*.bak
+*.bak2
+FETCH_HEAD

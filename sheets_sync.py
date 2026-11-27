@@ -1,5 +1,4 @@
 import gspread
-from google.oauth2.service_account import Credentials
 import os
 import logging
 import asyncio
@@ -23,8 +22,7 @@ def _sync_to_google_sheets_worker(log_entry: dict):
         return
 
     try:
-        creds = Credentials.from_service_account_file(creds_path, scopes=SCOPES)
-        client = gspread.authorize(creds)
+        client = gspread.service_account(filename=creds_path, scopes=SCOPES)
         
         # Open the spreadsheet and the first worksheet
         sh = client.open_by_key(sheet_id)
@@ -67,8 +65,7 @@ def _sync_visit_to_google_sheets_worker(visit_entry: dict):
         return
 
     try:
-        creds = Credentials.from_service_account_file(creds_path, scopes=SCOPES)
-        gc = gspread.authorize(creds)
+        gc = gspread.service_account(filename=creds_path, scopes=SCOPES)
 
         sh = gc.open_by_key(sheet_id)
 

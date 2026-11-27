@@ -47,7 +47,6 @@ except ImportError:
     boto3 = None
     NoCredentialsError = Exception
 
-from jose import jwt
 from database import (
     employees_collection, attendance_logs_collection, settings_collection, admins_collection, 
     organizations_collection, visit_plans_collection, visit_logs_collection, 
@@ -131,7 +130,7 @@ _SENSITIVE_SETTINGS_KEYS = {
 def sanitize_public_settings(settings_doc: Optional[dict]) -> dict:
     """Strip secret API keys, SMTP credentials, and admin alert email lists from public settings responses."""
     if not settings_doc or not isinstance(settings_doc, dict):
-        return SystemSettings().dict()
+        return SystemSettings().model_dump()
     cleaned = {k: v for k, v in settings_doc.items() if k not in _SENSITIVE_SETTINGS_KEYS}
     if "_id" in cleaned:
         cleaned["_id"] = str(cleaned["_id"])
@@ -629,7 +628,7 @@ async def calculate_leave_balance(
     # Identify all possible identifier variants for this employee
     emp_identifiers = [clean_email, email.strip()]
     try:
-        emp_doc = await employees_collection.find_one({"email": clean_email})
+        emp_doc = await employees_collection.find_one({"email": clean_email, "organization_id": org_id})
         if emp_doc:
             if "_id" in emp_doc:
                 emp_identifiers.append(str(emp_doc["_id"]))
@@ -646,12 +645,13 @@ async def calculate_leave_balance(
         pass
 
     leaves = await leave_requests_collection.find({
+        "organization_id": org_id,
         "$or": [
             {"employee_id": {"$in": emp_identifiers}},
             {"email": {"$in": emp_identifiers}}
         ],
         "status": {"$regex": "^approved$", "$options": "i"}
-    }).to_list(length=500)
+    }).to_list(length=None)
 
     def eval_leave(l_doc):
         norm_start = normalize_date_str(l_doc.get("start_date", ""))

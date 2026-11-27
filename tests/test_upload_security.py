@@ -6,7 +6,7 @@ from urllib.parse import urlparse, parse_qs
 
 from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
-from jose import jwt
+import jwt
 from PIL import Image
 import pytest
 
@@ -87,7 +87,7 @@ def test_grant_expiry_and_permission_changes_are_enforced(client, db):
     admin = account(db, "admin", org=employee["organization_id"], features=["wfh_monitoring"])
     record = saved_image(db, employee)
     link = client.get(f"/api/uploads/{record['_id']}/download-link", headers=bearer(admin, "admin")).json()["url"]
-    claims = jwt.get_unverified_claims(parse_qs(urlparse(link).query)["grant"][0])
+    claims = jwt.decode(parse_qs(urlparse(link).query)["grant"][0], options={"verify_signature": False})
     claims["exp"] = 1
     expired = jwt.encode(claims, auth.SECRET_KEY, algorithm=auth.ALGORITHM)
     assert client.get(f"/api/uploads/{record['_id']}/content", params={"grant": expired}).status_code == 401

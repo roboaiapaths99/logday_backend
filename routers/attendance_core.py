@@ -1,3 +1,4 @@
+from services.inference import run_inference
 from upload_security import SecureMediaRoute
 from fastapi import APIRouter, FastAPI, HTTPException, File, Depends, BackgroundTasks, Request, Query
 from fastapi.concurrency import run_in_threadpool
@@ -48,7 +49,6 @@ except ImportError:
     boto3 = None
     NoCredentialsError = Exception
 
-from jose import jwt
 from database import (
     employees_collection, attendance_logs_collection, settings_collection, admins_collection, 
     organizations_collection, visit_plans_collection, visit_logs_collection, 
@@ -123,7 +123,7 @@ async def verify_presence(req: VerifyPresenceRequest, request: Request, employee
         raise HTTPException(403, "Cannot verify another employee")
 
     # 2. Face Verification
-    is_match, distance = verify_face(req.image, user["face_embedding"])
+    is_match, distance = await run_inference(verify_face, req.image, user["face_embedding"])
     if distance == 1.0:
         raise HTTPException(status_code=400, detail="Biometric data mismatch. Please re-enroll your face in Profile.")
     
@@ -395,7 +395,7 @@ async def smart_attendance(req: VerifyPresenceRequest, request: Request, backgro
         has_valid_face = bool(user.get("face_embedding")) and not is_dummy_embedding(user.get("face_embedding"))
         if not has_valid_face and not is_superadmin and req.image:
             try:
-                new_emb = get_face_embedding(req.image)
+                new_emb = await run_inference(get_face_embedding, req.image)
                 if new_emb is not None and not is_dummy_embedding(new_emb):
                     await employees_collection.update_one(
                         {"_id": user["_id"]},
@@ -416,7 +416,7 @@ async def smart_attendance(req: VerifyPresenceRequest, request: Request, backgro
         # Face Verification (Bypass for Superadmin, checkout, or if no image provided)
         distance = 0.0
         if req.image and user.get("face_embedding") and attendance_type != "check-out":
-            is_match, distance = verify_face(req.image, user["face_embedding"])
+            is_match, distance = await run_inference(verify_face, req.image, user["face_embedding"])
             if not is_match and not is_superadmin:
                 background_tasks.add_task(
                     trigger_alert, "Identity", user.get("email"), user.get("organization_id"), 
@@ -574,7 +574,7 @@ async def smart_attendance(req: VerifyPresenceRequest, request: Request, backgro
 
         # 4. Log Attendance (Consolidated Enterprise Classification)
         attendance_type = req.intended_type or "check-in" # Default or provided
-        settings = org_settings or SystemSettings().dict()
+        settings = org_settings or SystemSettings().model_dump()
         tz_offset = int(settings.get("timezone_offset", 330))
         log_time_utc = datetime.now(timezone.utc)
         current_time_local = log_time_utc + timedelta(minutes=tz_offset)
