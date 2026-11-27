@@ -410,31 +410,35 @@ async def visit_check_in(req: dict, employee=Depends(get_current_employee)):
 async def visit_check_out(req: dict, background_tasks: BackgroundTasks, employee=Depends(get_current_employee)):
     """Log check-out with remarks, media, person met, and outcome."""
     try:
-        # Security: Verify that this visit belongs to the organization
-        visit = await visit_logs_collection.find_one({"_id": ObjectId(req["visit_id"])})
-        if not visit or visit["organization_id"] != employee["organization_id"]:
-             raise HTTPException(status_code=403, detail="Access denied: Visit record not found or cross-org violation.")
+        raw_visit_id = str(req.get("visit_id") or "").strip()
+        if not raw_visit_id or not ObjectId.is_valid(raw_visit_id):
+            raise HTTPException(status_code=400, detail="Invalid or missing visit_id")
+        visit_obj_id = ObjectId(raw_visit_id)
+
+        # Security: Verify that this visit belongs to BOTH the organization AND the logged-in employee
+        visit = await visit_logs_collection.find_one({"_id": visit_obj_id})
+        emp_email = (employee.get("email") or "").strip().lower()
+        visit_owner = (visit.get("employee_id") or visit.get("employee_email") or "").strip().lower() if visit else ""
+        if not visit or visit.get("organization_id") != employee.get("organization_id") or (visit_owner and visit_owner != emp_email):
+            raise HTTPException(status_code=403, detail="Access denied: Visit record not found or ownership violation.")
 
         # --- Optional Face Verification for Check-out ---
         face_verified = True
         if req.get("selfie_base64"):
             try:
-                # Get employee's enrolled descriptor
                 target_descriptor = employee.get("face_embedding")
                 if target_descriptor:
-                    # Verify provided selfie
                     from services.inference import run_inference
                     is_match, score = await run_inference(verify_face, req["selfie_base64"], target_descriptor)
                     face_verified = is_match
                     if not is_match:
-                        # Alert admin but don't block check-out (could be lighting etc)
                         await trigger_alert(
                             "Identity", 
                             employee["email"], 
                             employee["organization_id"],
-                            f"Face mismatch during check-out for visit {req['visit_id']}.",
+                            f"Face mismatch during check-out for visit {raw_visit_id}.",
                             "high",
-                            {"id": req['visit_id'], "score": score}
+                            {"id": raw_visit_id, "score": score}
                         )
                 else:
                     logger.warning(f"Employee {employee['email']} has no enrolled face for verification.")
@@ -453,10 +457,13 @@ async def visit_check_out(req: dict, background_tasks: BackgroundTasks, employee
         if req.get("site_photo_base64"):
             site_photo_url = await save_local_image(req["site_photo_base64"], employee, "field_media", "site_photos")
 
+        out_lat = req.get("lat") if req.get("lat") is not None else req.get("latitude")
+        out_lng = req.get("lng") if req.get("lng") is not None else (req.get("long") if req.get("long") is not None else req.get("longitude"))
+
         update_data = {
             "check_out_time": datetime.now(timezone.utc),
-            "check_out_lat": req["lat"],
-            "check_out_lng": req["lng"],
+            "check_out_lat": out_lat,
+            "check_out_lng": out_lng,
             "remarks": req.get("remarks"),
             "outcome": req.get("outcome"),
             "order_captured": req.get("order_captured", False),
@@ -471,7 +478,7 @@ async def visit_check_out(req: dict, background_tasks: BackgroundTasks, employee
         }
         
         await visit_logs_collection.update_one(
-            {"_id": ObjectId(req["visit_id"])},
+            {"_id": visit_obj_id},
             {"$set": update_data}
         )
         await employees_collection.update_one(
@@ -727,17 +734,40 @@ async def sync_offline_batch(req: SyncBatchRequest, background_tasks: Background
         raise HTTPException(status_code=500, detail="Batch synchronization failed")
 
 
+async def _get_admin_field_scope_query(admin, base_query: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Scope field admin queries by organization_id and manager team hierarchy."""
+    query = dict(base_query or {})
+    if not _is_superadmin(admin) and getattr(admin, "organization_id", None):
+        query["organization_id"] = admin.organization_id
+    if getattr(admin, "role", None) in (AdminRole.MANAGER, "manager"):
+        scoped_emails = await get_scoped_employee_emails(admin)
+        scoped_emp_ids = await get_scoped_employee_employee_ids(admin)
+        allowed_ids = list(set((scoped_emails or []) + (scoped_emp_ids or [])))
+        if "employee_id" in query and isinstance(query["employee_id"], str):
+            if query["employee_id"] not in allowed_ids:
+                query["employee_id"] = "__unauthorized__"
+        else:
+            query["employee_id"] = {"$in": allowed_ids}
+    return query
+
+
 @router.get("/api/field/km-suggestion")
 async def get_km_suggestion(employee=Depends(get_current_employee)):
     """Calculate suggested KM for today based on active duty pings."""
     try:
-        now = datetime.now(timezone.utc)
-        start_of_day = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
-        
-        pings = await location_pings_collection.find({
+        org_id = employee.get("organization_id")
+        org_settings = await get_effective_org_settings(org_id) if org_id else {}
+        tz_offset = org_settings.get("timezone_offset", employee.get("timezone_offset", 330))
+        start_of_day = get_today_start(tz_offset)
+
+        ping_query = {
             "employee_id": employee["email"],
             "recorded_at": {"$gte": start_of_day}
-        }).sort("recorded_at", 1).to_list(length=2000)
+        }
+        if org_id:
+            ping_query["organization_id"] = org_id
+
+        pings = await location_pings_collection.find(ping_query).sort("recorded_at", 1).to_list(length=2000)
         
         total_km = 0.0
         if len(pings) > 1:
@@ -759,24 +789,28 @@ async def submit_km_reimbursement(req: dict, employee=Depends(get_current_employ
     try:
         date_str = req.get("date") or datetime.now(timezone.utc).strftime("%Y-%m-%d")
         total_km = float(req.get("total_km", 0))
+        org_id = employee.get("organization_id")
         
-        # Check if already claimed for this date
-        existing = await km_reimbursements_collection.find_one({
+        # Check if already claimed for this date within the organization
+        existing_query = {
             "employee_id": employee["email"],
             "date": date_str
-        })
+        }
+        if org_id:
+            existing_query["organization_id"] = org_id
+        existing = await km_reimbursements_collection.find_one(existing_query)
         if existing:
             raise HTTPException(status_code=400, detail=f"KM reimbursement already claimed for {date_str}")
         
         # Fetch dynamic rate from organization settings
-        org_settings = await settings_collection.find_one({"organization_id": employee["organization_id"]})
+        org_settings = await settings_collection.find_one({"organization_id": org_id})
         rate_per_km = 10.0 # Default
         if org_settings and "field_rate_per_km" in org_settings:
             rate_per_km = float(org_settings["field_rate_per_km"])
         
         claim = {
             "employee_id": employee["email"],
-            "organization_id": employee["organization_id"],
+            "organization_id": org_id,
             "date": date_str,
             "total_km": total_km,
             "rate_per_km": rate_per_km,
@@ -787,6 +821,8 @@ async def submit_km_reimbursement(req: dict, employee=Depends(get_current_employ
         
         result = await km_reimbursements_collection.insert_one(claim)
         return {"success": True, "claim_id": str(result.inserted_id)}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Failed to submit KM reimbursement: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -795,16 +831,16 @@ async def submit_km_reimbursement(req: dict, employee=Depends(get_current_employ
 @router.get("/admin/field/reimbursements")
 async def admin_list_km_claims(status: Optional[str] = "pending", admin=Depends(require_feature("war_room"))):
     """List KM reimbursement claims for approval."""
-    query = {}
-    if admin.organization_id:
-        query["organization_id"] = admin.organization_id
-    if status:
-        query["status"] = status
+    base_query = {"status": status} if status else {}
+    query = await _get_admin_field_scope_query(admin, base_query)
         
     claims = await km_reimbursements_collection.find(query).sort("created_at", -1).to_list(length=200)
     
     emp_emails = list({c["employee_id"] for c in claims if c.get("employee_id")})
-    employees = await employees_collection.find({"email": {"$in": emp_emails}}, {"email": 1, "full_name": 1}).to_list(length=len(emp_emails))
+    emp_lookup_query = {"email": {"$in": emp_emails}}
+    if admin.organization_id:
+        emp_lookup_query["organization_id"] = admin.organization_id
+    employees = await employees_collection.find(emp_lookup_query, {"email": 1, "full_name": 1}).to_list(length=len(emp_emails) + 1)
     emp_map = {e["email"]: e["full_name"] for e in employees}
 
     for c in claims:
@@ -819,11 +855,11 @@ async def admin_list_km_claims(status: Optional[str] = "pending", admin=Depends(
 @router.post("/admin/field/reimbursements/{claim_id}/{action}")
 async def process_km_reimbursement(claim_id: str, action: str, admin=Depends(require_feature("war_room"))):
     "Approve or Reject a KM reimbursement claim."
+    if not ObjectId.is_valid(claim_id):
+        raise HTTPException(status_code=400, detail="Invalid claim ID")
+
     new_status = "approved" if action == "approve" else "rejected"
-    
-    query = {"_id": ObjectId(claim_id)}
-    if admin.organization_id:
-        query["organization_id"] = admin.organization_id
+    query = await _get_admin_field_scope_query(admin, {"_id": ObjectId(claim_id)})
 
     update_data = {
         "status": new_status,
@@ -846,23 +882,31 @@ async def process_km_reimbursement(claim_id: str, action: str, admin=Depends(req
 async def get_agent_trail(employee_email: str, admin=Depends(require_feature("war_room"))):
     """Fetch today's location trail for a specific agent (Admin only)."""
     try:
-        now = datetime.now(timezone.utc)
-        start_of_day = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
-        
         base_filter = get_employee_filter(admin)
         emp_query = {"email": employee_email, **base_filter}
         
-        emp = await employees_collection.find_one(emp_query)
+        emp = await employees_collection.find_one(emp_query, {"face_embedding": 0, "hashed_password": 0})
         if not emp:
             raise HTTPException(status_code=404, detail="Employee not found or unauthorized")
 
-        pings = await location_pings_collection.find({
+        org_id = emp.get("organization_id") or getattr(admin, "organization_id", None)
+        org_settings = await get_effective_org_settings(org_id) if org_id else {}
+        tz_offset = org_settings.get("timezone_offset", emp.get("timezone_offset", 330))
+        start_of_day = get_today_start(tz_offset)
+
+        ping_query = {
             "employee_id": employee_email,
             "recorded_at": {"$gte": start_of_day}
-        }).sort("recorded_at", 1).to_list(length=2000)
+        }
+        if org_id:
+            ping_query["organization_id"] = org_id
+
+        pings = await location_pings_collection.find(ping_query).sort("recorded_at", 1).to_list(length=2000)
         
         trail = [[p["lat"], p["lng"]] for p in pings]
         return {"trail": trail}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Trail fetch failed: {e}")
         return {"trail": []}
@@ -874,27 +918,37 @@ async def get_field_day_summary(employee_id: str, date: Optional[str] = None, cu
     # Privacy Enforcement
     if employee_id != current_user["email"]:
         raise HTTPException(status_code=403, detail="Access denied: Cannot view another agent's summary.")
-        
-    today_start = get_today_start(current_user.get("timezone_offset", 0))
-    query_date = date or today_start.strftime("%Y-%m-%d")
+
+    org_id = current_user.get("organization_id")
+    org_settings_doc = await get_effective_org_settings(org_id) if org_id else {}
+    tz_offset = org_settings_doc.get("timezone_offset", current_user.get("timezone_offset", 330))
+    today_start = get_today_start(tz_offset)
+    local_now = datetime.now(timezone.utc) + timedelta(minutes=tz_offset)
+    query_date = date or local_now.strftime("%Y-%m-%d")
     
     # 1. Total Visits
-    visits = await visit_logs_collection.count_documents({
+    visit_query = {
         "employee_id": employee_id,
         "date": query_date,
         "status": "completed"
-    })
+    }
+    if org_id:
+        visit_query["organization_id"] = org_id
+    visits = await visit_logs_collection.count_documents(visit_query)
     
     # 2. Total KM (Sum of suggested KM or accepted claims for today)
     # For now, we'll try to get it from location pings if recorded
     total_km = 0.0
-    pings = await location_pings_collection.find({
+    ping_query = {
         "employee_id": employee_id,
         "recorded_at": {
             "$gte": today_start,
             "$lt": today_start + timedelta(days=1)
         }
-    }).sort("recorded_at", 1).to_list(length=1000)
+    }
+    if org_id:
+        ping_query["organization_id"] = org_id
+    pings = await location_pings_collection.find(ping_query).sort("recorded_at", 1).to_list(length=1000)
     
     if len(pings) > 1:
         for i in range(len(pings)-1):
@@ -906,7 +960,7 @@ async def get_field_day_summary(employee_id: str, date: Optional[str] = None, cu
         total_km = total_km / 1000.0 # Convert to KM
     
     # 3. Current Attendance Status and Classification (TODAY ONLY)
-    today_field_logs = await attendance_logs_collection.find({
+    att_query = {
         "$or": [
             {"email": employee_id},
             {"user_id": employee_id},
@@ -914,14 +968,13 @@ async def get_field_day_summary(employee_id: str, date: Optional[str] = None, cu
             {"user_id": employee_id.lower().strip()}
         ],
         "timestamp": {"$gte": today_start}
-    }).sort("timestamp", 1).to_list(length=100)
+    }
+    if org_id:
+        att_query["organization_id"] = org_id
+    today_field_logs = await attendance_logs_collection.find(att_query).sort("timestamp", 1).to_list(length=100)
 
     first_in_log = next((l for l in today_field_logs if l.get("type") in ["check-in", "IN"]), None)
     last_out_log = next((l for l in reversed(today_field_logs) if l.get("type") in ["check-out", "OUT"]), None)
-
-    org_id = current_user.get("organization_id")
-    org_settings_doc = await get_effective_org_settings(org_id) if org_id else {}
-    tz_offset = org_settings_doc.get("timezone_offset", current_user.get("timezone_offset", 330))
 
     first_in_local = (first_in_log["timestamp"] + timedelta(minutes=tz_offset)) if first_in_log else None
     last_out_local = (last_out_log["timestamp"] + timedelta(minutes=tz_offset)) if last_out_log else None
@@ -1043,18 +1096,18 @@ async def update_territory(email: str, req: dict, admin=Depends(require_feature(
 async def get_plans_for_approval(status: str = "submitted", admin=Depends(require_feature("war_room"))):
     """List visit plans with filtering, execution progress, and proof media."""
     from collections import defaultdict
-    query = {}
-    if admin.organization_id:
-        query["organization_id"] = admin.organization_id
-    if status and status != "all":
-        query["status"] = status
+    base_query = {"status": status} if (status and status != "all") else {}
+    query = await _get_admin_field_scope_query(admin, base_query)
 
     plans = await visit_plans_collection.find(query).sort([("date", -1), ("_id", -1)]).to_list(length=150)
     
     # Enrichment: Add employee names and details
     emp_ids = list({p["employee_id"] for p in plans if p.get("employee_id")})
+    emp_lookup_query = {"$or": [{"employee_id": {"$in": emp_ids}}, {"email": {"$in": emp_ids}}]}
+    if admin.organization_id:
+        emp_lookup_query["organization_id"] = admin.organization_id
     employees = await employees_collection.find(
-        {"$or": [{"employee_id": {"$in": emp_ids}}, {"email": {"$in": emp_ids}}]},
+        emp_lookup_query,
         {"employee_id": 1, "email": 1, "full_name": 1, "phone": 1}
     ).to_list(length=len(emp_ids) * 2 + 10)
     
@@ -1174,17 +1227,25 @@ async def get_plans_for_approval(status: str = "submitted", admin=Depends(requir
 @router.post("/admin/field/visit-plans/{plan_id}/{action}")
 async def process_visit_plan(plan_id: str, action: str, admin=Depends(require_feature("war_room"))):
     """Approve or Reject a visit plan."""
+    if not ObjectId.is_valid(plan_id):
+        raise HTTPException(status_code=400, detail="Invalid plan ID")
+
     new_status = PlanStatus.APPROVED if action == "approve" else PlanStatus.REJECTED
+    query = await _get_admin_field_scope_query(admin, {"_id": ObjectId(plan_id)})
     result = await visit_plans_collection.update_one(
-        {"_id": ObjectId(plan_id)},
+        query,
         {"$set": {"status": new_status, "processed_at": datetime.now(timezone.utc)}}
     )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Plan not found or access denied")
     return {"status": "success"}
 
 
 @router.put("/admin/field/visit-plans/{plan_id}")
 async def update_visit_plan(plan_id: str, req: dict, admin=Depends(require_feature("war_room"))):
     """Update a visit plan (reorder stops, edit details, add comments) before or after approval."""
+    if not ObjectId.is_valid(plan_id):
+        raise HTTPException(status_code=400, detail="Invalid plan ID")
     try:
         # Extract stops and comments from request
         stops = req.get("stops")
@@ -1198,15 +1259,18 @@ async def update_visit_plan(plan_id: str, req: dict, admin=Depends(require_featu
             update_data["reviewed_at"] = datetime.now(timezone.utc)
             update_data["reviewed_by"] = admin.email
 
+        query = await _get_admin_field_scope_query(admin, {"_id": ObjectId(plan_id)})
         result = await visit_plans_collection.update_one(
-            {"_id": ObjectId(plan_id)},
+            query,
             {"$set": update_data}
         )
         
         if result.matched_count == 0:
-            raise HTTPException(status_code=404, detail="Plan not found")
+            raise HTTPException(status_code=404, detail="Plan not found or access denied")
             
         return {"status": "success", "message": "Plan updated successfully"}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Failed to update plan: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -1443,8 +1507,11 @@ async def submit_expense(req: dict, employee=Depends(get_current_employee)):
 @router.get("/api/field/expenses")
 async def get_my_expenses(employee=Depends(get_current_employee)):
     """Field employee fetches their own expense claims."""
+    query = {"employee_id": employee["email"]}
+    if employee.get("organization_id"):
+        query["organization_id"] = employee["organization_id"]
     claims = await expense_claims_collection.find(
-        {"employee_id": employee["email"]}
+        query
     ).sort("created_at", -1).to_list(length=100)
     for c in claims:
         c["_id"] = str(c["_id"])
@@ -1458,16 +1525,16 @@ async def get_my_expenses(employee=Depends(get_current_employee)):
 @router.get("/admin/expenses")
 async def admin_list_expenses(status: Optional[str] = None, admin=Depends(require_feature("expenses"))):
     """Admin fetches all expense claims, optionally filtered by status."""
-    query = {}
-    if admin.organization_id:
-        query["organization_id"] = admin.organization_id
-    if status:
-        query["status"] = status
+    base_query = {"status": status} if status else {}
+    query = await _get_admin_field_scope_query(admin, base_query)
     
     claims = await expense_claims_collection.find(query).sort("created_at", -1).to_list(length=200)
     
     emp_emails = list({c.get("employee_id") for c in claims if c.get("employee_id")})
-    employees = await employees_collection.find({"email": {"$in": emp_emails}}, {"email": 1, "full_name": 1}).to_list(length=len(emp_emails))
+    emp_lookup_query = {"email": {"$in": emp_emails}}
+    if admin.organization_id:
+        emp_lookup_query["organization_id"] = admin.organization_id
+    employees = await employees_collection.find(emp_lookup_query, {"email": 1, "full_name": 1}).to_list(length=len(emp_emails) + 1)
     emp_map = {e["email"]: e["full_name"] for e in employees}
 
     for c in claims:
@@ -1483,12 +1550,11 @@ async def admin_list_expenses(status: Optional[str] = None, admin=Depends(requir
 @router.put("/admin/expenses/{claim_id}")
 async def admin_update_expense(claim_id: str, req: dict, admin=Depends(require_feature("expenses"))):
     """Admin approves, rejects, or queries an expense claim."""
-    from bson import ObjectId
+    if not ObjectId.is_valid(claim_id):
+        raise HTTPException(status_code=400, detail="Invalid claim ID")
+
     action = req.get("action", "approve")  # approve | reject | query
-    
-    query = {"_id": ObjectId(claim_id)}
-    if admin.organization_id:
-        query["organization_id"] = admin.organization_id
+    query = await _get_admin_field_scope_query(admin, {"_id": ObjectId(claim_id)})
 
     update_fields = {}
     if action == "approve":
@@ -1520,18 +1586,22 @@ async def get_alerts(
     admin=Depends(require_feature("war_room"))
 ):
     """Retrieve filtered security and operational alerts."""
-    query = {"organization_id": admin.organization_id}
-    if type: query["type"] = type
-    if severity: query["severity"] = severity
-    if status and status != "all": query["status"] = status
-    if employee_id: query["employee_id"] = employee_id
+    base_query = {}
+    if type: base_query["type"] = type
+    if severity: base_query["severity"] = severity
+    if status and status != "all": base_query["status"] = status
+    if employee_id: base_query["employee_id"] = employee_id
     if source:
-        query["metadata.source"] = source
+        base_query["metadata.source"] = source
 
+    query = await _get_admin_field_scope_query(admin, base_query)
     alerts = await alerts_collection.find(query).sort("timestamp", -1).to_list(length=100)
     
     emp_emails = list({a["employee_id"] for a in alerts if a.get("employee_id")})
-    employees = await employees_collection.find({"email": {"$in": emp_emails}}, {"email": 1, "full_name": 1}).to_list(length=len(emp_emails))
+    emp_lookup_query = {"email": {"$in": emp_emails}}
+    if admin.organization_id:
+        emp_lookup_query["organization_id"] = admin.organization_id
+    employees = await employees_collection.find(emp_lookup_query, {"email": 1, "full_name": 1}).to_list(length=len(emp_emails) + 1)
     emp_map = {e["email"]: e["full_name"] for e in employees}
 
     for a in alerts:
@@ -1546,13 +1616,16 @@ async def get_alerts(
 @router.put("/admin/field/alerts/{alert_id}")
 async def update_alert_status(alert_id: str, req: dict, admin=Depends(require_feature("war_room"))):
     """Update alert status (resolved, dismissed)."""
-    from bson import ObjectId
+    if not ObjectId.is_valid(alert_id):
+        raise HTTPException(status_code=400, detail="Invalid alert ID")
+
     status = req.get("status")
     if status not in ["resolved", "dismissed", "pending"]:
         raise HTTPException(status_code=400, detail="Invalid status")
 
+    query = await _get_admin_field_scope_query(admin, {"_id": ObjectId(alert_id)})
     result = await alerts_collection.update_one(
-        {"_id": ObjectId(alert_id), "organization_id": admin.organization_id},
+        query,
         {"$set": {"status": status, "resolved_at": datetime.now(timezone.utc)}}
     )
     if result.matched_count == 0:
@@ -1563,20 +1636,12 @@ async def update_alert_status(alert_id: str, req: dict, admin=Depends(require_fe
 @router.get("/admin/field/heatmap-data")
 async def get_heatmap_data(admin=Depends(require_feature("war_room"))):
     """Aggregation of pings for heatmap visualization."""
-    now = datetime.now(timezone.utc)
-    start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    
-    base_filter = get_employee_filter(admin)
-    query = {"recorded_at": {"$gte": start_of_day}}
-    
-    if "organization_id" in base_filter:
-        query["organization_id"] = base_filter["organization_id"]
-        
-    if "manager_id" in base_filter:
-        team = await employees_collection.find({"manager_id": base_filter["manager_id"]}).to_list(length=100)
-        team_emails = [e["email"] for e in team]
-        query["employee_id"] = {"$in": team_emails}
-        
+    org_id = getattr(admin, "organization_id", None)
+    org_settings = await get_effective_org_settings(org_id) if org_id else {}
+    tz_offset = org_settings.get("timezone_offset", 330)
+    start_of_day = get_today_start(tz_offset)
+
+    query = await _get_admin_field_scope_query(admin, {"recorded_at": {"$gte": start_of_day}})
     pings = await location_pings_collection.find(query).to_list(length=5000)
     
     # Format for Leaflet.heat: [[lat, lng, intensity], ...]
@@ -1685,17 +1750,35 @@ async def get_field_leaderboard(employee=Depends(get_current_employee)):
 
     results = await visit_logs_collection.aggregate(pipeline).to_list(length=10)
 
+    top_ids = [row["_id"] for row in results if row.get("_id")]
+    emp_lookup_query = {"$or": [{"email": {"$in": top_ids}}, {"employee_id": {"$in": top_ids}}]}
+    if org_id:
+        emp_lookup_query["organization_id"] = org_id
+    emp_docs = await employees_collection.find(
+        emp_lookup_query,
+        {"email": 1, "employee_id": 1, "full_name": 1, "designation": 1}
+    ).to_list(length=len(top_ids) * 2 + 1)
+    emp_map = {}
+    for e in emp_docs:
+        if e.get("email"):
+            emp_map[e["email"]] = e
+        if e.get("employee_id"):
+            emp_map[e["employee_id"]] = e
+
     leaderboard = []
     for idx, row in enumerate(results):
-        emp = await employees_collection.find_one({"email": row["_id"]})
-        emp_name = emp["full_name"] if emp else row["_id"]
+        emp = emp_map.get(row["_id"])
+        emp_name = emp.get("full_name", row["_id"]) if emp else row["_id"]
         emp_designation = emp.get("designation", "Field Agent") if emp else "Field Agent"
 
         # Sum KM for the week from location pings
-        pings = await location_pings_collection.find({
+        ping_query = {
             "employee_id": row["_id"],
             "recorded_at": {"$gte": week_start, "$lt": week_end}
-        }).sort("recorded_at", 1).to_list(length=5000)
+        }
+        if org_id:
+            ping_query["organization_id"] = org_id
+        pings = await location_pings_collection.find(ping_query).sort("recorded_at", 1).to_list(length=5000)
 
         total_km = 0.0
         for i in range(1, len(pings)):

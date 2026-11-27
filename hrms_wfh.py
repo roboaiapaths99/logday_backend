@@ -8,6 +8,7 @@ from database import wfh_requests_collection, employees_collection, settings_col
 from auth import get_current_employee, get_current_admin
 from models import Admin, WFHStatus, EmployeeType
 from permissions import require_feature
+from services.common_helpers import get_employee_filter, get_scoped_employee_emails
 
 router = APIRouter(route_class=SecureMediaRoute, tags=["WFH Management"])
 
@@ -88,7 +89,11 @@ async def create_wfh_request(req_data: dict, employee=Depends(get_current_employ
 async def get_my_wfh_requests(employee=Depends(get_current_employee)):
     """Fetch WFH requests for the logged-in employee."""
     email = employee["email"].strip().lower()
-    requests = await wfh_requests_collection.find({"employee_email": email}).sort("date", -1).to_list(length=100)
+    org_id = employee.get("organization_id")
+    query = {"employee_email": email}
+    if org_id:
+        query["organization_id"] = org_id
+    requests = await wfh_requests_collection.find(query).sort("date", -1).to_list(length=100)
     for r in requests:
         r["_id"] = str(r["_id"])
         if r.get("created_at"):
@@ -107,7 +112,11 @@ async def cancel_wfh_request(request_id: str, employee=Depends(get_current_emplo
         raise HTTPException(status_code=400, detail="Invalid request ID")
 
     email = employee["email"].strip().lower()
-    req = await wfh_requests_collection.find_one({"_id": obj_id, "employee_email": email})
+    org_id = employee.get("organization_id")
+    query = {"_id": obj_id, "employee_email": email}
+    if org_id:
+        query["organization_id"] = org_id
+    req = await wfh_requests_collection.find_one(query)
     if not req:
         raise HTTPException(status_code=404, detail="WFH request not found")
 
@@ -120,15 +129,25 @@ async def cancel_wfh_request(request_id: str, employee=Depends(get_current_emplo
 
 # ─── Admin Endpoints ────────────────────────────────────────────
 
+async def _build_scoped_wfh_request_query(admin: Admin) -> dict:
+    org_id = admin.organization_id
+    query: dict = {}
+    if org_id and org_id != "system_org" and getattr(admin, "role", "") != "superadmin":
+        query["organization_id"] = org_id
+    if getattr(admin, "role", "") == "manager":
+        scoped_emails = await get_scoped_employee_emails(admin)
+        query["employee_email"] = {"$in": [e.strip().lower() for e in scoped_emails if e]}
+    return query
+
+
 @router.get("/admin/wfh/requests")
 async def get_wfh_requests(
     status: Optional[str] = None,
     month: Optional[str] = None,
     admin: Admin = Depends(require_feature("wfh_management"))
 ):
-    """List WFH requests for the admin's organization, with filters."""
-    org_id = admin.organization_id
-    query = {"organization_id": org_id}
+    """List WFH requests for the admin's organization/team, with filters."""
+    query = await _build_scoped_wfh_request_query(admin)
 
     if status:
         query["status"] = status
@@ -155,8 +174,8 @@ async def approve_wfh_request(request_id: str, admin: Admin = Depends(require_fe
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid request ID")
 
-    org_id = admin.organization_id
-    req = await wfh_requests_collection.find_one({"_id": obj_id, "organization_id": org_id})
+    scope_query = await _build_scoped_wfh_request_query(admin)
+    req = await wfh_requests_collection.find_one({"_id": obj_id, **scope_query})
     if not req:
         raise HTTPException(status_code=404, detail="WFH request not found")
 
@@ -174,8 +193,6 @@ async def approve_wfh_request(request_id: str, admin: Admin = Depends(require_fe
         }
     )
 
-    # Optional: Update employee status for hybrid tracking if needed
-    # But checking wfh_requests is primary
     return {"status": "success", "message": "WFH request approved successfully"}
 
 
@@ -195,8 +212,8 @@ async def reject_wfh_request(
     if not reason:
          raise HTTPException(status_code=400, detail="Rejection reason is required")
 
-    org_id = admin.organization_id
-    req = await wfh_requests_collection.find_one({"_id": obj_id, "organization_id": org_id})
+    scope_query = await _build_scoped_wfh_request_query(admin)
+    req = await wfh_requests_collection.find_one({"_id": obj_id, **scope_query})
     if not req:
         raise HTTPException(status_code=404, detail="WFH request not found")
 
@@ -225,10 +242,9 @@ async def get_wfh_calendar(
     """
     Get WFH calendar data showing who is approved/pending WFH for each day of the month.
     """
-    org_id = admin.organization_id
-    # Fetch all requests for this month
+    scope_query = await _build_scoped_wfh_request_query(admin)
     query = {
-        "organization_id": org_id,
+        **scope_query,
         "date": {"$regex": f"^{month}"},
         "status": {"$in": ["approved", "pending"]}
     }
@@ -259,28 +275,31 @@ async def get_wfh_stats(admin: Admin = Depends(require_feature("wfh_management")
     tz_offset = int((s_doc or {}).get("timezone_offset", 330))
     today_str = (datetime.now(timezone.utc) + timedelta(minutes=tz_offset)).strftime("%Y-%m-%d")
 
+    scope_query = await _build_scoped_wfh_request_query(admin)
+    emp_filter = get_employee_filter(admin)
+
     # Counts
     today_wfh_approved = await wfh_requests_collection.count_documents({
-        "organization_id": org_id,
+        **scope_query,
         "date": today_str,
         "status": "approved"
     })
 
     pending_requests = await wfh_requests_collection.count_documents({
-        "organization_id": org_id,
+        **scope_query,
         "status": "pending"
     })
 
     # Permanent WFH count
     permanent_wfh = await employees_collection.count_documents({
-        "organization_id": org_id,
+        **emp_filter,
         "employee_type": "wfh"
     })
 
     # Approved this month (matching current YYYY-MM)
     current_month_str = today_str[:7]
     approved_this_month = await wfh_requests_collection.count_documents({
-        "organization_id": org_id,
+        **scope_query,
         "date": {"$regex": f"^{current_month_str}"},
         "status": "approved"
     })
@@ -289,7 +308,7 @@ async def get_wfh_stats(admin: Admin = Depends(require_feature("wfh_management")
     today_wfh_list = []
     # 1. Approved requests
     approved_reqs = await wfh_requests_collection.find({
-        "organization_id": org_id,
+        **scope_query,
         "date": today_str,
         "status": "approved"
     }).to_list(length=100)
@@ -303,7 +322,7 @@ async def get_wfh_stats(admin: Admin = Depends(require_feature("wfh_management")
 
     # 2. Permanent WFH employees
     perm_emps = await employees_collection.find({
-        "organization_id": org_id,
+        **emp_filter,
         "employee_type": "wfh"
     }, {"email": 1, "full_name": 1}).to_list(length=100)
 
@@ -329,9 +348,8 @@ async def get_wfh_stats(admin: Admin = Depends(require_feature("wfh_management")
 @router.get("/admin/wfh/policies")
 async def get_wfh_policies(admin: Admin = Depends(require_feature("wfh_management"))):
     """List employees and their WFH policy settings."""
-    org_id = admin.organization_id
     employees = await employees_collection.find(
-        {"organization_id": org_id},
+        get_employee_filter(admin),
         {"email": 1, "full_name": 1, "employee_type": 1, "allowed_wfh_days_per_month": 1, "department": 1, "designation": 1}
     ).to_list(length=1000)
 
@@ -356,10 +374,9 @@ async def update_wfh_policy(
     admin: Admin = Depends(require_feature("wfh_management"))
 ):
     """Update employee's WFH type/policy."""
-    org_id = admin.organization_id
     email = employee_email.strip().lower()
 
-    emp = await employees_collection.find_one({"email": email, "organization_id": org_id})
+    emp = await employees_collection.find_one({"email": email, **get_employee_filter(admin)})
     if not emp:
         raise HTTPException(status_code=404, detail="Employee not found")
 

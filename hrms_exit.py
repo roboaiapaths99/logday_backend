@@ -354,16 +354,16 @@ async def calculate_settlement(id: str, req: dict, current_admin: Admin = Depend
     if not emp:
         raise HTTPException(status_code=400, detail="Employee not found")
         
-    sal = _resolve_employee_salary_structure(emp)
-    if not sal:
+    sal = await _resolve_employee_salary_structure(emp)
+    if not sal or not sal.get("ctc"):
         latest_payroll = await payrolls_collection.find_one(
             {"employee_email": exit_doc["employee_email"], "organization_id": exit_doc["organization_id"]},
             sort=[("payroll_month", -1)]
         )
         if latest_payroll:
             gross_val = float(latest_payroll.get("gross_salary") or latest_payroll.get("basic_salary") or 0.0)
-            sal = {"ctc": gross_val * 12.0, "gross_monthly": gross_val}
-        else:
+            sal = {"ctc": float(latest_payroll.get("ctc") or (gross_val * 12.0)), "gross_monthly": gross_val}
+        elif not sal:
             sal = {"ctc": 0.0, "gross_monthly": 0.0}
 
     ctc = float(sal.get("ctc", 0.0) or 0.0)
@@ -492,17 +492,27 @@ async def complete_exit(id: str, current_admin: Admin = Depends(require_feature(
         }}
     )
     
-    # Deactivate the employee account in database
+    # Deactivate the employee account in database and revoke all active sessions
     email_clean = exit_doc["employee_email"].strip().lower()
+    emp = await employees_collection.find_one({"email": email_clean, "organization_id": exit_doc["organization_id"]})
     await employees_collection.update_one(
         {"email": email_clean, "organization_id": exit_doc["organization_id"]},
-        {"$set": {
-            "status": "Inactive",
-            "is_active": False,
-            "last_working_day": exit_doc["last_working_day"]
-        }}
+        {
+            "$set": {
+                "status": "Inactive",
+                "is_active": False,
+                "last_working_day": exit_doc["last_working_day"]
+            },
+            "$inc": {"auth_version": 1}
+        }
     )
-    
+    if emp:
+        from database import auth_sessions_collection
+        await auth_sessions_collection.update_many(
+            {"account_id": str(emp["_id"]), "account_type": "employee"},
+            {"$set": {"revoked": True}}
+        )
+
     return {
         "message": "Exit process completed successfully. Employee account set to Inactive.",
         "status": "completed"
@@ -519,15 +529,18 @@ from auth import get_current_employee
 async def get_my_exit_clearance(employee=Depends(get_current_employee)):
     """Fetch the active resignation & exit clearance workflow for the logged-in employee."""
     clean_email = employee["email"].strip().lower()
+    org_id = employee.get("organization_id")
+    org_scope = {"organization_id": org_id} if org_id else {}
     exit_doc = await exit_managements_collection.find_one({
         "employee_email": clean_email,
+        **org_scope,
         "status": {"$in": [ExitStatus.PENDING, ExitStatus.IN_PROGRESS, ExitStatus.COMPLETED]}
     })
     
     if not exit_doc:
-        # Also try searching by employee_id
+        # Also try searching by employee_id within the same organization
         emp_id = str(employee.get("_id", ""))
-        exit_doc = await exit_managements_collection.find_one({"employee_id": emp_id})
+        exit_doc = await exit_managements_collection.find_one({"employee_id": emp_id, **org_scope})
         
     if not exit_doc:
         raise HTTPException(status_code=404, detail="No active exit process on file for your account.")
@@ -547,6 +560,7 @@ async def apply_my_resignation(req: dict, employee=Depends(get_current_employee)
     # Check if active process already exists
     existing = await exit_managements_collection.find_one({
         "employee_email": clean_email,
+        "organization_id": org_id,
         "status": {"$in": [ExitStatus.PENDING, ExitStatus.IN_PROGRESS]}
     })
     if existing:
@@ -559,7 +573,7 @@ async def apply_my_resignation(req: dict, employee=Depends(get_current_employee)
     last_working_day = req.get("last_working_day") or req.get("proposed_lwd") or datetime.now(timezone.utc).strftime("%Y-%m-%d")
     reason = req.get("reason") or req.get("exit_reason") or "Resignation"
     handover_notes = req.get("handover_notes") or req.get("notes") or ""
-    now_iso = datetime.now(timezone.utc).isoformat()
+    now_utc = datetime.now(timezone.utc)
 
     new_exit = {
         "employee_id": employee.get("employee_id") or str(employee.get("_id", "")),
@@ -569,7 +583,7 @@ async def apply_my_resignation(req: dict, employee=Depends(get_current_employee)
         "designation": employee.get("designation", "Employee"),
         "department": employee.get("department", "General"),
         "joining_date": employee.get("date_of_joining") or employee.get("joining_date") or "N/A",
-        "resignation_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        "resignation_date": now_utc.strftime("%Y-%m-%d"),
         "last_working_day": last_working_day,
         "notice_period_days": 30,
         "notice_served_days": 30,
@@ -605,13 +619,15 @@ async def apply_my_resignation(req: dict, employee=Depends(get_current_employee)
             "improvement_suggestions": None
         },
         "documents_issued": [],
-        "created_at": now_iso,
-        "updated_at": now_iso,
+        "created_at": now_utc,
+        "updated_at": now_utc,
         "created_by": clean_email
     }
     
     res = await exit_managements_collection.insert_one(new_exit)
     new_exit["_id"] = str(res.inserted_id)
+    new_exit["created_at"] = now_utc.isoformat()
+    new_exit["updated_at"] = now_utc.isoformat()
     return new_exit
 
 
@@ -619,8 +635,11 @@ async def apply_my_resignation(req: dict, employee=Depends(get_current_employee)
 async def submit_my_exit_interview(req: dict, employee=Depends(get_current_employee)):
     """Submit the employee exit questionnaire feedback."""
     clean_email = employee["email"].strip().lower()
+    org_id = employee.get("organization_id")
+    org_scope = {"organization_id": org_id} if org_id else {}
     exit_doc = await exit_managements_collection.find_one({
         "employee_email": clean_email,
+        **org_scope,
         "status": {"$in": [ExitStatus.PENDING, ExitStatus.IN_PROGRESS]}
     })
     if not exit_doc:

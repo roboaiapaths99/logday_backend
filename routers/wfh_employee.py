@@ -250,12 +250,18 @@ async def wfh_checkin(req: dict, employee=Depends(get_current_employee)):
         # Auto-enroll real DeepFace biometric if clear face image is provided
         new_emb = await run_inference(get_face_embedding, face_image)
         if new_emb is not None and not is_dummy_embedding(new_emb):
+            profile_url = employee.get("profile_image")
+            try:
+                from upload_security import save_local_image
+                profile_url = await save_local_image(face_image, employee, "onboarding", "profiles")
+            except Exception as img_err:
+                logger.warning(f"WFH auto-enroll profile image save skipped: {img_err}")
             await employees_collection.update_one(
                 {"_id": employee["_id"]},
                 {"$set": {
                     "face_embedding": new_emb,
                     "needs_face_enrollment": False,
-                    "profile_image": face_image
+                    "profile_image": profile_url
                 }}
             )
             stored_embedding = new_emb

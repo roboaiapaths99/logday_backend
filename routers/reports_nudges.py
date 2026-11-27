@@ -263,6 +263,7 @@ async def agent_performance_report(
     km_pipeline = [
         {"$match": {
             "organization_id": org_id,
+            "employee_id": {"$in": all_identifiers},
             "date": {"$gte": start_dt.strftime("%Y-%m-%d"), "$lte": end_dt.strftime("%Y-%m-%d")}
         }},
         {"$group": {
@@ -272,17 +273,30 @@ async def agent_performance_report(
     ]
     km_stats = await km_reimbursements_collection.aggregate(km_pipeline).to_list(None)
 
+    stat_eids = list({s["_id"] for s in visit_stats if s.get("_id")} | {k["_id"] for k in km_stats if k.get("_id")})
+    emp_lookup = {}
+    if stat_eids:
+        emp_query = {"$or": [{"employee_id": {"$in": stat_eids}}, {"email": {"$in": stat_eids}}]}
+        if org_id:
+            emp_query["organization_id"] = org_id
+        emp_docs = await employees_collection.find(
+            emp_query,
+            {"full_name": 1, "email": 1, "employee_id": 1}
+        ).to_list(length=len(stat_eids) * 2 + 1)
+        for e in emp_docs:
+            if e.get("email"):
+                emp_lookup[e["email"]] = e
+            if e.get("employee_id"):
+                emp_lookup[e["employee_id"]] = e
+
     perf_map = {}
     for stat in visit_stats:
         eid = stat["_id"]
-        emp = await employees_collection.find_one(
-            {"$or": [{"employee_id": eid}, {"email": eid}]},
-            {"full_name": 1, "email": 1, "employee_id": 1}
-        )
+        emp = emp_lookup.get(eid)
         canonical_key = emp["email"] if emp and emp.get("email") else eid
         perf_map[canonical_key] = {
             "employee_id": emp.get("employee_id", eid) if emp else eid,
-            "full_name": emp["full_name"] if emp else "Unknown",
+            "full_name": emp.get("full_name", "Unknown") if emp else "Unknown",
             "total_visits": stat["total_visits"],
             "leads": stat["leads"],
             "orders": stat["orders"],
@@ -291,17 +305,14 @@ async def agent_performance_report(
     
     for kstat in km_stats:
         eid = kstat["_id"]
-        emp = await employees_collection.find_one(
-            {"$or": [{"employee_id": eid}, {"email": eid}]},
-            {"full_name": 1, "email": 1, "employee_id": 1}
-        )
+        emp = emp_lookup.get(eid)
         canonical_key = emp["email"] if emp and emp.get("email") else eid
         if canonical_key in perf_map:
             perf_map[canonical_key]["total_km"] = round(kstat["total_km"], 2)
         else:
             perf_map[canonical_key] = {
                 "employee_id": emp.get("employee_id", eid) if emp else eid,
-                "full_name": emp["full_name"] if emp else "Unknown",
+                "full_name": emp.get("full_name", "Unknown") if emp else "Unknown",
                 "total_visits": 0,
                 "leads": 0,
                 "orders": 0,
@@ -476,17 +487,23 @@ async def send_manager_nudge(req: dict, manager=Depends(get_current_employee)):
         raise HTTPException(status_code=400, detail="Nudge message cannot be empty.")
 
     # If sending to all subordinates or "all" in employee_emails
+    mgr_org_id = manager.get("organization_id")
+    base_sub_filter = {"manager_id": manager["email"], "is_active": {"$ne": False}}
+    if mgr_org_id:
+        base_sub_filter["organization_id"] = mgr_org_id
+
     if recipient_type == "all" or "all" in employee_emails or not employee_emails:
         recipient_type = "all"
-        cursor = employees_collection.find({"manager_id": manager["email"], "is_active": {"$ne": False}})
+        cursor = employees_collection.find(base_sub_filter, {"email": 1, "push_token": 1, "push_tokens": 1})
         subordinates = await cursor.to_list(length=500)
         valid_recipients = [s["email"] for s in subordinates if s.get("email")]
     else:
-        valid_recipients = []
-        for email in employee_emails:
-            emp = await employees_collection.find_one({"email": email, "manager_id": manager["email"]})
-            if emp:
-                valid_recipients.append(email)
+        cursor = employees_collection.find(
+            {**base_sub_filter, "email": {"$in": employee_emails}},
+            {"email": 1, "push_token": 1, "push_tokens": 1}
+        )
+        subordinates = await cursor.to_list(length=len(employee_emails) + 1)
+        valid_recipients = [s["email"] for s in subordinates if s.get("email")]
 
     if not valid_recipients:
         raise HTTPException(status_code=400, detail="No valid team members found in the provided emails.")
@@ -496,7 +513,7 @@ async def send_manager_nudge(req: dict, manager=Depends(get_current_employee)):
     nudge_log = {
         "manager_id": manager["email"],
         "manager_name": manager_name,
-        "organization_id": manager.get("organization_id"),
+        "organization_id": mgr_org_id,
         "recipients": valid_recipients,
         "recipient_type": recipient_type,
         "message": message,
@@ -509,7 +526,7 @@ async def send_manager_nudge(req: dict, manager=Depends(get_current_employee)):
 
     # Collect push tokens for all recipients
     push_tokens = []
-    async for emp in employees_collection.find({"email": {"$in": valid_recipients}}):
+    for emp in subordinates:
         if emp.get("push_token"):
             push_tokens.append(emp["push_token"])
         if isinstance(emp.get("push_tokens"), list):
@@ -576,22 +593,22 @@ async def admin_send_nudge(req: dict, admin=Depends(require_feature("nudge"))):
     if not message:
         raise HTTPException(status_code=400, detail="Nudge message cannot be empty.")
 
+    base_filter = get_employee_filter(admin)
     if recipient_type == "all" or "all" in employee_emails or not employee_emails:
         recipient_type = "all"
-        query = {"is_active": {"$ne": False}}
-        if org_id:
-            query["organization_id"] = org_id
-        all_emps = await employees_collection.find(query).to_list(length=None)
-        valid_recipients = [e["email"] for e in all_emps if e.get("email")]
+        query = {**base_filter, "is_active": {"$ne": False}}
+        target_emps = await employees_collection.find(
+            query,
+            {"email": 1, "push_token": 1, "push_tokens": 1}
+        ).to_list(length=None)
+        valid_recipients = [e["email"] for e in target_emps if e.get("email")]
     else:
-        valid_recipients = []
-        for email in employee_emails:
-            query = {"email": email}
-            if org_id:
-                query["organization_id"] = org_id
-            emp = await employees_collection.find_one(query)
-            if emp:
-                valid_recipients.append(email)
+        query = {**base_filter, "email": {"$in": employee_emails}}
+        target_emps = await employees_collection.find(
+            query,
+            {"email": 1, "push_token": 1, "push_tokens": 1}
+        ).to_list(length=len(employee_emails) + 1)
+        valid_recipients = [e["email"] for e in target_emps if e.get("email")]
 
     if not valid_recipients:
         raise HTTPException(status_code=400, detail="No valid employees found in your organization.")
@@ -614,7 +631,7 @@ async def admin_send_nudge(req: dict, admin=Depends(require_feature("nudge"))):
 
     # Collect push tokens
     push_tokens = []
-    async for emp in employees_collection.find({"email": {"$in": valid_recipients}}):
+    for emp in target_emps:
         if emp.get("push_token"):
             push_tokens.append(emp["push_token"])
         if isinstance(emp.get("push_tokens"), list):
@@ -677,8 +694,12 @@ async def register_push_token(req: dict, emp=Depends(get_current_employee)):
     if not token:
         raise HTTPException(status_code=400, detail="push_token is required.")
         
+    emp_filter = {"_id": emp["_id"]} if emp.get("_id") else {"email": emp["email"]}
+    if emp.get("organization_id"):
+        emp_filter["organization_id"] = emp["organization_id"]
+
     await employees_collection.update_one(
-        {"email": emp["email"]},
+        emp_filter,
         {
             "$set": {
                 "push_token": token,
@@ -702,10 +723,11 @@ async def get_employee_nudges(emp=Depends(get_current_employee)):
     email = emp.get("email")
 
     query = {
+        "organization_id": org_id,
         "$or": [
             {"recipients": email},
-            {"recipient_type": "all", "organization_id": org_id},
-            {"recipients": "all", "organization_id": org_id}
+            {"recipient_type": "all"},
+            {"recipients": "all"}
         ]
     }
     
@@ -734,15 +756,26 @@ async def get_employee_nudges(emp=Depends(get_current_employee)):
 @router.post("/api/employee/nudges/{nudge_id}/read")
 async def mark_nudge_read(nudge_id: str, emp=Depends(get_current_employee)):
     """Mark a nudge as read by this employee."""
-    try:
-        oid = ObjectId(nudge_id)
-    except Exception:
+    if not ObjectId.is_valid(nudge_id):
         raise HTTPException(status_code=400, detail="Invalid nudge ID")
+    oid = ObjectId(nudge_id)
 
-    await nudge_logs_collection.update_one(
-        {"_id": oid},
-        {"$addToSet": {"read_by": emp["email"]}}
+    org_id = emp.get("organization_id")
+    email = emp.get("email")
+    res = await nudge_logs_collection.update_one(
+        {
+            "_id": oid,
+            "organization_id": org_id,
+            "$or": [
+                {"recipients": email},
+                {"recipient_type": "all"},
+                {"recipients": "all"}
+            ]
+        },
+        {"$addToSet": {"read_by": email}}
     )
+    if res.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Nudge not found or access denied")
     return {"status": "success", "message": "Marked as read"}
 
 
@@ -759,13 +792,17 @@ async def get_admin_leaderboard(admin=Depends(require_feature("leaderboard"))):
     week_start = week_start.replace(hour=0, minute=0, second=0, microsecond=0)
     week_end = week_start + timedelta(days=7)
 
+    match_stage = {
+        "organization_id": org_id,
+        "check_in_time": {"$gte": week_start, "$lt": week_end}
+    }
+    if getattr(admin, "role", None) in (AdminRole.MANAGER, "manager"):
+        scoped_emails = await get_scoped_employee_emails(admin)
+        scoped_emp_ids = await get_scoped_employee_employee_ids(admin)
+        match_stage["employee_id"] = {"$in": list(set((scoped_emails or []) + (scoped_emp_ids or [])))}
+
     pipeline = [
-        {
-            "$match": {
-                "organization_id": org_id,
-                "check_in_time": {"$gte": week_start, "$lt": week_end}
-            }
-        },
+        {"$match": match_stage},
         {
             "$group": {
                 "_id": "$employee_id",
@@ -780,17 +817,35 @@ async def get_admin_leaderboard(admin=Depends(require_feature("leaderboard"))):
 
     results = await visit_logs_collection.aggregate(pipeline).to_list(length=10)
 
+    top_ids = [row["_id"] for row in results if row.get("_id")]
+    emp_lookup_query = {"$or": [{"email": {"$in": top_ids}}, {"employee_id": {"$in": top_ids}}]}
+    if org_id:
+        emp_lookup_query["organization_id"] = org_id
+    emp_docs = await employees_collection.find(
+        emp_lookup_query,
+        {"email": 1, "employee_id": 1, "full_name": 1, "designation": 1}
+    ).to_list(length=len(top_ids) * 2 + 1)
+    emp_map = {}
+    for e in emp_docs:
+        if e.get("email"):
+            emp_map[e["email"]] = e
+        if e.get("employee_id"):
+            emp_map[e["employee_id"]] = e
+
     leaderboard = []
     for idx, row in enumerate(results):
-        emp = await employees_collection.find_one({"email": row["_id"]})
-        emp_name = emp["full_name"] if emp else row["_id"]
+        emp = emp_map.get(row["_id"])
+        emp_name = emp.get("full_name", row["_id"]) if emp else row["_id"]
         emp_designation = emp.get("designation", "Field Agent") if emp else "Field Agent"
 
         # Sum KM for the week from location pings
-        pings = await location_pings_collection.find({
+        ping_query = {
             "employee_id": row["_id"],
             "recorded_at": {"$gte": week_start, "$lt": week_end}
-        }).sort("recorded_at", 1).to_list(length=5000)
+        }
+        if org_id:
+            ping_query["organization_id"] = org_id
+        pings = await location_pings_collection.find(ping_query).sort("recorded_at", 1).to_list(length=5000)
 
         total_km = 0.0
         for i in range(1, len(pings)):

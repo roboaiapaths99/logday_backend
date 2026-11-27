@@ -177,7 +177,10 @@ async def create_leave_request(req: dict, employee=Depends(get_current_employee)
 @router.get("/api/leave/my-requests")
 async def get_my_leave_requests(employee=Depends(get_current_employee)):
     """List current employee's leave requests."""
-    requests = await leave_requests_collection.find({"employee_id": employee["email"]}).sort("created_at", -1).to_list(length=100)
+    query = {"employee_id": employee["email"]}
+    if employee.get("organization_id"):
+        query["organization_id"] = employee["organization_id"]
+    requests = await leave_requests_collection.find(query).sort("created_at", -1).to_list(length=100)
     for r in requests:
         r["_id"] = str(r["_id"])
         r["id"] = r["_id"]
@@ -207,7 +210,10 @@ async def get_my_leave_balance(
 @router.get("/api/manager/team-attendance")
 async def get_team_attendance(manager=Depends(get_current_employee)):
     """Fetch current attendance status for all subordinates."""
-    cursor = employees_collection.find({"manager_id": manager["email"]})
+    sub_query = {"manager_id": manager["email"]}
+    if manager.get("organization_id"):
+        sub_query["organization_id"] = manager["organization_id"]
+    cursor = employees_collection.find(sub_query, {"face_embedding": 0, "hashed_password": 0})
     subordinates = await cursor.to_list(length=100)
     
     results = []
@@ -240,14 +246,20 @@ async def get_team_attendance(manager=Depends(get_current_employee)):
 @router.get("/api/manager/pending-leaves")
 async def get_pending_leaves(manager=Depends(get_current_employee)):
     """Fetch pending leave requests for subordinates."""
-    cursor = employees_collection.find({"manager_id": manager["email"]})
+    sub_query = {"manager_id": manager["email"]}
+    if manager.get("organization_id"):
+        sub_query["organization_id"] = manager["organization_id"]
+    cursor = employees_collection.find(sub_query, {"email": 1})
     subordinates = await cursor.to_list(length=100)
-    sub_emails = [s["email"] for s in subordinates]
+    sub_emails = [s["email"] for s in subordinates if s.get("email")]
     
-    requests = await leave_requests_collection.find({
+    leave_query = {
         "employee_id": {"$in": sub_emails},
         "status": "pending"
-    }).sort("created_at", -1).to_list(length=100)
+    }
+    if manager.get("organization_id"):
+        leave_query["organization_id"] = manager["organization_id"]
+    requests = await leave_requests_collection.find(leave_query).sort("created_at", -1).to_list(length=100)
     
     for r in requests:
         r["_id"] = str(r["_id"])
@@ -268,14 +280,19 @@ async def leave_decision(payload: dict, manager=Depends(get_current_employee)):
         
         if action not in ["approve", "reject"]:
             raise HTTPException(status_code=400, detail="Invalid action")
+        if not req_id or not ObjectId.is_valid(str(req_id)):
+            raise HTTPException(status_code=400, detail="Invalid request_id")
             
         obj_id = ObjectId(req_id)
         leave_req = await leave_requests_collection.find_one({"_id": obj_id})
         if not leave_req:
             raise HTTPException(status_code=404, detail="Request not found")
             
-        # Verify manager owns this subordinate
-        emp = await employees_collection.find_one({"email": leave_req["employee_id"], "manager_id": manager["email"]})
+        # Verify manager owns this subordinate within the same organization
+        emp_query = {"email": leave_req["employee_id"], "manager_id": manager["email"]}
+        if manager.get("organization_id"):
+            emp_query["organization_id"] = manager["organization_id"]
+        emp = await employees_collection.find_one(emp_query)
         if not emp:
             raise HTTPException(status_code=403, detail="Unauthorized")
             
@@ -373,13 +390,28 @@ async def post_leave_message(request_id: str, payload: dict, auth_data=Depends(g
         
     if not payload or "message" not in payload:
         raise HTTPException(status_code=400, detail="Message content is required")
+
+    req = await leave_requests_collection.find_one({"_id": obj_id})
+    if not req:
+        raise HTTPException(status_code=404, detail="Request not found")
         
     user, role = auth_data
     
     if role == "admin":
+        admin_org = user.organization_id
+        if not _is_superadmin(user) and admin_org and admin_org != req.get("organization_id"):
+            raise HTTPException(status_code=403, detail="Access denied")
+        if getattr(user, "role", "") == "manager":
+            emp = await employees_collection.find_one({"email": req.get("employee_id"), **get_employee_filter(user)})
+            if not emp:
+                raise HTTPException(status_code=403, detail="Access denied")
         sender_id = user.email
         sender_name = user.full_name
     else:
+        if user.get("email") != req.get("employee_id") or (
+            user.get("organization_id") and req.get("organization_id") and user.get("organization_id") != req.get("organization_id")
+        ):
+            raise HTTPException(status_code=403, detail="Access denied")
         sender_id = user.get("email")
         sender_name = user.get("full_name", user.get("name", "Unknown"))
 
@@ -391,13 +423,10 @@ async def post_leave_message(request_id: str, payload: dict, auth_data=Depends(g
         "timestamp": datetime.now(timezone.utc)
     }
     
-    result = await leave_requests_collection.update_one(
+    await leave_requests_collection.update_one(
         {"_id": obj_id},
         {"$push": {"discussion": message}}
     )
-    
-    if result.matched_count == 0:
-        raise HTTPException(status_code=404, detail="Request not found")
         
     return {"status": "success"}
 
@@ -534,6 +563,14 @@ async def toggle_leave_payment_status(request_id: str, req_body: dict, admin: di
     if not leave_req:
         raise HTTPException(status_code=404, detail="Leave request not found")
 
+    filter_query = get_employee_filter(admin)
+    if "manager_id" in filter_query:
+        emp = await employees_collection.find_one({"email": leave_req.get("employee_id"), **filter_query})
+        if not emp:
+            raise HTTPException(status_code=403, detail="Access denied: You can only manage leaves for your direct reports.")
+    elif not _is_superadmin(admin) and admin.organization_id and admin.organization_id != leave_req.get("organization_id"):
+        raise HTTPException(status_code=403, detail="Access denied: This request belongs to another organization.")
+
     is_paid = req_body.get("is_paid")
     if is_paid is None:
         raise HTTPException(status_code=400, detail="is_paid (boolean) is required")
@@ -557,10 +594,11 @@ async def convert_absent_to_leave(req: ConvertAbsentToLeaveRequest, admin: Admin
     if not clean_date:
         raise HTTPException(status_code=400, detail="Invalid date format. Expected YYYY-MM-DD or DD/MM/YYYY")
 
-    emp = await employees_collection.find_one({"email": clean_email})
+    emp_scope = get_employee_filter(admin)
+    emp = await employees_collection.find_one({"email": clean_email, **emp_scope})
     if not emp:
-        # Try finding by employee_id or other fields
-        emp = await employees_collection.find_one({"employee_id": req.employee_email.strip()})
+        # Try finding by employee_id within admin's tenant/manager scope
+        emp = await employees_collection.find_one({"employee_id": req.employee_email.strip(), **emp_scope})
         if not emp:
             raise HTTPException(status_code=404, detail="Employee not found")
         clean_email = emp["email"]
@@ -570,6 +608,7 @@ async def convert_absent_to_leave(req: ConvertAbsentToLeaveRequest, admin: Admin
     # Check if there is already an approved leave for this date
     existing = await leave_requests_collection.find_one({
         "employee_id": clean_email,
+        "organization_id": org_id,
         "start_date": {"$lte": clean_date},
         "end_date": {"$gte": clean_date},
         "status": "approved"
@@ -723,18 +762,22 @@ async def admin_get_holidays(year: Optional[int] = None, month: Optional[str] = 
 
 @router.delete("/admin/holidays/{holiday_id_or_date}")
 async def admin_delete_holiday(holiday_id_or_date: str, admin: dict = Depends(require_feature("leaves"))):
-    """Delete a holiday by its ID or YYYY-MM-DD date."""
+    """Delete a holiday by its ID or YYYY-MM-DD date (strictly scoped to the admin's organization)."""
     org_id = admin.organization_id or "system_org"
-    query = {}
     if ObjectId.is_valid(holiday_id_or_date):
         query = {"_id": ObjectId(holiday_id_or_date)}
+        if not _is_superadmin(admin):
+            query["organization_id"] = org_id
     else:
-        query = {
-            "$or": [
-                {"organization_id": org_id, "date": holiday_id_or_date},
-                {"organization_id": "system_org", "date": holiday_id_or_date}
-            ]
-        }
+        if _is_superadmin(admin):
+            query = {
+                "$or": [
+                    {"organization_id": org_id, "date": holiday_id_or_date},
+                    {"organization_id": "system_org", "date": holiday_id_or_date}
+                ]
+            }
+        else:
+            query = {"organization_id": org_id, "date": holiday_id_or_date}
 
     holiday_to_delete = await holidays_collection.find_one(query)
     if not holiday_to_delete:
@@ -943,8 +986,11 @@ async def admin_update_employee_leave_quota(
     admin: dict = Depends(require_feature("leaves"))
 ):
     """Set custom leave quota override for a specific employee."""
-    org_id = admin.organization_id or "system_org"
     clean_email = email.strip().lower()
+    emp = await employees_collection.find_one({"email": clean_email, **get_employee_filter(admin)})
+    if not emp:
+        raise HTTPException(status_code=404, detail="Employee not found")
+    org_id = emp.get("organization_id") or admin.organization_id or "system_org"
     year = req.year or datetime.now(timezone.utc).year
 
     override = {
@@ -981,8 +1027,11 @@ async def admin_get_employee_leave_balance(
     admin: dict = Depends(require_feature("leaves"))
 ):
     """Fetch live calculated leave balance for an employee."""
-    org_id = admin.organization_id or "system_org"
     clean_email = email.strip().lower()
+    emp = await employees_collection.find_one({"email": clean_email, **get_employee_filter(admin)})
+    if not emp:
+        raise HTTPException(status_code=404, detail="Employee not found")
+    org_id = emp.get("organization_id") or admin.organization_id or "system_org"
     balance = await calculate_leave_balance(clean_email, org_id, year, month)
     return balance
 

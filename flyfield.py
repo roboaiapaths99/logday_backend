@@ -26,6 +26,7 @@ from database import (
     alerts_collection
 )
 from auth import get_current_employee, get_current_admin
+from services.common_helpers import get_employee_filter, get_effective_org_settings
 
 logger = logging.getLogger(__name__)
 
@@ -179,11 +180,16 @@ async def get_flyfield_today(user: dict = Depends(get_current_employee)):
     """
     email = user["email"]
     org_id = user.get("organization_id")
-    today_start_utc, today_end_utc, today_str = get_today_bounds()
+    org_settings = await get_effective_org_settings(org_id)
+    tz_offset = int((org_settings or {}).get("timezone_offset", 330))
+    today_start_utc, today_end_utc, today_str = get_today_bounds(tz_offset)
+
+    org_scope = {"organization_id": org_id} if org_id else {}
 
     # 1. Fetch today's check-in / check-out from attendance_logs
     today_logs = await attendance_logs_collection.find({
         "email": email,
+        **org_scope,
         "timestamp": {"$gte": today_start_utc, "$lt": today_end_utc}
     }).sort("timestamp", 1).to_list(length=20)
 
@@ -198,6 +204,7 @@ async def get_flyfield_today(user: dict = Depends(get_current_employee)):
     # 2. Fetch today's FlyField visits
     visits = await visit_logs_collection.find({
         "employee_email": email,
+        **org_scope,
         "date": today_str,
         "visit_mode": "flyfield"
     }).sort("check_in_time", 1).to_list(length=100)
@@ -212,6 +219,7 @@ async def get_flyfield_today(user: dict = Depends(get_current_employee)):
     # 3. Compute estimated KM from location pings today
     pings = await location_pings_collection.find({
         "employee_id": email,
+        **org_scope,
         "recorded_at": {"$gte": today_start_utc, "$lt": today_end_utc}
     }).sort("recorded_at", 1).to_list(length=1000)
 
@@ -634,7 +642,7 @@ async def get_flyfield_history(month: Optional[str] = None, user: dict = Depends
 @router.get("/admin/flyfield/live")
 async def get_admin_flyfield_live(admin = Depends(require_feature("flyfield"))):
     """
-    Live real-time status of all FlyField employees in admin's organization:
+    Live real-time status of all FlyField employees in admin's organization/team:
     - Day status (Active / Completed / Not Started)
     - Current state (On Visit / Moving / Idle / Offline)
     - Real physical address
@@ -642,17 +650,18 @@ async def get_admin_flyfield_live(admin = Depends(require_feature("flyfield"))):
     - Battery percentage & last seen
     """
     org_id = admin.organization_id
-    today_start_utc, today_end_utc, today_str = get_today_bounds()
+    org_settings = await get_effective_org_settings(org_id)
+    tz_offset = int((org_settings or {}).get("timezone_offset", 330))
+    today_start_utc, today_end_utc, today_str = get_today_bounds(tz_offset)
 
-    # Query all employees assigned to FlyField in this org
+    # Query all employees assigned to FlyField in this admin's tenant & manager scope
     query = {
+        **get_employee_filter(admin),
         "employee_type": "field",
         "field_mode": "flyfield"
     }
-    if org_id and org_id != "system_org":
-        query["organization_id"] = org_id
 
-    agents = await employees_collection.find(query).to_list(length=500)
+    agents = await employees_collection.find(query, {"face_embedding": 0, "hashed_password": 0}).to_list(length=500)
     now_utc = datetime.now(timezone.utc)
 
     result = []
@@ -661,10 +670,12 @@ async def get_admin_flyfield_live(admin = Depends(require_feature("flyfield"))):
     on_visit_count = 0
 
     agent_emails = [a["email"] for a in agents if a.get("email")]
+    org_scope = {"organization_id": org_id} if (org_id and org_id != "system_org" and getattr(admin, "role", "") != "superadmin") else {}
 
     # Batch-fetch 1: Today's attendance logs for all FlyField agents in one query
     all_today_logs = await attendance_logs_collection.find({
         "email": {"$in": agent_emails},
+        **org_scope,
         "timestamp": {"$gte": today_start_utc, "$lt": today_end_utc}
     }).sort("timestamp", 1).to_list(length=5000) if agent_emails else []
     logs_by_email = {}
@@ -674,6 +685,7 @@ async def get_admin_flyfield_live(admin = Depends(require_feature("flyfield"))):
     # Batch-fetch 2: Today's FlyField visits for all agents in one query
     all_today_visits = await visit_logs_collection.find({
         "employee_email": {"$in": agent_emails},
+        **org_scope,
         "date": today_str,
         "visit_mode": "flyfield"
     }).to_list(length=10000) if agent_emails else []
@@ -683,7 +695,7 @@ async def get_admin_flyfield_live(admin = Depends(require_feature("flyfield"))):
 
     # Batch-fetch 3: Latest location ping per agent in a single aggregation
     latest_pings_agg = await location_pings_collection.aggregate([
-        {"$match": {"employee_id": {"$in": agent_emails}}},
+        {"$match": {"employee_id": {"$in": agent_emails}, **org_scope}},
         {"$sort": {"recorded_at": -1}},
         {"$group": {"_id": "$employee_id", "doc": {"$first": "$$ROOT"}}}
     ]).to_list(length=len(agent_emails)) if agent_emails else []
@@ -773,9 +785,15 @@ async def get_admin_flyfield_live(admin = Depends(require_feature("flyfield"))):
                         att_time = att_time.replace(tzinfo=timezone.utc)
                     last_seen_sec = min(last_seen_sec, int((now_utc - att_time).total_seconds()))
 
-        # Real address resolution if missing or generic
+        # Real address resolution: check in-memory cache first; cap external Nominatim calls per live request so map never stalls
         if lat and lng and (not address or address == "Location unavailable"):
-            address = await resolve_real_address(lat, lng)
+            cache_key = (round(float(lat), 4), round(float(lng), 4))
+            if cache_key in FLYFIELD_GEOCODE_CACHE:
+                address = FLYFIELD_GEOCODE_CACHE[cache_key]
+            elif len(result) < 3:
+                address = await resolve_real_address(lat, lng)
+            else:
+                address = f"Area near {round(float(lat), 4)}, {round(float(lng), 4)}"
 
         # Status categorization
         current_status = "offline"
@@ -913,9 +931,10 @@ async def admin_close_stuck_visit(visit_id: str, admin = Depends(require_feature
 
 async def build_daily_timeline(email: str, date_str: Optional[str] = None) -> dict:
     # 1. Employee info & org timezone
-    emp = await employees_collection.find_one({"email": email})
+    emp = await employees_collection.find_one({"email": email}, {"face_embedding": 0, "hashed_password": 0})
     emp_name = emp.get("full_name", email) if emp else email
     org_id = emp.get("organization_id") if emp else None
+    org_scope = {"organization_id": org_id} if org_id else {}
     s_doc = await settings_collection.find_one({"$or": [{"organization_id": org_id}, {"id": "config"}]}) if org_id else None
     tz_offset = int((s_doc or {}).get("timezone_offset", 330))
 
@@ -933,6 +952,7 @@ async def build_daily_timeline(email: str, date_str: Optional[str] = None) -> di
     # 2. Check-in & Check-out logs
     logs = await attendance_logs_collection.find({
         "email": email,
+        **org_scope,
         "timestamp": {"$gte": day_start, "$lt": day_end}
     }).sort("timestamp", 1).to_list(length=20)
 
@@ -942,6 +962,7 @@ async def build_daily_timeline(email: str, date_str: Optional[str] = None) -> di
     # 3. Visits on target date
     visits = await visit_logs_collection.find({
         "employee_email": email,
+        **org_scope,
         "date": target_date,
         "visit_mode": "flyfield"
     }).sort("check_in_time", 1).to_list(length=100)
@@ -969,6 +990,7 @@ async def build_daily_timeline(email: str, date_str: Optional[str] = None) -> di
     # 4. Location trail pings for map polyline
     pings = await location_pings_collection.find({
         "employee_id": email,
+        **org_scope,
         "recorded_at": {"$gte": day_start, "$lt": day_end}
     }).sort("recorded_at", 1).to_list(length=1000)
 

@@ -42,10 +42,14 @@ async def get_salary_structure(employee=Depends(get_current_employee)):
     """Fetch current salary structure details, falling back to _resolve_employee_salary_structure or latest payroll."""
     from hrms_payroll import _resolve_employee_salary_structure
     clean_email = (employee.get("email") or "").strip().lower()
+    org_id = employee.get("organization_id")
     sal = await _resolve_employee_salary_structure(employee)
     if not sal.get("ctc"):
+        p_query = {"employee_email": clean_email}
+        if org_id:
+            p_query["organization_id"] = org_id
         latest_p = await payrolls_collection.find_one(
-            {"employee_email": clean_email},
+            p_query,
             sort=[("payroll_month", -1)]
         )
         if latest_p and latest_p.get("ctc"):
@@ -63,10 +67,14 @@ async def get_salary_structure(employee=Depends(get_current_employee)):
 async def get_my_payslips(employee=Depends(get_current_employee)):
     """List all processed monthly payslips (APPROVED, LOCKED, or PAID status)."""
     clean_email = (employee.get("email") or "").strip().lower()
-    cursor = payrolls_collection.find({
+    org_id = employee.get("organization_id")
+    p_query = {
         "employee_email": {"$in": [clean_email, employee.get("email", "")]},
         "status": {"$in": ["locked", "paid", "approved", "processed"]}
-    }).sort("payroll_month", -1)
+    }
+    if org_id:
+        p_query["organization_id"] = org_id
+    cursor = payrolls_collection.find(p_query).sort("payroll_month", -1)
     
     payrolls = await cursor.to_list(length=100)
     for p in payrolls:
@@ -83,10 +91,14 @@ async def download_payslip_pdf(id: str, employee=Depends(get_current_employee)):
         raise HTTPException(status_code=400, detail="Invalid ID format")
 
     clean_email = (employee.get("email") or "").strip().lower()
-    p = await payrolls_collection.find_one({
+    org_id = employee.get("organization_id")
+    p_query = {
         "_id": obj_id,
         "employee_email": {"$in": [clean_email, employee.get("email", "")]}
-    })
+    }
+    if org_id:
+        p_query["organization_id"] = org_id
+    p = await payrolls_collection.find_one(p_query)
     if not p:
         raise HTTPException(status_code=404, detail="Payslip record not found.")
 
@@ -143,8 +155,8 @@ async def file_resignation(req: dict, employee=Depends(get_current_employee)):
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid date format for Proposed Last Working Day. Expected YYYY-MM-DD")
 
-    now_iso = datetime.now(timezone.utc).isoformat()
-    # Create exit document
+    now_utc = datetime.now(timezone.utc)
+    # Create exit document with BSON datetime for consistent chronological sorting in list_exits
     exit_doc = {
         "organization_id": employee["organization_id"],
         "employee_email": employee["email"].strip().lower(),
@@ -156,7 +168,7 @@ async def file_resignation(req: dict, employee=Depends(get_current_employee)):
         "exit_reason": exit_reason,
         "reason": exit_reason,
         "handover_notes": notes,
-        "resignation_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        "resignation_date": now_utc.strftime("%Y-%m-%d"),
         "last_working_day": proposed_lwd,
         "notice_period_days": 30,
         "notice_served_days": 30,
@@ -233,11 +245,13 @@ async def file_resignation(req: dict, employee=Depends(get_current_employee)):
             "processed_at": None
         },
         "documents_issued": [],
-        "created_at": now_iso,
-        "updated_at": now_iso,
+        "created_at": now_utc,
+        "updated_at": now_utc,
         "created_by": employee["email"]
     }
 
     result = await exit_managements_collection.insert_one(exit_doc)
     exit_doc["_id"] = str(result.inserted_id)
+    exit_doc["created_at"] = now_utc.isoformat()
+    exit_doc["updated_at"] = now_utc.isoformat()
     return exit_doc

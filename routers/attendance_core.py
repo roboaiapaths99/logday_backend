@@ -427,11 +427,15 @@ async def smart_attendance(req: VerifyPresenceRequest, request: Request, backgro
             if not has_valid_face and not is_superadmin and req.client_type != "flyfield":
                 raise HTTPException(status_code=400, detail="Face biometric not enrolled for this user.")
         
-        # Face Verification (Bypass for Superadmin, checkout, or if no image provided)
+        # Face Verification (Required on check-in unless superadmin or flyfield GPS punch)
         distance = 0.0
-        if req.image and user.get("face_embedding") and attendance_type != "check-out":
+        if attendance_type != "check-out" and not is_superadmin and req.client_type != "flyfield":
+            if not req.image:
+                raise HTTPException(status_code=400, detail="Face image is required for check-in.")
+            if not user.get("face_embedding"):
+                raise HTTPException(status_code=400, detail="Face biometric not enrolled for this user.")
             is_match, distance = await run_inference(verify_face, req.image, user["face_embedding"])
-            if not is_match and not is_superadmin:
+            if not is_match:
                 background_tasks.add_task(
                     trigger_alert, "Identity", user.get("email"), user.get("organization_id"), 
                     f"Face verification failed with confidence distance {distance:.3f}", "medium"
@@ -808,7 +812,7 @@ async def smart_attendance(req: VerifyPresenceRequest, request: Request, backgro
             "location_name": loc_name_val,
             "address": loc_name_val,
             "field_mode": user.get("field_mode"),
-            "selfie_verified": True,
+            "selfie_verified": bool(req.image),
             "device_id": req.device_id,
             "mock_location_detected": req.mock_detected
         }

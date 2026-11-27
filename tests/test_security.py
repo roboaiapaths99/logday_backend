@@ -649,4 +649,194 @@ def test_concurrent_payroll_auto_generation_is_idempotent(db):
     assert count == 1
 
 
+def test_smart_attendance_checkin_requires_face_image(client, db):
+    emp = account(db, "employee", email="noface_checkin@example.test")
+    db.employees_collection.update_one(
+        {"_id": emp["_id"]},
+        {"$set": {"face_embedding": [0.1, 0.2, 0.3], "employee_type": "wfh"}}
+    )
+    res = client.post(
+        "/smart-attendance",
+        headers=bearer(emp, "employee"),
+        json={"email": emp["email"], "intended_type": "check-in", "lat": 28.5, "long": 77.3, "image": ""},
+    )
+    assert res.status_code == 400
+    assert "Face image is required" in res.text
+
+
+def test_visit_checkout_validates_id_and_enforces_employee_ownership(client, db):
+    org_id = str(ObjectId())
+    emp_a = account(db, "employee", email="field_a@example.test", org=org_id)
+    emp_b = account(db, "employee", email="field_b@example.test", org=org_id)
+
+    # 1. Invalid visit_id returns 400 (not 500)
+    bad_res = client.post(
+        "/api/field/visit/check-out",
+        headers=bearer(emp_a, "employee"),
+        json={"visit_id": "not-an-object-id"},
+    )
+    assert bad_res.status_code == 400
+
+    # 2. Colleague in same org cannot close emp_a's visit
+    visit_id = ObjectId()
+    db.visit_logs_collection.insert_one({
+        "_id": visit_id,
+        "employee_id": emp_a["email"],
+        "organization_id": org_id,
+        "status": "ongoing",
+    })
+    colleague_res = client.post(
+        "/api/field/visit/check-out",
+        headers=bearer(emp_b, "employee"),
+        json={"visit_id": str(visit_id), "latitude": 12.97, "longitude": 77.59},
+    )
+    assert colleague_res.status_code == 403
+
+    # 3. Owner can close their visit using latitude/longitude keys without KeyError
+    owner_res = client.post(
+        "/api/field/visit/check-out",
+        headers=bearer(emp_a, "employee"),
+        json={"visit_id": str(visit_id), "latitude": 12.97, "longitude": 77.59, "outcome": "Completed"},
+    )
+    assert owner_res.status_code == 200
+
+
+def test_manager_scope_enforced_on_wfh_requests_and_flyfield_live(client, db):
+    org_id = str(ObjectId())
+    mgr = account(db, "admin", email="mgr_scope@example.test", role="manager", features=["wfh_management", "flyfield"], org=org_id)
+    team_emp = account(db, "employee", email="team_wfh@example.test", org=org_id)
+    db.employees_collection.update_one(
+        {"_id": team_emp["_id"]},
+        {"$set": {"manager_id": mgr["email"], "employee_type": "field", "field_mode": "flyfield"}}
+    )
+    other_emp = account(db, "employee", email="other_wfh@example.test", org=org_id)
+    db.employees_collection.update_one(
+        {"_id": other_emp["_id"]},
+        {"$set": {"manager_id": "other_mgr@example.test", "employee_type": "field", "field_mode": "flyfield"}}
+    )
+
+    db.wfh_requests_collection.insert_many([
+        {"employee_email": team_emp["email"], "employee_name": "Team Member", "organization_id": org_id, "date": "2026-11-20", "status": "pending"},
+        {"employee_email": other_emp["email"], "employee_name": "Other Member", "organization_id": org_id, "date": "2026-11-20", "status": "pending"},
+    ])
+
+    headers = bearer(mgr, "admin")
+    wfh_res = client.get("/admin/wfh/requests", headers=headers)
+    assert wfh_res.status_code == 200
+    assert [r["employee_email"] for r in wfh_res.json()] == [team_emp["email"]]
+
+    fly_res = client.get("/admin/flyfield/live", headers=headers)
+    assert fly_res.status_code == 200
+    assert [a["email"] for a in fly_res.json()["agents"]] == [team_emp["email"]]
+
+
+def test_exit_settlement_coroutine_and_exit_completion_revokes_session(client, db):
+    import copy
+    from hrms_exit import DEFAULT_CLEARANCES
+    from hrms_models import ClearanceStatus, ExitStatus
+
+    org_id = str(ObjectId())
+    owner = account(db, "admin", email="exit_owner@example.test", role="owner", features=["exit_management"], org=org_id)
+    emp = account(db, "employee", email="exiting_emp@example.test", org=org_id)
+    db.salary_structures_collection.insert_one({
+        "organization_id": org_id,
+        "employee_email": emp["email"],
+        "ctc": 600000.0,
+    })
+
+    emp_headers = bearer(emp, "employee")
+    assert client.get("/api/employee/profile", headers=emp_headers).status_code == 200
+
+    clearances = copy.deepcopy(DEFAULT_CLEARANCES)
+    for dept in clearances.values():
+        dept["status"] = ClearanceStatus.COMPLETED
+
+    exit_id = ObjectId()
+    db.exit_managements_collection.insert_one({
+        "_id": exit_id,
+        "organization_id": org_id,
+        "employee_email": emp["email"],
+        "employee_name": emp["full_name"],
+        "last_working_day": "2026-11-30",
+        "notice_period_days": 30,
+        "notice_served_days": 30,
+        "status": ExitStatus.IN_PROGRESS,
+        "clearances": clearances,
+        "created_at": datetime.now(timezone.utc),
+    })
+
+    admin_headers = bearer(owner, "admin")
+    settle_res = client.post(
+        f"/admin/exit-management/{exit_id}/settlement",
+        headers=admin_headers,
+        json={"unused_leave_days": 2, "remaining_days_in_month": 15, "bonus_due": 1000},
+    )
+    assert settle_res.status_code == 200, settle_res.text
+    assert settle_res.json()["final_settlement"]["calculated"] is True
+    assert settle_res.json()["final_settlement"]["salary_dues"] == 25000.0
+
+    comp_res = client.post(f"/admin/exit-management/{exit_id}/complete", headers=admin_headers)
+    assert comp_res.status_code == 200, comp_res.text
+    # Completing exit must immediately invalidate the employee's session
+    assert client.get("/api/employee/profile", headers=emp_headers).status_code in (401, 403)
+
+
+def test_leave_message_payment_status_and_holiday_delete_are_tenant_scoped(client, db):
+    org_a = str(ObjectId())
+    org_b = str(ObjectId())
+    admin_a = account(db, "admin", email="leave_admin_a@example.test", role="owner", features=["leaves", "attendance"], org=org_a)
+    emp_a = account(db, "employee", email="leave_emp_a@example.test", org=org_a)
+    emp_b = account(db, "employee", email="leave_emp_b@example.test", org=org_b)
+
+    leave_b_id = ObjectId()
+    db.leave_requests_collection.insert_one({
+        "_id": leave_b_id,
+        "employee_id": emp_b["email"],
+        "organization_id": org_b,
+        "leave_type": "casual",
+        "start_date": "2026-11-20",
+        "end_date": "2026-11-20",
+        "status": "approved",
+        "discussion": [],
+    })
+
+    # Employee A and Admin A cannot post messages or toggle payment status on Org B's leave request
+    assert client.post(
+        f"/api/leave/requests/{leave_b_id}/message",
+        headers=bearer(emp_a, "employee"),
+        json={"message": "cross-tenant injection"},
+    ).status_code == 403
+    assert client.post(
+        f"/api/leave/requests/{leave_b_id}/message",
+        headers=bearer(admin_a, "admin"),
+        json={"message": "cross-tenant admin injection"},
+    ).status_code == 403
+    assert client.put(
+        f"/admin/leave/requests/{leave_b_id}/payment-status",
+        headers=bearer(admin_a, "admin"),
+        json={"is_paid": False},
+    ).status_code == 403
+
+    # Admin A cannot convert absence to leave or delete holiday for Org B
+    assert client.post(
+        "/admin/attendance/convert-absent-to-leave",
+        headers=bearer(admin_a, "admin"),
+        json={"employee_email": emp_b["email"], "date": "2026-11-21", "leave_type": "casual"},
+    ).status_code == 404
+
+    holiday_b_id = ObjectId()
+    db.holidays_collection.insert_one({
+        "_id": holiday_b_id,
+        "organization_id": org_b,
+        "date": "2026-12-25",
+        "name": "Christmas",
+    })
+    assert client.delete(
+        f"/admin/holidays/{holiday_b_id}",
+        headers=bearer(admin_a, "admin"),
+    ).status_code == 404
+
+
+
+
 
