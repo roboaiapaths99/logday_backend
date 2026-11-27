@@ -686,6 +686,8 @@ async def smart_attendance(req: VerifyPresenceRequest, request: Request, backgro
                 checkin_upd = {
                     "is_half_day": classification["is_half_day"],
                     "half_day_type": classification["half_day_type"],
+                    "is_late": classification["is_late"],
+                    "late_mins": classification["late_mins"],
                     "off_hours": 0.0,
                     "late_off_hours": 0.0,
                     "early_off_hours": 0.0,

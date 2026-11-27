@@ -299,14 +299,41 @@ async def wfh_checkin(req: dict, employee=Depends(get_current_employee)):
     # Using UTC date here caused instant "stale session" closure for IST users
     # between midnight and 5:30 AM local time.
     tz_offset_mins = 330  # default IST
+    org_settings = {}
     try:
-        org_settings = await settings_collection.find_one({"organization_id": org_id}) if org_id else None
+        org_settings = await get_effective_org_settings(org_id) if org_id else {}
         if org_settings:
-            tz_offset_mins = org_settings.get("timezone_offset", 330)
+            tz_offset_mins = int(org_settings.get("timezone_offset", 330))
     except Exception:
         pass
     local_now = now + timedelta(minutes=tz_offset_mins)
     today = local_now.strftime("%Y-%m-%d")
+
+    approved_leave = None
+    try:
+        clean_email = (email or "").strip().lower()
+        approved_leave = await leave_requests_collection.find_one({
+            "organization_id": org_id,
+            "$or": [
+                {"employee_id": clean_email},
+                {"email": clean_email},
+                {"employee_id": employee_id}
+            ],
+            "status": {"$regex": "^approved$", "$options": "i"},
+            "start_date": {"$lte": today},
+            "end_date": {"$gte": today}
+        })
+    except Exception as leave_err:
+        logger.warning(f"WFH checkin leave lookup error: {leave_err}")
+
+    classification = classify_attendance_day(
+        first_checkin_local=local_now,
+        last_checkout_local=None,
+        worked_hours=0.0,
+        settings=org_settings or {},
+        employee_type=employee.get("employee_type", "wfh"),
+        approved_leave=approved_leave
+    )
 
     session_doc = {
         "employee_id": employee_id,
@@ -338,7 +365,24 @@ async def wfh_checkin(req: dict, employee=Depends(get_current_employee)):
         "organization_id": org_id,
         "timestamp": now,
         "type": "check-in",
-        "status": "Present",
+        "status": "SUCCESS",
+        "attendance_status": classification["status"],
+        "is_late": classification["is_late"],
+        "is_early_leave": classification["is_early_leave"],
+        "is_short_leave": classification["is_short_leave"],
+        "is_half_day": classification["is_half_day"],
+        "short_leave_type": classification["short_leave_type"],
+        "half_day_type": classification["half_day_type"],
+        "late_mins": classification["late_mins"],
+        "early_exit_mins": classification["early_exit_mins"],
+        "late_off_hours": classification["late_off_hours"],
+        "early_off_hours": classification["early_off_hours"],
+        "off_hours": classification["off_hours"],
+        "worked_hours": classification["worked_hours"],
+        "required_hours": classification["required_hours"],
+        "effective_days": classification["effective_days"],
+        "classification_reason": classification["classification_reason"],
+        "is_applied_leave": classification["is_applied_leave"],
         "selfie_verified": True,
         "face_confidence": face_distance,
         "device_id": device_id,
@@ -352,7 +396,12 @@ async def wfh_checkin(req: dict, employee=Depends(get_current_employee)):
     await attendance_logs_collection.insert_one(attendance_doc)
     await employees_collection.update_one(
         {"_id": employee["_id"]},
-        {"$set": {"checked_in": True, "last_attendance_type": "wfh_checkin", "last_attendance_time": now}}
+        {"$set": {
+            "checked_in": True,
+            "last_attendance_type": "check-in",
+            "last_attendance_time": now,
+            "last_attendance_status": classification["status"]
+        }}
     )
 
 
@@ -585,6 +634,47 @@ async def wfh_checkout(req: dict, employee=Depends(get_current_employee)):
         }
     )
 
+    # Compute daily attendance classification on WFH check-out
+    org_settings = {}
+    tz_offset_mins = 330
+    try:
+        org_settings = await get_effective_org_settings(org_id) if org_id else {}
+        if org_settings:
+            tz_offset_mins = int(org_settings.get("timezone_offset", 330))
+    except Exception:
+        pass
+
+    first_in_local = (check_in_time + timedelta(minutes=tz_offset_mins)) if check_in_time else (now + timedelta(minutes=tz_offset_mins))
+    last_out_local = now + timedelta(minutes=tz_offset_mins)
+    worked_hours = round(total_seconds / 3600.0, 2)
+    session_date_str = session.get("date") or last_out_local.strftime("%Y-%m-%d")
+
+    approved_leave = None
+    try:
+        clean_email = (email or "").strip().lower()
+        approved_leave = await leave_requests_collection.find_one({
+            "organization_id": org_id,
+            "$or": [
+                {"employee_id": clean_email},
+                {"email": clean_email},
+                {"employee_id": employee_id}
+            ],
+            "status": {"$regex": "^approved$", "$options": "i"},
+            "start_date": {"$lte": session_date_str},
+            "end_date": {"$gte": session_date_str}
+        })
+    except Exception as leave_err:
+        logger.warning(f"WFH checkout leave lookup error: {leave_err}")
+
+    classification = classify_attendance_day(
+        first_checkin_local=first_in_local,
+        last_checkout_local=last_out_local,
+        worked_hours=worked_hours,
+        settings=org_settings or {},
+        employee_type=employee.get("employee_type", "wfh"),
+        approved_leave=approved_leave
+    )
+
     attendance_doc = {
         "user_id": employee_id,
         "email": email,
@@ -592,7 +682,24 @@ async def wfh_checkout(req: dict, employee=Depends(get_current_employee)):
         "organization_id": org_id,
         "timestamp": now,
         "type": "check-out",
-        "status": "Present",
+        "status": "SUCCESS",
+        "attendance_status": classification["status"],
+        "is_late": classification["is_late"],
+        "is_early_leave": classification["is_early_leave"],
+        "is_short_leave": classification["is_short_leave"],
+        "is_half_day": classification["is_half_day"],
+        "short_leave_type": classification["short_leave_type"],
+        "half_day_type": classification["half_day_type"],
+        "late_mins": classification["late_mins"],
+        "early_exit_mins": classification["early_exit_mins"],
+        "late_off_hours": classification["late_off_hours"],
+        "early_off_hours": classification["early_off_hours"],
+        "off_hours": classification["off_hours"],
+        "worked_hours": classification["worked_hours"],
+        "required_hours": classification["required_hours"],
+        "effective_days": classification["effective_days"],
+        "classification_reason": classification["classification_reason"],
+        "is_applied_leave": classification["is_applied_leave"],
         "selfie_verified": True,
         "device_id": device_id,
         "source": "wfh_desktop",
@@ -604,9 +711,32 @@ async def wfh_checkout(req: dict, employee=Depends(get_current_employee)):
     }
 
     await attendance_logs_collection.insert_one(attendance_doc)
+    try:
+        await attendance_logs_collection.update_one(
+            {"wfh_session_id": str(session["_id"]), "type": "check-in"},
+            {"$set": {
+                "status": "SUCCESS",
+                "is_half_day": classification["is_half_day"],
+                "half_day_type": classification["half_day_type"],
+                "is_late": classification["is_late"],
+                "late_mins": classification["late_mins"],
+                "is_short_leave": classification["is_short_leave"],
+                "short_leave_type": classification["short_leave_type"],
+                "effective_days": classification["effective_days"],
+                "worked_hours": classification["worked_hours"]
+            }}
+        )
+    except Exception as upd_err:
+        logger.warning(f"WFH checkin retroactive update skipped: {upd_err}")
+
     await employees_collection.update_one(
         {"_id": employee["_id"]},
-        {"$set": {"checked_in": False, "last_attendance_type": "wfh_checkout", "last_attendance_time": now}}
+        {"$set": {
+            "checked_in": False,
+            "last_attendance_type": "check-out",
+            "last_attendance_time": now,
+            "last_attendance_status": classification["status"]
+        }}
     )
 
 
@@ -661,17 +791,45 @@ async def get_active_wfh_session(employee=Depends(get_current_employee)):
                     check_in_time = check_in_time.replace(tzinfo=timezone.utc)
                 total_seconds = int((now_utc - check_in_time).total_seconds())
 
+            capped_seconds = min(total_seconds, 28800)  # Cap at 8 hours if stale
+            auto_checkout_time = (check_in_time + timedelta(seconds=capped_seconds)) if check_in_time else now_utc
+
             await wfh_sessions_collection.update_one(
                 {"_id": session["_id"]},
                 {
                     "$set": {
                         "status": "completed",
-                        "check_out_time": now_utc,
-                        "total_active_seconds": min(total_seconds, 28800), # Cap at 8 hours if stale
+                        "check_out_time": auto_checkout_time,
+                        "total_active_seconds": capped_seconds,
                         "updated_at": now_utc
                     }
                 }
             )
+            existing_out = await attendance_logs_collection.find_one({
+                "wfh_session_id": str(session["_id"]),
+                "type": "check-out"
+            })
+            if not existing_out:
+                await attendance_logs_collection.insert_one({
+                    "user_id": employee_id,
+                    "email": employee.get("email"),
+                    "employee_name": employee.get("full_name", ""),
+                    "organization_id": org_id,
+                    "timestamp": auto_checkout_time,
+                    "type": "check-out",
+                    "status": "SUCCESS",
+                    "attendance_status": "Present",
+                    "worked_hours": round(capped_seconds / 3600.0, 2),
+                    "effective_days": 1.0,
+                    "selfie_verified": True,
+                    "device_id": session.get("device_id"),
+                    "source": "wfh_desktop_autoclose",
+                    "wfh_session_id": str(session["_id"]),
+                    "attendance_type": "wfh",
+                    "check_in_method": "wfh_desktop",
+                    "total_seconds": capped_seconds,
+                    "created_at": now_utc
+                })
             session = None
 
     if not session:

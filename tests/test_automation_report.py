@@ -18,7 +18,7 @@ def test_full_month_calendar_and_removed_columns():
     assert report.working_days('2026-11', []) == 21
     assert report.working_days('2026-11', [{'days_off': [1, 2, 2]}, {'date': '2026-11-02'}]) == 20
     assert report.working_days('2028-02', []) == 21
-    assert not {'approved', 'short', 'review', 'hours'} & {key for key, _ in report.COLUMNS}
+    assert not {'approved', 'short', 'review', 'hours', 'pending_requests'} & {key for key, _ in report.COLUMNS}
     assert report.calendar_heading({'days_in_month': 30, 'working_days_by_org': {'a': 20}}) == 'Total Working Days: 20   |   Days in Month: 30'
 
 
@@ -36,7 +36,7 @@ def test_classification_unique_days_late_boundary_and_incomplete():
     row = report.summarize({}, logs, [], [], SETTINGS, '2026-11', NOW)
     assert row['present'] == 2
     assert row['half'] == 1
-    assert row['late'] == 2  # Late is an overlapping flag, including late half days.
+    assert row['late'] == 1  # Half day is counted only as half day, not double-counted in late.
     assert row['review'] == 1
     assert row['absent'] == 17  # 21 weekdays minus four attendance dates.
 
@@ -69,6 +69,32 @@ def test_overnight_shift_across_midnight_paired_cleanly():
     ]
     row = report.summarize({}, logs, [], [], SETTINGS, '2026-11', NOW)
     assert row['present'] == 2
+    assert row['review'] == 0
+
+
+def test_all_four_apps_desk_field_flyfield_and_wfh_count_in_present_and_absent():
+    logs = [
+        # Day 2: Normal Office Desk App (status="SUCCESS")
+        event(2, '10:00', 'check-in', status='SUCCESS', attendance_type='office'),
+        event(2, '18:00', 'check-out', status='SUCCESS', attendance_type='office'),
+        # Day 3: Planned Field App / Offline Sync (type="IN"/"OUT", status="SUCCESS")
+        event(3, '10:00', 'IN', status='SUCCESS', attendance_type='remote_field'),
+        event(3, '18:00', 'OUT', status='SUCCESS', attendance_type='remote_field'),
+        # Day 4: FlyField App (status="SUCCESS")
+        event(4, '10:00', 'check-in', status='SUCCESS', attendance_type='remote_field', field_mode='flyfield'),
+        event(4, '18:00', 'check-out', status='SUCCESS', attendance_type='remote_field', field_mode='flyfield'),
+        # Day 5: WFH App historical logs (status="Present", source="wfh_desktop")
+        event(5, '10:00', 'check-in', status='Present', source='wfh_desktop', attendance_type='wfh'),
+        event(5, '18:00', 'check-out', status='Present', source='wfh_desktop', attendance_type='wfh'),
+        # Day 6: WFH App new logs (status="SUCCESS", source="wfh_desktop")
+        event(6, '10:00', 'check-in', status='SUCCESS', source='wfh_desktop', attendance_type='wfh'),
+        event(6, '18:00', 'check-out', status='SUCCESS', source='wfh_desktop', attendance_type='wfh'),
+        # Day 9 (Monday): Historical WFH check-in where check-out was auto-closed in wfh_sessions without an attendance_logs check-out
+        event(9, '10:00', 'check-in', status='Present', source='wfh_desktop', attendance_type='wfh'),
+    ]
+    row = report.summarize({}, logs, [], [], SETTINGS, '2026-11', NOW)
+    assert row['present'] == 6
+    assert row['absent'] == 15  # 21 working days minus 6 present days across all 4 apps
     assert row['review'] == 0
 
 

@@ -21,7 +21,7 @@ from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Tuple
 
 from bson import ObjectId
-from fastapi import APIRouter, Body, Depends, Form, HTTPException, Query
+from fastapi import APIRouter, Body, Cookie, Depends, Form, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse
 
@@ -345,6 +345,11 @@ def _render_action_html_page(title: str, badge_text: str, badge_color: str, mess
       You can safely close this browser tab.
     </p>
   </div>
+  <script>
+    if (window.history && window.history.replaceState && window.location.search) {{
+      window.history.replaceState(null, document.title, window.location.pathname);
+    }}
+  </script>
 </body>
 </html>"""
     return HTMLResponse(content=html, status_code=200)
@@ -587,16 +592,19 @@ def _is_alert_token_expired(alert_doc: dict, now_utc: Optional[datetime] = None)
 
 @router.get("/api/absence-alert/action", response_class=HTMLResponse)
 async def preview_absence_alert_email_action(
-    token: str = Query(..., description="Unique alert security token"),
-    action: str = Query(..., description="'send_mail' or 'reject'"),
+    token: Optional[str] = Query(None, description="Unique alert security token"),
+    action: Optional[str] = Query(None, description="'send_mail' or 'reject'"),
+    aa_token: Optional[str] = Cookie(None),
+    aa_action: Optional[str] = Cookie(None),
 ):
     """
     Safe GET confirmation page for 'Send Mail' or 'Reject' clicked inside the 4:00 PM admin email.
     Using a read-only GET page + POST form submission prevents corporate email security scanners
     (Outlook SafeLinks, Mimecast, Gmail link pre-fetchers) from accidentally triggering the penalty.
     """
-    clean_action = (action or "").strip().lower()
-    if clean_action not in ("send_mail", "reject"):
+    token = (token or aa_token or "").strip()
+    clean_action = (action or aa_action or "").strip().lower()
+    if clean_action not in ("send_mail", "reject") or not token:
         return _render_action_html_page(
             title="Invalid Action",
             badge_text="Error",
@@ -662,7 +670,7 @@ async def preview_absence_alert_email_action(
           </button>
         </form>
         """
-        return _render_action_html_page(
+        resp = _render_action_html_page(
             title="Confirm 1.5-Day Warning Email",
             badge_text="Action Confirmation",
             badge_color="#dc2626",
@@ -680,12 +688,15 @@ async def preview_absence_alert_email_action(
           </button>
         </form>
         """
-        return _render_action_html_page(
+        resp = _render_action_html_page(
             title="Confirm Reject Alert",
             badge_text="Reject Confirmation",
             badge_color="#475569",
             message_html=form_html,
         )
+    resp.set_cookie("aa_token", token, max_age=900, httponly=True, samesite="lax", path="/api/absence-alert")
+    resp.set_cookie("aa_action", clean_action, max_age=900, httponly=True, samesite="lax", path="/api/absence-alert")
+    return resp
 
 
 @router.post("/api/absence-alert/action", response_class=HTMLResponse)

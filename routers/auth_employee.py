@@ -136,14 +136,27 @@ async def register(req: RegisterRequest):
         if not req.face_image:
             raise HTTPException(status_code=400, detail="face_image is required for registration")
         
-        embedding = await run_in_threadpool(get_face_embedding, req.face_image)
+        from services.inference import run_inference
+        from upload_security import save_local_image
+        embedding = await run_inference(get_face_embedding, req.face_image)
         if embedding is None:
             raise HTTPException(status_code=400, detail="No face detected in image. Please try again with a clear photo.")
 
         # Create employee record
         hashed_password = await get_password_hash_async(req.password)
         invitation = await consume_invitation(req.invitation_token, clean_email)
+        emp_oid = ObjectId()
+        try:
+            profile_image_url = await save_local_image(
+                req.face_image,
+                {"_id": emp_oid, "email": clean_email, "organization_id": invitation["organization_id"]},
+                "onboarding",
+                "profiles",
+            )
+        except HTTPException:
+            profile_image_url = None
         employee_dict = {
+            "_id": emp_oid,
             "full_name": req.full_name,
             "email": clean_email,
             "employee_id": invitation["employee_id"],
@@ -153,7 +166,7 @@ async def register(req: RegisterRequest):
             "employee_type": invitation["employee_type"],
             "hashed_password": hashed_password,
             "face_embedding": embedding,
-            "profile_image": req.face_image,
+            "profile_image": profile_image_url,
             "device_id": req.device_id,
             "created_at": datetime.now(timezone.utc),
             "status": "Active"

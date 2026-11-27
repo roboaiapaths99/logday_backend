@@ -275,6 +275,11 @@ def classify_attendance_day(
             effective_days = 0.5
             classification_reason = f"Worked {worked_hours:.1f}h (< min half-day requirement {half_day_min_hours:.1f}h)"
 
+    # A day classified as Half Day is counted only as a Half Day (never double-counted as Late)
+    if is_half_day:
+        is_late = False
+        late_mins = 0
+
     # C) Short Leave is strictly for approved leave applications (never automatic)
     # D) Fallback states for standard working day
     if not is_half_day and not is_short_leave:

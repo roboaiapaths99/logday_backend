@@ -620,7 +620,10 @@ async def sync_offline_batch(req: SyncBatchRequest, background_tasks: Background
                     employee_type=employee.get("employee_type", "field"),
                     approved_leave=None
                 )
+                att_doc["status"] = "SUCCESS"
                 att_doc["attendance_status"] = classification["status"]
+                att_doc["is_late"] = classification["is_late"]
+                att_doc["is_early_leave"] = classification["is_early_leave"]
                 att_doc["is_short_leave"] = classification["is_short_leave"]
                 att_doc["is_half_day"] = classification["is_half_day"]
                 att_doc["short_leave_type"] = classification["short_leave_type"]
@@ -630,6 +633,7 @@ async def sync_offline_batch(req: SyncBatchRequest, background_tasks: Background
                 att_doc["late_off_hours"] = classification["late_off_hours"]
                 att_doc["early_off_hours"] = classification["early_off_hours"]
                 att_doc["off_hours"] = classification["off_hours"]
+                att_doc["effective_days"] = classification["effective_days"]
                 att_doc["classification_reason"] = classification["classification_reason"]
             except Exception as ex:
                 logger.warning(f"Offline sync classification error: {ex}")

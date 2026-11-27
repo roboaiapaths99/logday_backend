@@ -104,9 +104,9 @@ async def ensure_employee_indexes():
         (absence_alerts_collection, "token", {"unique": True, "sparse": True}),
         (leave_requests_collection, "penalty_key", {"unique": True, "sparse": True}),
         (payrolls_collection, [("organization_id", 1), ("employee_email", 1), ("payroll_month", 1)], {"unique": True, "sparse": True}),
-        (attendance_logs_collection, [("organization_id", 1), ("offline_id", 1)], {"unique": True, "sparse": True}),
-        (visit_logs_collection, [("organization_id", 1), ("offline_id", 1)], {"unique": True, "sparse": True}),
-        (location_pings_collection, [("organization_id", 1), ("offline_id", 1)], {"unique": True, "sparse": True}),
+        (attendance_logs_collection, [("organization_id", 1), ("offline_id", 1)], {"unique": True, "partialFilterExpression": {"offline_id": {"$type": "string"}}}),
+        (visit_logs_collection, [("organization_id", 1), ("offline_id", 1)], {"unique": True, "partialFilterExpression": {"offline_id": {"$type": "string"}}}),
+        (location_pings_collection, [("organization_id", 1), ("offline_id", 1)], {"unique": True, "partialFilterExpression": {"offline_id": {"$type": "string"}}}),
     ]
 
     try:
@@ -120,4 +120,13 @@ async def ensure_employee_indexes():
         try:
             await col.create_index(keys, **kwargs)
         except Exception as e:
-            logger.warning(f"Index creation skipped on {getattr(col, 'name', col)} ({keys}): {e}")
+            if "IndexOptionsConflict" in str(e) or "IndexKeySpecsConflict" in str(e) or getattr(e, "code", None) in (85, 86):
+                try:
+                    idx_name = "_".join(f"{k}_{d}" for k, d in keys) if isinstance(keys, list) else f"{keys}_1"
+                    await col.drop_index(idx_name)
+                    await col.create_index(keys, **kwargs)
+                    continue
+                except Exception:
+                    pass
+            logger.warning(f"Index creation skipped on {getattr(col, 'name', col)} ({keys}): {e}")
+

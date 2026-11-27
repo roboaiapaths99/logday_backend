@@ -125,31 +125,52 @@ async def admin_import_employees(file: bytes = File(...), current_admin: Admin =
         if not org_id:
             raise HTTPException(status_code=403, detail="Organization ID missing in admin context")
 
-        # Detect format: try CSV first, then Excel
-        try:
-            df = pd.read_csv(io.BytesIO(file))
-        except Exception:
+        # Detect format: try CSV first, then Excel (with stdlib csv fallback if pandas is unavailable)
+        rows_list: List[Dict[str, Any]] = []
+        columns_set: List[str] = []
+        if pd is not None:
             try:
-                df = pd.read_excel(io.BytesIO(file))
+                df = pd.read_csv(io.BytesIO(file))
+            except Exception:
+                try:
+                    df = pd.read_excel(io.BytesIO(file))
+                except Exception:
+                    raise HTTPException(status_code=400, detail="Unsupported file format. Please upload a .csv or .xlsx file.")
+            df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
+            columns_set = list(df.columns)
+            for _, r in df.iterrows():
+                rows_list.append({col: (None if pd.isna(r.get(col)) else r.get(col)) for col in columns_set})
+        else:
+            try:
+                text = file.decode("utf-8-sig")
+                reader = csv.DictReader(io.StringIO(text))
+                if not reader.fieldnames:
+                    raise ValueError("Empty CSV header")
+                raw_fields = list(reader.fieldnames)
+                norm_map = {f: f.strip().lower().replace(" ", "_") for f in raw_fields}
+                columns_set = list(norm_map.values())
+                for raw_row in reader:
+                    rows_list.append({norm_map[k]: v for k, v in raw_row.items() if k in norm_map})
             except Exception:
                 raise HTTPException(status_code=400, detail="Unsupported file format. Please upload a .csv or .xlsx file.")
         
-        # Normalize column names (strip whitespace, lowercase)
-        df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
-        
         required_cols = ["full_name", "email"]
         for col in required_cols:
-            if col not in df.columns:
+            if col not in columns_set:
                 raise HTTPException(status_code=400, detail=f"Missing required column: {col}. Required: full_name, email")
         
         created_count = 0
         updated_count = 0
         error_rows = []
         
-        for idx, row in df.iterrows():
+        def _has_val(v: Any) -> bool:
+            return v is not None and str(v).strip() != "" and str(v).strip().lower() != "nan"
+
+        for idx, row in enumerate(rows_list):
             try:
-                email = str(row["email"]).strip().lower()
-                if not email or email == "nan":
+                raw_email = row.get("email")
+                email = str(raw_email).strip().lower() if _has_val(raw_email) else ""
+                if not email:
                     error_rows.append({"row": idx + 2, "error": "Missing email"})
                     continue
                     
@@ -166,35 +187,54 @@ async def admin_import_employees(file: bytes = File(...), current_admin: Admin =
                     "beat_zone_name": "beat_zone_name",
                 }
                 for csv_col, db_field in field_map.items():
-                    if csv_col in df.columns:
+                    if csv_col in columns_set:
                         val = row.get(csv_col)
-                        if pd.notna(val) and str(val).strip():
+                        if _has_val(val):
                             update_fields[db_field] = str(val).strip()
                 
                 # Handle manager_email column for auto-assignment
-                if "manager_email" in df.columns:
+                if "manager_email" in columns_set:
                     mgr_email = row.get("manager_email")
-                    if pd.notna(mgr_email) and str(mgr_email).strip():
+                    if _has_val(mgr_email):
                         update_fields["manager_id"] = str(mgr_email).strip().lower()
                 
-                raw_password = str(row.get("password")).strip() if "password" in df.columns and pd.notna(row.get("password")) and str(row.get("password")).strip() else None
+                raw_password = str(row.get("password")).strip() if "password" in columns_set and _has_val(row.get("password")) else None
                 employee_id = update_fields.get("employee_id", email.split("@")[0])
 
                 if existing:
-                    # UPSERT: Update existing employee's metadata
+                    # Enforce tenant isolation & manager team scope before updating existing employee
+                    if str(existing.get("organization_id")) != str(org_id):
+                        error_rows.append({"row": idx + 2, "error": f"Email {email} belongs to another organization"})
+                        continue
+                    if current_admin.role == "manager" and existing.get("manager_id") != current_admin.email:
+                        error_rows.append({"row": idx + 2, "error": f"Email {email} is outside your manager team scope"})
+                        continue
+
+                    # UPSERT: Update existing employee's metadata within the same organization
                     if raw_password:
-                        update_fields["hashed_password"] = get_password_hash(raw_password)
+                        update_fields["hashed_password"] = await get_password_hash_async(raw_password)
                         update_fields["force_password_change"] = True
 
                     if update_fields:
+                        update_doc = {"$set": update_fields}
+                        if raw_password:
+                            update_doc["$inc"] = {"auth_version": 1}
                         await employees_collection.update_one(
-                            {"email": email},
-                            {"$set": update_fields}
+                            {"_id": existing["_id"], "organization_id": org_id},
+                            update_doc
                         )
+                        if raw_password:
+                            from database import auth_sessions_collection
+                            await auth_sessions_collection.update_many(
+                                {"account_id": str(existing["_id"]), "account_type": "employee"},
+                                {"$set": {"revoked": True}}
+                            )
                         updated_count += 1
                 else:
                     # CREATE: New employee
                     final_password = raw_password if raw_password else employee_id
+                    if current_admin.role == "manager" and "manager_id" not in update_fields:
+                        update_fields["manager_id"] = current_admin.email
                     
                     employee_dict = {
                         "full_name": update_fields.pop("full_name", email.split("@")[0]),
@@ -203,7 +243,7 @@ async def admin_import_employees(file: bytes = File(...), current_admin: Admin =
                         "designation": update_fields.pop("designation", "Employee"),
                         "department": update_fields.pop("department", "General"),
                         "employee_type": update_fields.pop("employee_type", "desk"),
-                        "hashed_password": get_password_hash(final_password),
+                        "hashed_password": await get_password_hash_async(final_password),
                         "force_password_change": True,
                         "face_embedding": None,
                         "profile_image": None,
@@ -255,20 +295,107 @@ async def get_import_template(current_admin: Admin = Depends(require_feature("em
     )
 
 
+async def _build_export_logs_query_and_enrich(
+    current_admin: Admin,
+    month: Optional[str] = None,
+    date: Optional[str] = None,
+):
+    org_id = current_admin.organization_id
+    if not org_id and not _is_superadmin(current_admin):
+        raise HTTPException(status_code=403, detail="Organization context required")
+
+    tz_offset = 330
+    if org_id:
+        org_settings = await settings_collection.find_one({"organization_id": org_id})
+        if org_settings and org_settings.get("timezone_offset") is not None:
+            tz_offset = int(org_settings.get("timezone_offset", 330))
+
+    org_employees = await employees_collection.find(
+        get_employee_filter(current_admin),
+        {"_id": 1, "email": 1, "full_name": 1}
+    ).to_list(None)
+
+    org_emp_ids = [str(emp["_id"]) for emp in org_employees if emp.get("_id") is not None]
+    org_emp_emails = list({
+        e
+        for emp in org_employees
+        if emp.get("email")
+        for e in (emp["email"], emp["email"].strip().lower())
+    })
+
+    emp_map = {}
+    for emp in org_employees:
+        if emp.get("_id") is not None:
+            emp_map[str(emp["_id"])] = emp
+        if emp.get("email"):
+            emp_map[emp["email"]] = emp
+            emp_map[emp["email"].strip().lower()] = emp
+
+    period_label = datetime.now(timezone.utc).astimezone(timezone(timedelta(minutes=tz_offset))).strftime("%Y%m%d")
+    if not org_emp_ids and not org_emp_emails:
+        return [], tz_offset, period_label
+
+    query: Dict[str, Any] = {
+        "$or": [
+            {"user_id": {"$in": org_emp_ids}},
+            {"email": {"$in": org_emp_emails}},
+        ]
+    }
+
+    local_tz = timezone(timedelta(minutes=tz_offset))
+    if date:
+        try:
+            dt_start = datetime.strptime(date.strip(), "%Y-%m-%d").replace(tzinfo=local_tz)
+            dt_end = dt_start + timedelta(days=1)
+            query["timestamp"] = {
+                "$gte": dt_start.astimezone(timezone.utc),
+                "$lt": dt_end.astimezone(timezone.utc),
+            }
+            period_label = date.strip()
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid date format. Expected YYYY-MM-DD.")
+    elif month:
+        try:
+            year, mon = map(int, month.strip().split("-"))
+            dt_start = datetime(year, mon, 1, tzinfo=local_tz)
+            if mon == 12:
+                dt_end = datetime(year + 1, 1, 1, tzinfo=local_tz)
+            else:
+                dt_end = datetime(year, mon + 1, 1, tzinfo=local_tz)
+            query["timestamp"] = {
+                "$gte": dt_start.astimezone(timezone.utc),
+                "$lt": dt_end.astimezone(timezone.utc),
+            }
+            period_label = month.strip()
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid month format. Expected YYYY-MM.")
+
+    logs = await attendance_logs_collection.find(query).sort("timestamp", -1).to_list(length=5000)
+    for log in logs:
+        emp = emp_map.get(str(log.get("user_id", ""))) or emp_map.get((log.get("email") or "").strip().lower())
+        if emp:
+            if not log.get("full_name"):
+                log["full_name"] = emp.get("full_name") or emp.get("email")
+            if not log.get("email"):
+                log["email"] = emp.get("email")
+        elif not log.get("full_name") and log.get("employee_name"):
+            log["full_name"] = log.get("employee_name")
+
+    return logs, tz_offset, period_label
+
+
 @router.get("/admin/export-logs-pdf")
-async def admin_export_logs_pdf(current_admin: Admin = Depends(require_feature("attendance"))):
-    """Generate a PDF report of all attendance logs for the admin's organization/team scope."""
+async def admin_export_logs_pdf(
+    month: Optional[str] = None,
+    date: Optional[str] = None,
+    current_admin: Admin = Depends(require_feature("attendance")),
+):
+    """Generate a PDF report of attendance logs for the admin's organization/team scope."""
     try:
-        org_id = current_admin.organization_id
-        if not org_id and not _is_superadmin(current_admin):
-            raise HTTPException(status_code=403, detail="Organization context required")
-
-        # Enforce both tenant and manager team scope
-        org_employees = await employees_collection.find(get_employee_filter(current_admin), {"_id": 1}).to_list(None)
-        org_emp_ids = [str(emp["_id"]) for emp in org_employees]
-
-        cursor = attendance_logs_collection.find({"user_id": {"$in": org_emp_ids}}).sort("timestamp", -1)
-        logs = await cursor.to_list(length=5000)
+        logs, tz_offset, period_label = await _build_export_logs_query_and_enrich(
+            current_admin, month=month, date=date
+        )
+        local_tz = timezone(timedelta(minutes=tz_offset))
 
         def _build_pdf():
             buffer = io.BytesIO()
@@ -277,14 +404,16 @@ async def admin_export_logs_pdf(current_admin: Admin = Depends(require_feature("
 
             styles = getSampleStyleSheet()
             elements.append(Paragraph("LogDay Attendance Audit Report", styles['Title']))
-            elements.append(Paragraph(f"Generated on: {datetime.now(timezone.utc).astimezone(timezone(timedelta(minutes=330))).strftime('%Y-%m-%d %I:%M %p')} (IST)", styles['Normal']))
+            elements.append(Paragraph(f"Generated on: {datetime.now(timezone.utc).astimezone(local_tz).strftime('%Y-%m-%d %I:%M %p')}", styles['Normal']))
             elements.append(Spacer(1, 20))
 
             data = [["Timestamp", "Employee Name", "Type", "Location", "Verification"]]
             for log in logs:
                 ts = log.get("timestamp")
                 if isinstance(ts, datetime):
-                    ist_ts = ts.astimezone(timezone(timedelta(minutes=330)))
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=timezone.utc)
+                    ist_ts = ts.astimezone(local_tz)
                     ts_str = ist_ts.strftime("%Y-%m-%d %I:%M %p")
                 else:
                     ts_str = str(ts)
@@ -318,7 +447,7 @@ async def admin_export_logs_pdf(current_admin: Admin = Depends(require_feature("
         return StreamingResponse(
             buffer,
             media_type="application/pdf",
-            headers={"Content-Disposition": f"attachment; filename=attendance_report_{datetime.now(timezone.utc).astimezone(timezone(timedelta(minutes=330))).strftime('%Y%m%d')}.pdf"}
+            headers={"Content-Disposition": f"attachment; filename=attendance_report_{period_label}.pdf"}
         )
     except HTTPException:
         raise
@@ -328,24 +457,28 @@ async def admin_export_logs_pdf(current_admin: Admin = Depends(require_feature("
 
 
 @router.get("/admin/export-logs-excel")
-async def admin_export_logs_excel(current_admin: Admin = Depends(require_feature("attendance"))):
+async def admin_export_logs_excel(
+    month: Optional[str] = None,
+    date: Optional[str] = None,
+    current_admin: Admin = Depends(require_feature("attendance")),
+):
     """Export attendance logs to Excel for the admin's organization/team scope."""
     try:
-        org_id = current_admin.organization_id
-        if not org_id and not _is_superadmin(current_admin):
-            raise HTTPException(status_code=403, detail="Organization context required")
-
-        # Enforce both tenant and manager team scope
-        org_employees = await employees_collection.find(get_employee_filter(current_admin), {"_id": 1}).to_list(None)
-        org_emp_ids = [str(emp["_id"]) for emp in org_employees]
-
-        logs = await attendance_logs_collection.find({"user_id": {"$in": org_emp_ids}}).sort("timestamp", -1).to_list(5000)
+        logs, tz_offset, period_label = await _build_export_logs_query_and_enrich(
+            current_admin, month=month, date=date
+        )
+        local_tz = timezone(timedelta(minutes=tz_offset))
 
         headers_list = ["Employee", "Email", "Time", "Type", "Late", "Late Mins", "Address", "WiFi", "Distance (m)", "Duration (h)"]
         rows_data = []
         for log in logs:
             ts = log.get("timestamp")
-            time_str = (ts.astimezone(timezone(timedelta(minutes=330))).strftime("%Y-%m-%d %H:%M:%S") + " (IST)") if isinstance(ts, datetime) else (str(ts) if ts else "N/A")
+            if isinstance(ts, datetime):
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                time_str = ts.astimezone(local_tz).strftime("%Y-%m-%d %H:%M:%S")
+            else:
+                time_str = str(ts) if ts else "N/A"
             rows_data.append({
                 "Employee": log.get("full_name") or log.get("email") or "",
                 "Email": log.get("email") or "",
@@ -397,7 +530,7 @@ async def admin_export_logs_excel(current_admin: Admin = Depends(require_feature
         return StreamingResponse(
             buffer,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={"Content-Disposition": f"attachment; filename=attendance_logs_{datetime.now(timezone.utc).astimezone(timezone(timedelta(minutes=330))).strftime('%Y%m%d')}.xlsx"}
+            headers={"Content-Disposition": f"attachment; filename=attendance_logs_{period_label}.xlsx"}
         )
     except HTTPException:
         raise
@@ -751,19 +884,18 @@ async def admin_all_logs(
 ):
     """Fetch all attendance logs for the organization (Role Scoped)."""
     filter_query = get_employee_filter(current_admin)
-    
-    # If filter has manager_id, we need to find user_ids first
-    if "manager_id" in filter_query:
-        org_employees = await employees_collection.find(filter_query, {"_id": 1}).to_list(None)
-        org_emp_ids = [str(emp["_id"]) for emp in org_employees]
-        log_query = {"user_id": {"$in": org_emp_ids}}
-    else:
-        # For non-manager admins, we still need to filter by org usually
-        # but our helper handles that mapping based on roles
-        log_emp_filter = get_employee_filter(current_admin)
-        org_employees = await employees_collection.find(log_emp_filter, {"_id": 1}).to_list(None)
-        org_emp_ids = [str(emp["_id"]) for emp in org_employees]
-        log_query = {"user_id": {"$in": org_emp_ids}}
+    org_employees = await employees_collection.find(
+        filter_query,
+        {"_id": 1, "full_name": 1, "email": 1, "profile_image": 1}
+    ).to_list(None)
+    org_emp_ids = [str(emp["_id"]) for emp in org_employees]
+    org_emp_emails = [emp.get("email") for emp in org_employees if emp.get("email")]
+    log_query = {
+        "$or": [
+            {"user_id": {"$in": org_emp_ids}},
+            {"email": {"$in": org_emp_emails}}
+        ]
+    }
 
     if month:
         try:
@@ -780,22 +912,24 @@ async def admin_all_logs(
         except ValueError:
             pass
 
-    # If month provided, maybe fetch more or no limit? The limit is defaults to 100
     if month:
         cursor = attendance_logs_collection.find(log_query).sort("timestamp", -1).limit(5000)
     else:
         cursor = attendance_logs_collection.find(log_query).sort("timestamp", -1).limit(limit)
         
     logs = await cursor.to_list(length=5000 if month else limit)
-    # Enrich with employee details for the UI
-    employees = await employees_collection.find({"_id": {"$in": [ObjectId(uid) for uid in org_emp_ids if ObjectId.is_valid(uid)]}}, {"full_name": 1, "email": 1, "profile_image": 1}).to_list(None)
-    emp_map = {str(e["_id"]): e for e in employees}
+    emp_map = {}
+    for e in org_employees:
+        emp_map[str(e["_id"])] = e
+        if e.get("email"):
+            emp_map[e["email"]] = e
+            emp_map[e["email"].strip().lower()] = e
     
     for log in logs:
         log["_id"] = str(log["_id"])
-        emp = emp_map.get(log.get("user_id"), {})
-        log["full_name"] = emp.get("full_name", "Unknown")
-        log["email"] = emp.get("email", "")
+        emp = emp_map.get(log.get("user_id")) or emp_map.get((log.get("email") or "").strip().lower()) or {}
+        log["full_name"] = emp.get("full_name", log.get("employee_name") or "Unknown")
+        log["email"] = emp.get("email", log.get("email") or "")
         log["profile_image"] = emp.get("profile_image", "")
         if isinstance(log.get("timestamp"), datetime):
             log["timestamp"] = log["timestamp"].replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
@@ -812,13 +946,27 @@ async def admin_create_employee(req: RegisterRequest, current_admin: Admin = Dep
         raise HTTPException(status_code=400, detail="Email already registered")
     
     # Embedding is optional for manual registration if they will enroll later
+    target_org_id = req.organization_id if (req.organization_id and _is_superadmin(current_admin)) else current_admin.organization_id
+    emp_oid = ObjectId()
     embedding = None
+    profile_image_url = None
     if req.face_image:
         from services.inference import run_inference
+        from upload_security import save_local_image
         embedding = await run_inference(get_face_embedding, req.face_image)
+        try:
+            profile_image_url = await save_local_image(
+                req.face_image,
+                {"_id": emp_oid, "email": clean_email, "organization_id": target_org_id},
+                "onboarding",
+                "profiles",
+            )
+        except HTTPException:
+            profile_image_url = None
 
     hashed_password = await get_password_hash_async(req.password)
     employee_dict = {
+        "_id": emp_oid,
         "full_name": req.full_name,
         "email": clean_email,
         "employee_id": req.employee_id,
@@ -826,13 +974,13 @@ async def admin_create_employee(req: RegisterRequest, current_admin: Admin = Dep
         "department": req.department,
         "hashed_password": hashed_password,
         "face_embedding": embedding,
-        "profile_image": req.face_image if req.face_image else None,
+        "profile_image": profile_image_url,
         "device_id": None, # Force bind on first use
         "created_at": datetime.now(timezone.utc),
         "needs_face_enrollment": True if not embedding else False,
         "employee_type": req.employee_type,
         "field_mode": getattr(req, "field_mode", "planned") or "planned",
-        "organization_id": req.organization_id if (req.organization_id and _is_superadmin(current_admin)) else current_admin.organization_id,  # Superadmin can target any org
+        "organization_id": target_org_id,  # Superadmin can target any org
         "force_password_change": True,  # Employee must set their own password on first desk login
         "status": "Active"
     }
@@ -1073,11 +1221,32 @@ async def get_admin_stats(admin: dict = Depends(require_feature("dashboard"))):
         ]
     }
          
-    today_checkins = await attendance_logs_collection.find(logs_query).to_list(2000)
-    clocked_in_today = len(today_checkins)
-    late_arrivals_today = sum(1 for l in today_checkins if l.get("is_late") or l.get("attendance_status") == "Late")
-    short_leaves_today = sum(1 for l in today_checkins if l.get("is_short_leave") or l.get("attendance_status") == "Short Leave")
-    half_days_today = sum(1 for l in today_checkins if l.get("is_half_day") or l.get("attendance_status") == "Half Day")
+    today_checkins = await attendance_logs_collection.find(logs_query).sort("timestamp", 1).to_list(2000)
+    canonical_emp_key = {}
+    for emp in org_employees:
+        eid_str = str(emp["_id"])
+        canonical_emp_key[eid_str] = eid_str
+        if emp.get("email"):
+            canonical_emp_key[emp["email"]] = eid_str
+            canonical_emp_key[emp["email"].strip().lower()] = eid_str
+
+    first_checkin_by_emp = {}
+    for l in today_checkins:
+        if str(l.get("status", "success")).lower() in ("failed", "error", "rejected", "invalid"):
+            continue
+        emp_key = (
+            canonical_emp_key.get(str(l.get("user_id") or ""))
+            or canonical_emp_key.get((l.get("email") or "").strip().lower())
+            or str(l.get("user_id") or (l.get("email") or "").strip().lower())
+        )
+        if emp_key and emp_key not in first_checkin_by_emp:
+            first_checkin_by_emp[emp_key] = l
+
+    unique_today_checkins = list(first_checkin_by_emp.values())
+    clocked_in_today = len(unique_today_checkins)
+    late_arrivals_today = sum(1 for l in unique_today_checkins if l.get("is_late") or l.get("attendance_status") == "Late")
+    short_leaves_today = sum(1 for l in unique_today_checkins if l.get("is_short_leave") or l.get("attendance_status") == "Short Leave")
+    half_days_today = sum(1 for l in unique_today_checkins if l.get("is_half_day") or l.get("attendance_status") == "Half Day")
     
     # Alerts & Fraud Detection Stats
     alert_query = {
@@ -1143,39 +1312,247 @@ async def get_admin_stats(admin: dict = Depends(require_feature("dashboard"))):
 
 
 @router.get("/admin/stats/attendance-chart")
-async def get_attendance_chart(admin: dict = Depends(require_feature("dashboard"))):
-    """Attendance volume over the last 7 days (Role Scoped)."""
+async def get_attendance_chart(
+    days: int = Query(7, ge=1, le=90),
+    admin: dict = Depends(require_feature("dashboard"))
+):
+    """Attendance volume over the last N days (Role Scoped, single batched query counting unique employees per day)."""
     filter_query = get_employee_filter(admin)
-    org_employees = await employees_collection.find(filter_query, {"_id": 1}).to_list(None)
+    org_employees = await employees_collection.find(filter_query, {"_id": 1, "email": 1}).to_list(None)
     org_emp_ids = [str(emp["_id"]) for emp in org_employees]
+    org_emp_emails = [emp.get("email") for emp in org_employees if emp.get("email")]
+
+    canonical_emp_key = {}
+    for emp in org_employees:
+        eid_str = str(emp["_id"])
+        canonical_emp_key[eid_str] = eid_str
+        if emp.get("email"):
+            canonical_emp_key[emp["email"]] = eid_str
+            canonical_emp_key[emp["email"].strip().lower()] = eid_str
 
     org_settings = await settings_collection.find_one({"organization_id": admin.organization_id})
-    tz_offset = org_settings.get("timezone_offset", 330) if org_settings else 330
+    tz_offset = int(org_settings.get("timezone_offset", 330)) if org_settings else 330
+
+    local_now = datetime.now(timezone.utc) + timedelta(minutes=tz_offset)
+    today_start_local = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    window_start_local = today_start_local - timedelta(days=days - 1)
+    window_end_local = today_start_local + timedelta(days=1)
+
+    window_start_utc = window_start_local - timedelta(minutes=tz_offset)
+    window_end_utc = window_end_local - timedelta(minutes=tz_offset)
+
+    logs = await attendance_logs_collection.find({
+        "timestamp": {"$gte": window_start_utc, "$lt": window_end_utc},
+        "type": {"$in": ["check-in", "IN"]},
+        "$or": [
+            {"user_id": {"$in": org_emp_ids}},
+            {"email": {"$in": org_emp_emails}}
+        ]
+    }).to_list(length=None)
+
+    unique_emps_by_date: Dict[str, set] = {}
+    for l in logs:
+        if str(l.get("status", "success")).lower() in ("failed", "error", "rejected", "invalid"):
+            continue
+        ts = l.get("timestamp")
+        if not isinstance(ts, datetime):
+            continue
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        local_ts = ts + timedelta(minutes=tz_offset)
+        d_key = local_ts.strftime("%Y-%m-%d")
+        emp_key = (
+            canonical_emp_key.get(str(l.get("user_id") or ""))
+            or canonical_emp_key.get((l.get("email") or "").strip().lower())
+            or str(l.get("user_id") or (l.get("email") or "").strip().lower())
+        )
+        if emp_key:
+            unique_emps_by_date.setdefault(d_key, set()).add(emp_key)
 
     chart_data = []
-    local_now = datetime.now(timezone.utc) + timedelta(minutes=tz_offset)
-    
-    for i in range(6, -1, -1):
-        day = local_now - timedelta(days=i)
-        day_str = day.strftime("%a") # Mon, Tue...
-        
-        # Local boundaries for this day
-        day_start_local = day.replace(hour=0, minute=0, second=0, microsecond=0)
-        day_end_local = day_start_local + timedelta(days=1)
-        
-        # Convert back to UTC for query
-        day_start_utc = day_start_local - timedelta(minutes=tz_offset)
-        day_end_utc = day_end_local - timedelta(minutes=tz_offset)
-        
-        count = await attendance_logs_collection.count_documents({
-            "timestamp": {"$gte": day_start_utc, "$lt": day_end_utc},
-            "type": "check-in",
-            "user_id": {"$in": org_emp_ids}
-        })
-        
-        chart_data.append({"name": day_str, "count": count})
-        
+    for i in range(days - 1, -1, -1):
+        day = today_start_local - timedelta(days=i)
+        d_key = day.strftime("%Y-%m-%d")
+        label = day.strftime("%a") if days <= 7 else day.strftime("%d %b")
+        chart_data.append({"name": label, "date": d_key, "count": len(unique_emps_by_date.get(d_key, set()))})
+
     return chart_data
+
+
+@router.post("/admin/attendance/regularize")
+async def admin_regularize_attendance(req: dict, current_admin: Admin = Depends(require_feature("attendance"))):
+    """
+    Admin manually adds or regularizes a missed check-out (or full day check-in + check-out) for an employee.
+    """
+    raw_email = (req.get("email") or "").strip().lower()
+    date_str = (req.get("date") or "").strip()
+    check_in_time_str = (req.get("check_in_time") or "").strip()
+    check_out_time_str = (req.get("check_out_time") or "18:00").strip()
+    reason = (req.get("reason") or "Admin attendance regularization").strip()
+
+    if not raw_email or not date_str:
+        raise HTTPException(status_code=400, detail="email and date (YYYY-MM-DD) are required")
+
+    try:
+        target_date = datetime.strptime(date_str, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format. Expected YYYY-MM-DD")
+
+    emp_filter = get_employee_filter(current_admin)
+    emp = await employees_collection.find_one({"email": raw_email, **emp_filter})
+    if not emp:
+        raise HTTPException(status_code=404, detail="Employee not found or outside your scope")
+
+    org_id = emp.get("organization_id") or current_admin.organization_id
+    org_settings = await get_effective_org_settings(org_id) if org_id else {}
+    tz_offset = int((org_settings or {}).get("timezone_offset", 330))
+
+    def _parse_hhmm(hhmm: str, default_h: int, default_m: int):
+        try:
+            parts = hhmm.split(":")
+            h, m = int(parts[0]), int(parts[1])
+            if 0 <= h <= 23 and 0 <= m <= 59:
+                return h, m
+        except Exception:
+            pass
+        return default_h, default_m
+
+    day_start_local = datetime(target_date.year, target_date.month, target_date.day, 0, 0, 0, tzinfo=timezone.utc)
+    day_end_local = day_start_local + timedelta(days=1)
+    day_start_utc = day_start_local - timedelta(minutes=tz_offset)
+    day_end_utc = day_end_local - timedelta(minutes=tz_offset)
+
+    user_id_str = str(emp["_id"])
+    existing_logs = await attendance_logs_collection.find({
+        "organization_id": org_id,
+        "$or": [
+            {"user_id": user_id_str},
+            {"email": raw_email}
+        ],
+        "timestamp": {"$gte": day_start_utc, "$lt": day_end_utc}
+    }).sort("timestamp", 1).to_list(length=50)
+
+    existing_checkin = next((l for l in existing_logs if str(l.get("type", "")).lower() in ("check-in", "in", "wfh_checkin")), None)
+    existing_checkout = next((l for l in reversed(existing_logs) if str(l.get("type", "")).lower() in ("check-out", "out", "wfh_checkout")), None)
+
+    out_h, out_m = _parse_hhmm(check_out_time_str, 18, 0)
+    checkout_local = day_start_local.replace(hour=out_h, minute=out_m)
+    checkout_utc = checkout_local - timedelta(minutes=tz_offset)
+
+    if existing_checkin:
+        in_ts = existing_checkin["timestamp"]
+        if in_ts.tzinfo is None:
+            in_ts = in_ts.replace(tzinfo=timezone.utc)
+        if check_in_time_str:
+            in_h, in_m = _parse_hhmm(check_in_time_str, 9, 0)
+            checkin_local = day_start_local.replace(hour=in_h, minute=in_m)
+            checkin_utc = checkin_local - timedelta(minutes=tz_offset)
+            in_ts = checkin_utc
+        else:
+            checkin_local = in_ts + timedelta(minutes=tz_offset)
+            checkin_utc = in_ts
+    else:
+        in_h, in_m = _parse_hhmm(check_in_time_str or "09:00", 9, 0)
+        checkin_local = day_start_local.replace(hour=in_h, minute=in_m)
+        checkin_utc = checkin_local - timedelta(minutes=tz_offset)
+
+    if checkout_utc <= checkin_utc:
+        checkout_utc = checkin_utc + timedelta(hours=8)
+        checkout_local = checkin_local + timedelta(hours=8)
+
+    worked_hours = round(max(0.0, (checkout_utc - checkin_utc).total_seconds() / 3600.0), 2)
+
+    approved_leave = await leave_requests_collection.find_one({
+        "organization_id": org_id,
+        "$or": [{"employee_id": raw_email}, {"email": raw_email}, {"employee_id": user_id_str}],
+        "status": {"$regex": "^approved$", "$options": "i"},
+        "start_date": {"$lte": date_str},
+        "end_date": {"$gte": date_str}
+    })
+
+    classification = classify_attendance_day(
+        first_checkin_local=checkin_local,
+        last_checkout_local=checkout_local,
+        worked_hours=worked_hours,
+        settings=org_settings or {},
+        employee_type=emp.get("employee_type", "desk"),
+        approved_leave=approved_leave
+    )
+
+    emp_mode = str(emp.get("employee_type") or "desk").lower()
+    att_type_val = "wfh" if emp_mode == "wfh" else ("remote_field" if emp_mode == "field" else "office")
+
+    common_meta = {
+        "status": "SUCCESS",
+        "attendance_status": classification["status"],
+        "is_late": classification["is_late"],
+        "is_early_leave": classification["is_early_leave"],
+        "is_short_leave": classification["is_short_leave"],
+        "is_half_day": classification["is_half_day"],
+        "short_leave_type": classification["short_leave_type"],
+        "half_day_type": classification["half_day_type"],
+        "late_mins": classification["late_mins"],
+        "early_exit_mins": classification["early_exit_mins"],
+        "off_hours": classification["off_hours"],
+        "worked_hours": classification["worked_hours"],
+        "required_hours": classification["required_hours"],
+        "effective_days": classification["effective_days"],
+        "classification_reason": f"{classification['classification_reason']} (Regularized: {reason})",
+        "is_applied_leave": classification["is_applied_leave"],
+        "regularized_by": current_admin.email,
+        "regularized_at": datetime.now(timezone.utc),
+        "regularization_reason": reason
+    }
+
+    if existing_checkin:
+        await attendance_logs_collection.update_one(
+            {"_id": existing_checkin["_id"]},
+            {"$set": {"timestamp": checkin_utc, **common_meta}}
+        )
+    else:
+        await attendance_logs_collection.insert_one({
+            "user_id": user_id_str,
+            "email": raw_email,
+            "employee_name": emp.get("full_name", raw_email),
+            "organization_id": org_id,
+            "timestamp": checkin_utc,
+            "type": "check-in",
+            "attendance_type": att_type_val,
+            "field_mode": emp.get("field_mode"),
+            "check_in_method": "admin_regularized",
+            "location_name": f"Regularized by Admin ({reason})",
+            "address": f"Regularized by Admin ({reason})",
+            "selfie_verified": False,
+            **common_meta
+        })
+
+    if existing_checkout:
+        await attendance_logs_collection.update_one(
+            {"_id": existing_checkout["_id"]},
+            {"$set": {"timestamp": checkout_utc, **common_meta}}
+        )
+    else:
+        await attendance_logs_collection.insert_one({
+            "user_id": user_id_str,
+            "email": raw_email,
+            "employee_name": emp.get("full_name", raw_email),
+            "organization_id": org_id,
+            "timestamp": checkout_utc,
+            "type": "check-out",
+            "attendance_type": att_type_val,
+            "field_mode": emp.get("field_mode"),
+            "check_in_method": "admin_regularized",
+            "location_name": f"Regularized by Admin ({reason})",
+            "address": f"Regularized by Admin ({reason})",
+            "selfie_verified": False,
+            **common_meta
+        })
+
+    return {
+        "status": "success",
+        "message": f"Attendance regularized for {emp.get('full_name') or raw_email} on {date_str}",
+        "classification": classification
+    }
 
 
 @router.get("/admin/live-feed")
@@ -1186,9 +1563,20 @@ async def get_admin_live_feed(skip: int = 0, limit: int = 50, admin: dict = Depe
     # Get relevant employee details for mapping
     org_employees = await employees_collection.find(filter_query, {"_id": 1, "full_name": 1, "email": 1, "profile_image": 1}).to_list(None)
     org_emp_ids = [str(emp["_id"]) for emp in org_employees]
-    emp_map = {str(emp["_id"]): emp for emp in org_employees}
+    org_emp_emails = [emp.get("email") for emp in org_employees if emp.get("email")]
+    emp_map = {}
+    for emp in org_employees:
+        emp_map[str(emp["_id"])] = emp
+        if emp.get("email"):
+            emp_map[emp["email"]] = emp
+            emp_map[emp["email"].strip().lower()] = emp
     
-    logs_query = {"user_id": {"$in": org_emp_ids}}
+    logs_query = {
+        "$or": [
+            {"user_id": {"$in": org_emp_ids}},
+            {"email": {"$in": org_emp_emails}}
+        ]
+    }
     
     total_logs = await attendance_logs_collection.count_documents(logs_query)
     cursor = attendance_logs_collection.find(logs_query).sort("timestamp", -1).skip(skip).limit(limit)
@@ -1196,9 +1584,9 @@ async def get_admin_live_feed(skip: int = 0, limit: int = 50, admin: dict = Depe
     
     for log in logs:
         log["_id"] = str(log["_id"])
-        emp = emp_map.get(log.get("user_id"), {})
-        log["employee_name"] = emp.get("full_name", "Unknown")
-        log["employee_email"] = emp.get("email", "")
+        emp = emp_map.get(log.get("user_id")) or emp_map.get((log.get("email") or "").strip().lower()) or {}
+        log["employee_name"] = emp.get("full_name", log.get("employee_name") or "Unknown")
+        log["employee_email"] = emp.get("email", log.get("email") or "")
         log["profile_image"] = emp.get("profile_image", "")
         if isinstance(log.get("timestamp"), datetime):
             ts = log["timestamp"]

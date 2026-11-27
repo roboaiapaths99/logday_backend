@@ -18,15 +18,13 @@ COLUMNS = [
     ('serial', 'Serial No.'), ('name', 'Employee Name'), ('email', 'Email ID'),
     ('present', 'Full Present Days'), ('absent', 'Absent Days'), ('late', 'Late Entry Days'),
     ('half', 'Half Days'), ('leave_pending', 'Leave Balance (Days)'),
-    ('pending_requests', 'Pending Leave Days'),
 ]
 NOTES = ('All employees in your permitted scope; page search/mode filters do not apply. '
          'Completed local dates only (today and future days excluded). Full present means a completed '
          'attendance day with full credit under current rules, excluding half days and short leave. '
          'Late entry is an overlapping flag using current organization rules. Weekends and configured '
-         'holidays are excluded from absence. Leave balance uses the existing selected-month balance engine; '
-         'pending leave days means requests awaiting approval. Monthly calendar totals cover the entire month; '
-         'attendance totals cover completed dates only.')
+         'holidays are excluded from absence. Leave balance uses the existing selected-month balance engine. '
+         'Monthly calendar totals cover the entire month; attendance totals cover completed dates only.')
 
 
 def days_off(holidays):
@@ -65,8 +63,13 @@ def summarize(employee, logs, leaves, holidays, settings, month, now):
     days = defaultdict(list)
     valid_logs = []
     for log in logs:
-        if str(log.get('status', 'success')).lower() != 'success' or not log.get('timestamp'):
+        if str(log.get('status', 'success')).lower() in ('failed', 'error', 'rejected', 'invalid') or not log.get('timestamp'):
             continue
+        raw_type = str(log.get('type', '')).strip().lower()
+        if raw_type in ('in', 'check_in', 'wfh_checkin'):
+            log = {**log, 'type': 'check-in'}
+        elif raw_type in ('out', 'check_out', 'wfh_checkout'):
+            log = {**log, 'type': 'check-out'}
         valid_logs.append(log)
         days[(as_utc(log['timestamp']) + offset).date()].append(log)
     valid_logs.sort(key=lambda l: as_utc(l['timestamp']))
@@ -93,7 +96,7 @@ def summarize(employee, logs, leaves, holidays, settings, month, now):
 
     row = dict(name=employee.get('full_name') or '', email=employee.get('email') or '',
                **{key: 0 for key, _ in COLUMNS if key not in ('name', 'email')})
-    row.update(approved=0, short=0, review=0, hours=0)
+    row.update(approved=0, short=0, review=0, hours=0, pending_requests=0)
     off = days_off(holidays)
     joined = employee.get('date_of_joining') or employee.get('joining_date') or employee.get('created_at')
     joined_date = None
@@ -144,6 +147,22 @@ def summarize(employee, logs, leaves, holidays, settings, month, now):
                 seconds += max(0, (stamp - opened).total_seconds())
                 opened = None
                 last_out = stamp
+        is_wfh_day = any(
+            c.get('source') in ('wfh_desktop', 'wfh_desktop_autoclose')
+            or c.get('attendance_type') == 'wfh'
+            or c.get('check_in_method') == 'wfh_desktop'
+            for c in checkins
+        )
+        if (opened is not None or last_out is None) and is_wfh_day:
+            first_stamp = opened or as_utc(checkins[0]['timestamp'])
+            fallback_hours = float(checkins[0].get('worked_hours') or 8.0)
+            if fallback_hours <= 0:
+                fallback_hours = 8.0
+            synth_out = first_stamp + timedelta(hours=min(fallback_hours, 8.0))
+            if opened is not None:
+                seconds += max(0, (synth_out - opened).total_seconds())
+                opened = None
+            last_out = synth_out
         hours = seconds / 3600
         row['hours'] += hours
         result = classify_attendance_day(as_utc(checkins[0]['timestamp']) + offset,
@@ -191,8 +210,15 @@ async def build_report(admin, month, now=None):
         working_days_by_org[str(org)] = working_days(month, holidays)
         logs_by_email = defaultdict(list)
         leaves_by_identity = defaultdict(list)
+        email_by_uid = {str(e.get('_id')): (e.get('email') or '').strip().lower() for e in staff if e.get('_id')}
         for log in logs:
-            logs_by_email[log.get('email')].append(log)
+            raw_em = (log.get('email') or '').strip()
+            if raw_em:
+                logs_by_email[raw_em].append(log)
+                if raw_em.lower() != raw_em:
+                    logs_by_email[raw_em.lower()].append(log)
+            elif log.get('user_id') and str(log.get('user_id')) in email_by_uid:
+                logs_by_email[email_by_uid[str(log.get('user_id'))]].append(log)
         for leave in leaves:
             for identity in {str(leave.get('email') or ''), str(leave.get('employee_id') or '')} - {''}:
                 leaves_by_identity[identity].append(leave)
@@ -230,14 +256,14 @@ def render_xlsx(report):
             return f'<c s="{style}"><v>{value}</v></c>'
         clean = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', str(value))
         return f'<c s="{style}" t="inlineStr"><is><t xml:space="preserve">{escape(clean)}</t></is></c>'
-    sheet = '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetViews><sheetView workbookViewId="0"><pane ySplit="6" topLeftCell="A7" state="frozen"/></sheetView></sheetViews><cols><col min="1" max="1" width="10" customWidth="1"/><col min="2" max="2" width="28" customWidth="1"/><col min="3" max="3" width="38" customWidth="1"/><col min="4" max="9" width="23" customWidth="1"/></cols><sheetData>'
+    sheet = '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetViews><sheetView workbookViewId="0"><pane ySplit="6" topLeftCell="A7" state="frozen"/></sheetView></sheetViews><cols><col min="1" max="1" width="10" customWidth="1"/><col min="2" max="2" width="28" customWidth="1"/><col min="3" max="3" width="38" customWidth="1"/><col min="4" max="8" width="23" customWidth="1"/></cols><sheetData>'
     for index, row in enumerate(matrix, 1):
         height = ' ht="80" customHeight="1"' if index == 4 else (' ht="38" customHeight="1"' if index in (1, 2, 6) else '')
         style = 3 if index in (1, 2) else (1 if index == 6 else 2)
         sheet += f'<row r="{index}"{height}>' + ''.join(
             cell(v, {3: 4, 4: 5, 6: 6}.get(column, style) if index >= 6 else style)
             for column, v in enumerate(row)) + '</row>'
-    sheet += f'</sheetData><autoFilter ref="A6:I{max(6, len(matrix))}"/><mergeCells count="3"><mergeCell ref="A1:I1"/><mergeCell ref="A2:I2"/><mergeCell ref="A4:I4"/></mergeCells></worksheet>'
+    sheet += f'</sheetData><autoFilter ref="A6:H{max(6, len(matrix))}"/><mergeCells count="3"><mergeCell ref="A1:H1"/><mergeCell ref="A2:H2"/><mergeCell ref="A4:H4"/></mergeCells></worksheet>'
     output = io.BytesIO()
     with zipfile.ZipFile(output, 'w', zipfile.ZIP_DEFLATED) as archive:
         archive.writestr('[Content_Types].xml', '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>')
@@ -264,7 +290,7 @@ def render_pdf(report):
     data = [[Paragraph(escape(title), highlighted.get(key, header)) for key, title in COLUMNS]]
     data += [[Paragraph(escape(str(row[key])), highlighted.get(key, small))
               for key, _ in COLUMNS] for row in report['rows']]
-    table = LongTable(data, colWidths=[40, 155, 225] + [115] * 6, repeatRows=1, hAlign='LEFT')
+    table = LongTable(data, colWidths=[40, 155, 225] + [138] * 5, repeatRows=1, hAlign='LEFT')
     table.setStyle(TableStyle([('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#004B87')),
         ('BACKGROUND', (3, 0), (3, 0), colors.HexColor('#F0FDF4')),
         ('BACKGROUND', (4, 0), (4, 0), colors.HexColor('#FEF2F2')),

@@ -140,7 +140,11 @@ async def attendance_report(
     query = {}
     
     scoped_ids = await get_scoped_employee_ids(admin)
-    query["user_id"] = {"$in": scoped_ids}
+    scoped_emails = await get_scoped_employee_emails(admin)
+    query["$or"] = [
+        {"user_id": {"$in": scoped_ids}},
+        {"email": {"$in": scoped_emails}}
+    ]
     
     if start_date:
         query["timestamp"] = {"$gte": datetime.fromisoformat(start_date)}
@@ -153,30 +157,62 @@ async def attendance_report(
     logs = await attendance_logs_collection.find(query).sort("timestamp", -1).to_list(length=None)
     
     from bson import ObjectId
-    emp_ids = list({ObjectId(log["user_id"]) for log in logs if log.get("user_id") and ObjectId.is_valid(str(log["user_id"]))})
-    employees = await employees_collection.find({"_id": {"$in": emp_ids}}, {"_id": 1, "full_name": 1, "employee_type": 1, "email": 1}).to_list(length=len(emp_ids))
-    emp_map = {str(e["_id"]): e for e in employees}
+    emp_ids = list({ObjectId(uid) for uid in scoped_ids if ObjectId.is_valid(str(uid))})
+    employees = await employees_collection.find(
+        {"$or": [{"_id": {"$in": emp_ids}}, {"email": {"$in": scoped_emails}}]},
+        {"_id": 1, "full_name": 1, "employee_type": 1, "field_mode": 1, "email": 1}
+    ).to_list(length=max(1, len(scoped_ids) + len(scoped_emails)))
+    emp_map = {}
+    for e in employees:
+        emp_map[str(e["_id"])] = e
+        if e.get("email"):
+            emp_map[e["email"]] = e
+            emp_map[e["email"].strip().lower()] = e
 
     summary = {"total_records": len(logs), "check_ins": 0, "check_outs": 0, "unique_employees": set()}
     enriched = []
     
     for log in logs:
         emp_id_str = str(log.get("user_id", ""))
-        emp = emp_map.get(emp_id_str)
-        if employee_type and emp and emp.get("employee_type", "desk") != employee_type:
-            continue
+        emp = emp_map.get(emp_id_str) or emp_map.get((log.get("email") or "").strip().lower())
+        emp_base_type = (emp.get("employee_type", "desk") if emp else (log.get("attendance_type") or "desk")).lower()
+        emp_field_mode = (emp.get("field_mode", "planned") if emp else (log.get("field_mode") or "planned")).lower()
+        is_flyfield = (
+            emp_field_mode == "flyfield"
+            or str(log.get("field_mode", "")).lower() == "flyfield"
+            or str(log.get("attendance_type", "")).lower() == "flyfield"
+        )
+        is_wfh = emp_base_type == "wfh" or str(log.get("attendance_type", "")).lower() == "wfh"
+        effective_type = (
+            "flyfield"
+            if is_flyfield
+            else ("wfh" if is_wfh else ("field" if emp_base_type in ("field", "remote_field") else "desk"))
+        )
+
+        if employee_type:
+            req_type = employee_type.strip().lower()
+            if req_type == "flyfield" and not is_flyfield:
+                continue
+            elif req_type == "wfh" and not is_wfh:
+                continue
+            elif req_type == "field" and effective_type != "field":
+                continue
+            elif req_type == "desk" and effective_type != "desk":
+                continue
+            elif req_type not in ("flyfield", "wfh", "field", "desk") and effective_type != req_type:
+                continue
         
         log["_id"] = str(log["_id"])
-        log["full_name"] = emp["full_name"] if emp else "Unknown"
-        log["employee_type"] = emp.get("employee_type", "desk") if emp else "unknown"
+        log["full_name"] = emp["full_name"] if emp else (log.get("employee_name") or "Unknown")
+        log["employee_type"] = effective_type
         if isinstance(log.get("timestamp"), datetime):
             log["timestamp"] = log["timestamp"].isoformat()
         
-        if log.get("type") == "check-in":
+        if str(log.get("type", "")).lower() in ("check-in", "in", "wfh_checkin"):
             summary["check_ins"] += 1
         else:
             summary["check_outs"] += 1
-        summary["unique_employees"].add(emp.get("email", "") if emp else "")
+        summary["unique_employees"].add(emp.get("email", "") if emp else (log.get("email") or ""))
         enriched.append(log)
     
     summary["unique_employees"] = len(summary["unique_employees"])
@@ -908,20 +944,24 @@ async def get_employee_monthly_summary(
     org_doc = await get_effective_org_settings(employee.get("organization_id"))
     offset = timedelta(minutes=int(org_doc.get("timezone_offset", 330)))
 
-    # 2. Fetch All Logs for the month
-    logs = await attendance_logs_collection.find({
-        "email": email,
-        "organization_id": employee["organization_id"],
-        "timestamp": {"$gte": start_date - offset, "$lt": end_date - offset}
-    }).sort("timestamp", 1).to_list(length=None)
-
-    # 3. Fetch Approved Leaves for the month (flexible identifier matching)
+    # 2. Fetch All Logs for the month (flexible identifier matching)
     clean_email = email.strip().lower()
     emp_identifiers = [clean_email, email.strip()]
     if "_id" in employee:
         emp_identifiers.append(str(employee["_id"]))
     if "employee_id" in employee and employee["employee_id"]:
         emp_identifiers.append(str(employee["employee_id"]).strip())
+
+    logs = await attendance_logs_collection.find({
+        "organization_id": employee["organization_id"],
+        "$or": [
+            {"email": {"$in": emp_identifiers}},
+            {"user_id": {"$in": emp_identifiers}}
+        ],
+        "timestamp": {"$gte": start_date - offset, "$lt": end_date - offset}
+    }).sort("timestamp", 1).to_list(length=None)
+
+    # 3. Fetch Approved Leaves for the month (flexible identifier matching)
 
     raw_leaves = await leave_requests_collection.find({
         "organization_id": employee["organization_id"],
@@ -1149,9 +1189,9 @@ async def get_employee_monthly_summary(
                     "wifi_confidence": log.get("wifi_confidence", 0)
                 })
 
-                if log_type == "check-in":
+                if log_type in ("check-in", "IN", "wfh_checkin"):
                     last_in_time = log_ts
-                elif log_type == "check-out":
+                elif log_type in ("check-out", "OUT", "wfh_checkout"):
                     day_info["last_out"] = log_ts.isoformat()
                     if last_in_time:
                         delta = log_ts - last_in_time
@@ -1163,8 +1203,8 @@ async def get_employee_monthly_summary(
             total_working_ms += day_duration_ms
 
             # Comprehensive classification via classify_attendance_day
-            checkout_logs = [l for l in day_logs if l.get("type") == "check-out"]
-            first_checkin = [l for l in day_logs if l.get("type") == "check-in"]
+            checkout_logs = [l for l in day_logs if l.get("type") in ("check-out", "OUT", "wfh_checkout")]
+            first_checkin = [l for l in day_logs if l.get("type") in ("check-in", "IN", "wfh_checkin")]
 
             first_in_ts = first_checkin[0]["timestamp"] if first_checkin else day_logs[0]["timestamp"]
             if first_in_ts.tzinfo is None: first_in_ts = first_in_ts.replace(tzinfo=timezone.utc)

@@ -29,7 +29,7 @@ DOWNLOAD_AUDIENCE = "logday-file-download"
 DOWNLOAD_SECONDS = 120
 PURPOSE_FEATURES = {
     "screenshot": {"wfh_monitoring"}, "face_check": {"wfh_monitoring"},
-    "onboarding": {"document_verification", "onboarding"},
+    "onboarding": {"document_verification", "onboarding", "employees", "attendance"},
     "field_media": {"war_room", "flyfield"}, "leave_proof": {"leaves"},
     "expense_receipt": {"expenses"},
 }
@@ -123,7 +123,7 @@ async def register_upload(url, owner, purpose, media_type=None, size=None):
 
 
 async def save_local_bytes(data, owner, purpose, folder, extension, media_type):
-    if folder not in {"onboarding_docs", "selfies", "site_photos", "voice_notes", "proofs", "receipts", "flyfield"}:
+    if folder not in {"onboarding_docs", "selfies", "site_photos", "voice_notes", "proofs", "receipts", "flyfield", "profiles"}:
         raise ValueError("Invalid server upload folder")
     if extension not in {".jpg", ".png", ".webp", ".pdf", ".m4a", ".aac", ".mp3", ".wav", ".ogg"}:
         raise HTTPException(415, "Unsupported file type")
